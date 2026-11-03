@@ -1,10 +1,4 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     body::Bytes,
@@ -20,7 +14,7 @@ use crate::{
     app::AppState,
     auth::Pool,
     budget::{self, Refusal},
-    cache::{Answer, Entry, LoadFailure, STALE_FOR},
+    cache::{Answer, AnswerCache, Entry, Finisher, LoadFailure, Outcome, STALE_FOR},
     config::ApiKey,
     error::ApiError,
 };
@@ -201,19 +195,26 @@ pub async fn passthrough(
     if !segments.iter().all(|segment| valid_segment(segment)) {
         return ApiError::invalid_path().into_response();
     }
-    let query = uri.query();
+    let query = uri.query().map(str::to_owned);
 
     let Some(freshness) = (method == Method::GET)
         .then(|| freshness(&segments))
         .flatten()
     else {
-        return match call(&state, &pool, method, &path, query, body).await {
-            Ok(answer) => respond(&answer, "miss"),
-            Err(failure) => failed(failure, &pool),
+        let call = {
+            let (state, pool) = (state.clone(), pool.clone());
+            tokio::spawn(
+                async move { call(&state, &pool, method, &path, query.as_deref(), body).await },
+            )
+        };
+        return match call.await {
+            Ok(Ok(answer)) => respond(&answer, "miss"),
+            Ok(Err(failure)) => failed(failure, &pool),
+            Err(_) => failed(LoadFailure::Upstream(UpstreamFailure::Unreachable), &pool),
         };
     };
 
-    let key = cache_key(&path, query);
+    let key = cache_key(&path, query.as_deref());
     let forced = wants_fresh(&headers);
     let now = state.clock.now_ms();
     let cached = state.cache.get(&key);
@@ -222,43 +223,30 @@ pub async fn passthrough(
         return respond(&entry.answer, "hit");
     }
 
-    let kept_meanwhile = AtomicBool::new(false);
-    let (loaded, ran) = state
-        .cache
-        .load(&key, || async {
-            if !forced
-                && let Some(entry) = state
-                    .cache
-                    .get(&key)
-                    .filter(|entry| entry.fresh_until_ms > state.clock.now_ms())
-            {
-                kept_meanwhile.store(true, Ordering::Relaxed);
-                return Ok(entry);
-            }
-            let answer = call(&state, &pool, Method::GET, &path, query, Bytes::new()).await?;
-            let now = state.clock.now_ms();
-            let fresh_ms = match answer.status {
-                StatusCode::OK => Some(freshness.found_ms),
-                StatusCode::NOT_FOUND => freshness.not_found_ms,
-                _ => None,
-            };
-            let Some(fresh_ms) = fresh_ms else {
-                return Err(LoadFailure::Answered(answer));
-            };
-            let entry = Arc::new(Entry {
-                answer,
-                stored_at_ms: now,
-                fresh_until_ms: now + fresh_ms,
-                stale_until_ms: now + fresh_ms + u64::try_from(STALE_FOR.as_millis()).unwrap_or(0),
-            });
-            state.cache.insert(&key, entry.clone());
-            Ok(entry)
-        })
-        .await;
+    let load_key = key.clone();
+    let (waiting, finisher) = state.cache.join(&load_key);
+    let started = finisher.is_some();
+    if let Some(finisher) = finisher {
+        let load = Load {
+            state: state.clone(),
+            pool: pool.clone(),
+            key,
+            load_key,
+            path,
+            query,
+            freshness,
+            forced,
+        };
+        tokio::spawn(load.run(finisher));
+    }
+    let outcome = AnswerCache::wait(waiting).await.unwrap_or(Outcome {
+        loaded: Err(LoadFailure::Upstream(UpstreamFailure::Unreachable)),
+        called: false,
+    });
 
-    match loaded {
+    match outcome.loaded {
         Ok(entry) => {
-            if ran && !kept_meanwhile.load(Ordering::Relaxed) {
+            if started && outcome.called {
                 respond(&entry.answer, "miss")
             } else {
                 state.budget.record_hit(&pool.consumer, &pool.name);
@@ -278,6 +266,80 @@ pub async fn passthrough(
                 }
                 _ => failed(failure, &pool),
             }
+        }
+    }
+}
+
+struct Load {
+    state: Arc<AppState>,
+    pool: Pool,
+    key: String,
+    load_key: String,
+    path: String,
+    query: Option<String>,
+    freshness: Freshness,
+    forced: bool,
+}
+
+impl Load {
+    async fn run(self, finisher: Finisher) {
+        let outcome = self.outcome().await;
+        self.state.cache.finish(&self.load_key, finisher, outcome);
+    }
+
+    async fn outcome(&self) -> Outcome {
+        let state = &self.state;
+        if !self.forced
+            && let Some(entry) = state
+                .cache
+                .get(&self.key)
+                .filter(|entry| entry.fresh_until_ms > state.clock.now_ms())
+        {
+            return Outcome {
+                loaded: Ok(entry),
+                called: false,
+            };
+        }
+        let answer = match call(
+            state,
+            &self.pool,
+            Method::GET,
+            &self.path,
+            self.query.as_deref(),
+            Bytes::new(),
+        )
+        .await
+        {
+            Ok(answer) => answer,
+            Err(failure) => {
+                return Outcome {
+                    loaded: Err(failure),
+                    called: true,
+                };
+            }
+        };
+        let fresh_ms = match answer.status {
+            StatusCode::OK => Some(self.freshness.found_ms),
+            StatusCode::NOT_FOUND => self.freshness.not_found_ms,
+            _ => None,
+        };
+        let Some(fresh_ms) = fresh_ms else {
+            return Outcome {
+                loaded: Err(LoadFailure::Answered(answer)),
+                called: true,
+            };
+        };
+        let now = state.clock.now_ms();
+        let entry = Arc::new(Entry {
+            answer,
+            stored_at_ms: now,
+            fresh_until_ms: now + fresh_ms,
+            stale_until_ms: now + fresh_ms + u64::try_from(STALE_FOR.as_millis()).unwrap_or(0),
+        });
+        state.cache.insert(&self.key, entry.clone());
+        Outcome {
+            loaded: Ok(entry),
+            called: true,
         }
     }
 }
@@ -692,6 +754,34 @@ mod tests {
                 .counts
                 .hits,
             4
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_finishes_and_is_recorded_after_its_caller_is_gone() {
+        let mock = Mock::start(Duration::from_millis(200), |_, _| reply(200, "{}")).await;
+        let gateway = gateway(&mock, 300, TIMEOUT);
+        let caller = {
+            let router = gateway.router.clone();
+            tokio::spawn(async move { get(&router, "/v1/curseforge/mods/1").await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        caller.abort();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        assert_eq!(mock.calls(), 1);
+        assert_eq!(gateway.state.cache.loads_running(), 0);
+        assert_eq!(
+            gateway.state.budget.snapshot().await.days[0].pools[0]
+                .counts
+                .calls,
+            1
+        );
+        assert_eq!(
+            get(&gateway.router, "/v1/curseforge/mods/1")
+                .await
+                .header("x-cache"),
+            Some("hit")
         );
     }
 
