@@ -7,18 +7,23 @@ use std::{io::IsTerminal, process::ExitCode};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::Config;
-
-const LOG_ENV: &str = "CONTENT_GATEWAY_LOG";
+use crate::config::{Config, DEFAULT_LOG};
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let (log_filter, log_filter_error) = match config::log_filter_from_env() {
+        Ok(filter) => (filter, None),
+        Err(error) => (EnvFilter::new(DEFAULT_LOG), Some(error)),
+    };
     tracing_subscriber::fmt()
         .with_ansi(std::io::stdout().is_terminal())
-        .with_env_filter(
-            EnvFilter::try_from_env(LOG_ENV).unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+        .with_env_filter(log_filter)
         .init();
+
+    if let Some(error) = log_filter_error {
+        tracing::error!("invalid configuration: {error}");
+        return ExitCode::FAILURE;
+    }
 
     let config = match Config::from_env() {
         Ok(config) => config,
