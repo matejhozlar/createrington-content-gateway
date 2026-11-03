@@ -256,12 +256,12 @@ pub async fn passthrough(
         Some(Share::File { file, .. }) => {
             let mut found = state
                 .cache
-                .lookup_many(&[Batch::Files.key(file), key.clone()])
+                .lookup_many(&[Batch::Files.key(file), key.clone()], state.clock.now_ms())
                 .await;
             let cached = found.pop().flatten();
             (found.pop().flatten(), cached)
         }
-        _ => (None, state.cache.lookup(&key).await),
+        _ => (None, state.cache.lookup(&key, state.clock.now_ms()).await),
     };
     let now = state.clock.now_ms();
     if !forced

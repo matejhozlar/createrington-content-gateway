@@ -211,7 +211,7 @@ pub async fn answer(
         .filter(|id| seen.insert(*id))
         .collect();
     let keys: Vec<String> = ids.iter().map(|id| batch.key(*id)).collect();
-    let found = state.cache.lookup_many(&keys).await;
+    let found = state.cache.lookup_many(&keys, state.clock.now_ms()).await;
     let now = state.clock.now_ms();
     let mut slots = Vec::with_capacity(ids.len());
     let mut mine = Vec::new();

@@ -71,7 +71,7 @@ impl Entry {
 /// time. Requests for a key whose load is running wait for that load
 /// instead of starting one.
 pub struct AnswerCache {
-    entries: Cache<String, Arc<Entry>>,
+    entries: Cache<String, Kept>,
     loading: Mutex<HashMap<String, Waiting>>,
     redis: Option<Arc<RedisStore>>,
 }
@@ -97,29 +97,39 @@ pub enum LoadFailure {
     Upstream(crate::curseforge::UpstreamFailure),
 }
 
+#[derive(Clone)]
+struct Kept {
+    entry: Arc<Entry>,
+    keep_for: Duration,
+}
+
+impl Kept {
+    fn until_stale(entry: Arc<Entry>, now_ms: u64) -> Self {
+        let keep_for = Duration::from_millis(entry.stale_until_ms.saturating_sub(now_ms) + 1);
+        Self { entry, keep_for }
+    }
+}
+
 struct KeepUntilStale;
 
-impl Expiry<String, Arc<Entry>> for KeepUntilStale {
+impl Expiry<String, Kept> for KeepUntilStale {
     fn expire_after_create(
         &self,
         _key: &String,
-        entry: &Arc<Entry>,
+        kept: &Kept,
         _created_at: Instant,
     ) -> Option<Duration> {
-        Some(
-            Duration::from_millis(entry.stale_until_ms.saturating_sub(entry.stored_at_ms))
-                + Duration::from_millis(1),
-        )
+        Some(kept.keep_for)
     }
 
     fn expire_after_update(
         &self,
-        key: &String,
-        entry: &Arc<Entry>,
-        updated_at: Instant,
+        _key: &String,
+        kept: &Kept,
+        _updated_at: Instant,
         _duration_until_expiry: Option<Duration>,
     ) -> Option<Duration> {
-        self.expire_after_create(key, entry, updated_at)
+        Some(kept.keep_for)
     }
 }
 
@@ -134,8 +144,8 @@ impl AnswerCache {
         Self {
             entries: Cache::builder()
                 .max_capacity(MAX_BYTES)
-                .weigher(|key: &String, entry: &Arc<Entry>| {
-                    u32::try_from(key.len() + entry.answer.body.len()).unwrap_or(u32::MAX)
+                .weigher(|key: &String, kept: &Kept| {
+                    u32::try_from(key.len() + kept.entry.answer.body.len()).unwrap_or(u32::MAX)
                 })
                 .expire_after(KeepUntilStale)
                 .build(),
@@ -146,18 +156,22 @@ impl AnswerCache {
 
     /// The entry kept in memory, without asking Redis.
     pub fn get(&self, key: &str) -> Option<Arc<Entry>> {
-        self.entries.get(key)
+        self.entries.get(key).map(|kept| kept.entry)
     }
 
     /// The entry kept in memory, or else the one kept in Redis.
-    pub async fn lookup(&self, key: &str) -> Option<Arc<Entry>> {
-        self.lookup_many(&[key.to_owned()]).await.pop().flatten()
+    pub async fn lookup(&self, key: &str, now_ms: u64) -> Option<Arc<Entry>> {
+        self.lookup_many(&[key.to_owned()], now_ms)
+            .await
+            .pop()
+            .flatten()
     }
 
-    /// The entries of `keys`, in their order, asking Redis once for every key memory has no entry for.
-    pub async fn lookup_many(&self, keys: &[String]) -> Vec<Option<Arc<Entry>>> {
-        let mut entries: Vec<Option<Arc<Entry>>> =
-            keys.iter().map(|key| self.entries.get(key)).collect();
+    /// The entries of `keys`, in their order, asking Redis once for every key memory has no entry for. An entry
+    /// from Redis whose stale time has passed is none, and one that is kept in memory again stays there only for
+    /// the time it has left.
+    pub async fn lookup_many(&self, keys: &[String], now_ms: u64) -> Vec<Option<Arc<Entry>>> {
+        let mut entries: Vec<Option<Arc<Entry>>> = keys.iter().map(|key| self.get(key)).collect();
         let Some(redis) = &self.redis else {
             return entries;
         };
@@ -183,9 +197,15 @@ impl AnswerCache {
             return entries;
         };
         for (index, bytes) in missing.into_iter().zip(stored) {
-            if let Some(entry) = bytes.and_then(decode) {
+            if let Some(entry) = bytes
+                .and_then(decode)
+                .filter(|entry| entry.is_stale(now_ms))
+            {
                 let entry = Arc::new(entry);
-                self.entries.insert(keys[index].clone(), entry.clone());
+                self.entries.insert(
+                    keys[index].clone(),
+                    Kept::until_stale(entry.clone(), now_ms),
+                );
                 entries[index] = Some(entry);
             }
         }
@@ -194,7 +214,10 @@ impl AnswerCache {
 
     /// Keeps `entry` in memory, and writes it to Redis in the background until its stale time.
     pub fn insert(&self, key: &str, entry: Arc<Entry>) {
-        self.entries.insert(key.to_owned(), entry.clone());
+        self.entries.insert(
+            key.to_owned(),
+            Kept::until_stale(entry.clone(), entry.stored_at_ms),
+        );
         let Some(redis) = self.redis.clone() else {
             return;
         };
@@ -500,8 +523,18 @@ mod tests {
 
         let after_restart = AnswerCache::new(Some(store.clone()));
         let found = after_restart
-            .lookup_many(&["mod:2".to_owned(), "mod:3".to_owned(), "mod:1".to_owned()])
+            .lookup_many(
+                &["mod:2".to_owned(), "mod:3".to_owned(), "mod:1".to_owned()],
+                0,
+            )
             .await;
+        let past_stale = 1_000 + u64::try_from(STALE_FOR.as_millis()).unwrap();
+        assert_eq!(
+            AnswerCache::new(Some(store.clone()))
+                .lookup("mod:1", past_stale)
+                .await,
+            None
+        );
         let bodies: Vec<Option<Bytes>> = found
             .iter()
             .map(|entry| entry.as_ref().map(|entry| entry.answer.body.clone()))
