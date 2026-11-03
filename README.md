@@ -47,7 +47,7 @@ Every process that calls the gateway is a consumer with its own bearer token (at
 
 Names and pools are lowercase letters, digits and `-`. A request sends `Authorization: Bearer <token>`, and `X-Budget-Pool: <pool>` when its token has more than one pool. One ceiling per minute covers all pools; every pool is counted on its own.
 
-An invalid value stops the gateway at startup with a message naming the variable. `.env.example` lists every variable. The gateway does not read a `.env` file by itself: export the variables, or pass the file with `docker run --env-file .env`.
+An empty value counts as unset. An invalid value stops the gateway at startup with a message naming the variable. `.env.example` lists every variable. The gateway does not read a `.env` file by itself: export the variables, or pass the file with `docker run --env-file .env`.
 
 Two more variables are read at build time, not at runtime. `/v1/healthz` reports them, and they are `null` when unset:
 
@@ -62,19 +62,20 @@ Two more variables are read at build time, not at runtime. `/v1/healthz` reports
 docker build -t content-gateway \
   --build-arg CONTENT_GATEWAY_COMMIT="$(git rev-parse HEAD)" \
   --build-arg CONTENT_GATEWAY_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" .
-docker run --rm -p 127.0.0.1:5005:5005 content-gateway
+cp .env.example .env   # then set CONTENT_GATEWAY_TOKEN, or CONTENT_GATEWAY_CONSUMERS
+docker run --rm --env-file .env -p 127.0.0.1:5005:5005 content-gateway
 ```
 
 The image is a static binary on a distroless base. Inside the container the gateway listens on `0.0.0.0`; publish the port on `127.0.0.1` as above. The build keeps downloaded crates and compiled dependencies in BuildKit cache mounts, so a rebuild after an update only compiles what changed.
 
 ## Endpoints
 
-| Route             | Auth  | What it answers                                                                                    |
-| ----------------- | ----- | -------------------------------------------------------------------------------------------------- |
-| `GET /v1/healthz` | none  | `{ status, version, commit, builtAt }`                                                             |
-| `GET /v1/budget`  | token | This minute's calls and refusals per pool, the 429 hold, and daily counts for the last 14 UTC days |
+| Route             | Auth  | What it answers                                                                                                                                        |
+| ----------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GET /v1/healthz` | none  | `{ status, version, commit, builtAt }`                                                                                                                 |
+| `GET /v1/budget`  | token | This minute's calls sent and withheld per pool, the 429 hold, and daily counts for the last 14 UTC days. Every count is a count of calls to CurseForge |
 
-Errors answer `{ "code", "message" }`. A call the budget refuses answers `503` with `Retry-After`, plus `pool` and `retryAfterMs` in the body; `code` is `BUDGET_SPENT` when the minute's ceiling is reached and `UPSTREAM_HOLD` while CurseForge's 429 hold lasts.
+Errors answer `{ "code", "message" }`. A call the budget refuses answers `503` with `Retry-After`, plus `pool` and `retryAfterMs` in the body; `code` is `BUDGET_SPENT` when the minute's ceiling is reached and `UPSTREAM_HOLD` while CurseForge's 429 hold lasts. A request that needs more calls than a whole minute allows answers `413 REQUEST_TOO_LARGE` without `Retry-After`, since waiting would not help.
 
 ## Keep it private
 
