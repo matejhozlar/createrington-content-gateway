@@ -1,7 +1,9 @@
 node_modules
 target
+dist
 pnpm-lock.yaml
 Cargo.lock
 CHANGELOG.md
 .claude
 .pnpm-store
+openapi.json

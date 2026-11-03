@@ -5,6 +5,8 @@
 node_modules
 .pnpm-store
 *.log
+dist
+*.tsbuildinfo
 
 # Env
 .env

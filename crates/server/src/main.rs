@@ -3,6 +3,7 @@ use std::{io::IsTerminal, process::ExitCode, sync::Arc, time::Duration};
 use content_gateway::{
     app::{self, AppState},
     config::{self, Config, DEFAULT_LOG},
+    openapi,
     redis_store::{self, RedisStore},
     serve::{self, Stopped},
 };
@@ -10,9 +11,23 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const OPENAPI_FLAG: &str = "--openapi";
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    if std::env::args().nth(1).as_deref() == Some(OPENAPI_FLAG) {
+        return match openapi::pretty_json() {
+            Ok(json) => {
+                print!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("cannot write the OpenAPI document: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let (log_filter, log_filter_error) = match config::log_filter_from_env() {
         Ok(filter) => (filter, None),
         Err(error) => (EnvFilter::new(DEFAULT_LOG), Some(error)),

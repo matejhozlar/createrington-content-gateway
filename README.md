@@ -2,7 +2,7 @@
 
 A small HTTP service that sits between your own services and the [CurseForge](https://docs.curseforge.com/rest-api/) and [Modrinth](https://docs.modrinth.com/api/) APIs. It holds the CurseForge API key so your services do not have to, shares one cache between all of them, counts every call made on the key, and holds every caller off when CurseForge answers 429.
 
-> **Status:** early. Consumers, tokens, the call budget and the CurseForge passthrough with its cache exist. The rest is being built in the open; the plan lives in [Createrington/app#1692](https://gitea.matejhoz.com/Createrington/app/issues/1692).
+> **Status:** early. Consumers, tokens, the call budget, the CurseForge passthrough with its cache, the OpenAPI document and the TypeScript client exist. The rest is being built in the open; the plan lives in [Createrington/app#1692](https://gitea.matejhoz.com/Createrington/app/issues/1692).
 
 ## What it will do
 
@@ -83,10 +83,13 @@ The image is a static binary on a distroless base. Inside the container the gate
 | Route                                           | Auth  | What it answers                                                                                                                                                                                           |
 | ----------------------------------------------- | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `GET /v1/healthz`                               | none  | `{ status, version, commit, builtAt }`                                                                                                                                                                    |
+| `GET /v1/openapi.json`                          | none  | The OpenAPI document of these routes, the same as `openapi.json` in this repository                                                                                                                       |
 | `GET /v1/budget`                                | token | This minute's calls sent and withheld per pool, the 429 hold, and daily counts for the last 14 UTC days: calls to CurseForge, answers given without one (`hits`), calls withheld, and 403 and 429 answers |
 | `GET /v1/curseforge/*`, `POST /v1/curseforge/*` | token | What `api.curseforge.com/v1/*` answers, see below                                                                                                                                                         |
 
 `source` in the budget says where its counts come from: `redis` for the stored ones, `memory` when no Redis is configured, and `unavailable` when Redis did not answer, in which case the minute is the gateway's own count and the days show only what is not written to Redis yet.
+
+The gateway's own answers are described by [`openapi.json`](openapi.json), which the server derives from its types (`content-gateway --openapi` prints it). Its `info.version` is the version of the API, the `1` of `/v1`; the gateway's own version is in `/v1/healthz`. The CurseForge answers are CurseForge's and are not described there. TypeScript consumers install [`@createrington/content-gateway-client`](packages/client/README.md), whose types come from the document; anyone else can generate a client from it.
 
 ### CurseForge
 
@@ -125,10 +128,18 @@ Run the gateway on loopback or a private network only, with your own CurseForge 
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-pnpm install        # Prettier, the pre-commit hook and the Infisical CLI
+pnpm install        # Prettier, the pre-commit hook, the Infisical CLI and the client's dependencies
 pnpm dev            # cargo run with the env injected from Infisical (maintainers)
+pnpm openapi        # rewrite openapi.json and the client's generated types after a route or type changed
+pnpm test           # the client's tests; pnpm typecheck and pnpm build likewise
 pnpm format:check
 ```
+
+`openapi.json` and `packages/client/src/generated/openapi.ts` are generated and checked in: `cargo test` fails when the document no longer matches the server, and the client's `generate:check` fails when the types no longer match the document.
+
+### Releasing the client
+
+The client package is versioned with [changesets](https://github.com/changesets/changesets), apart from the server. A change to `packages/client` comes with a changeset written on its branch (`pnpm changeset`); CI refuses a changed client without one. The release PR runs `pnpm version-packages`, which turns the changesets into the version bump and the package's `CHANGELOG.md` entry, and the merge into `main` publishes that version to the npm registry named in the package's `publishConfig` (`.gitea/workflows/publish-client.yml`, with the registry token in the `NPM_PUBLISH_TOKEN` secret). A version the registry already has is not published again, and a merge that still carries unconsumed changesets fails instead of publishing.
 
 The budget's tests also run against a real Redis when `CONTENT_GATEWAY_TEST_REDIS_URL` names one, for example `docker run --rm -p 127.0.0.1:6390:6379 redis:8.10-alpine` and `CONTENT_GATEWAY_TEST_REDIS_URL=redis://127.0.0.1:6390/0 cargo test`. Each test uses its own key prefix and deletes its keys; CI runs them against a throwaway Redis.
 

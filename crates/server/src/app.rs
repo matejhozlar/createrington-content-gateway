@@ -8,7 +8,7 @@ use crate::{
     cache::AnswerCache,
     config::{Config, Consumer},
     curseforge::{self, CURSEFORGE_API, Upstream},
-    health,
+    health, openapi,
     redis_store::RedisStore,
 };
 
@@ -53,7 +53,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/budget", get(budget::readout))
         .route(
             "/v1/curseforge/{*path}",
-            get(curseforge::passthrough).post(curseforge::passthrough),
+            get(curseforge::passthrough_get).post(curseforge::passthrough_post),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -62,6 +62,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 
     Router::new()
         .route("/v1/healthz", get(health::healthz))
+        .route("/v1/openapi.json", get(openapi::document))
         .merge(authenticated)
         .with_state(state)
 }
@@ -143,6 +144,19 @@ mod tests {
         assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
         assert!(body.get("commit").is_some());
         assert!(body.get("builtAt").is_some());
+    }
+
+    #[tokio::test]
+    async fn the_openapi_document_is_served_without_a_token_as_checked_in() {
+        let (status, content_type, body) = get("/v1/openapi.json", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("application/json"));
+
+        let served: Value = serde_json::from_slice(&body).unwrap();
+        let checked_in: Value =
+            serde_json::from_str(include_str!("../../../openapi.json")).unwrap();
+        assert_eq!(served, checked_in);
+        assert_eq!(served["info"]["version"], openapi::API_VERSION);
     }
 
     #[tokio::test]

@@ -8,8 +8,9 @@ use axum::{Json, extract::State};
 use jiff::{Timestamp, fmt::rfc2822};
 use redis::{Script, Value, aio::ConnectionManager};
 use serde::Serialize;
+use utoipa::ToSchema;
 
-use crate::{app::AppState, redis_store::RedisStore};
+use crate::{app::AppState, error::ApiError, redis_store::RedisStore};
 
 const MINUTE_MS: u64 = 60_000;
 const DAY_MS: u64 = 24 * 60 * MINUTE_MS;
@@ -136,19 +137,25 @@ struct MinuteCounts {
     withheld: u32,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+/// What one pool did on one UTC day.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 pub struct DayCounts {
+    /// Calls that reached CurseForge.
     pub calls: u64,
+    /// Requests answered without a call: from the cache, or by joining a call already in flight.
     pub hits: u64,
+    /// Calls the budget refused.
     pub withheld: u64,
+    /// Calls CurseForge answered 403.
     pub forbidden: u64,
+    /// Calls CurseForge answered 429.
     pub throttled: u64,
 }
 
 /// Where a readout's counts come from: `redis` when they are the stored ones, `memory` when no Redis is configured,
 /// `unavailable` when Redis did not answer, so the minute is this process's own count and the days hold only what
 /// is not written to Redis yet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Source {
     Redis,
@@ -156,34 +163,51 @@ pub enum Source {
     Unavailable,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// What `/v1/budget` answers: this minute over all pools and per pool, the 429 hold, and the last 14 UTC days.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BudgetSnapshot {
+    /// Calls to CurseForge the minute allows over all pools.
     pub limit_per_minute: u32,
+    /// Calls admitted this minute.
     pub used: u32,
+    /// Calls refused this minute.
     pub withheld: u32,
+    /// When this minute's counts start over, ISO 8601.
+    #[schema(format = DateTime)]
     pub resets_at: String,
+    /// Until when CurseForge's 429 holds every call off, ISO 8601, or null while no hold is on.
+    #[schema(format = DateTime)]
     pub held_until: Option<String>,
     pub source: Source,
+    /// Every pool of every consumer, this minute.
     pub pools: Vec<PoolSnapshot>,
+    /// The last 14 UTC days, today first.
     pub days: Vec<DaySnapshot>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// One pool's calls this minute.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct PoolSnapshot {
     pub consumer: String,
     pub pool: String,
+    /// Calls admitted this minute.
     pub used: u32,
+    /// Calls refused this minute.
     pub withheld: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// One UTC day's counts for every pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct DaySnapshot {
+    /// The UTC day, `YYYY-MM-DD`.
+    #[schema(format = Date)]
     pub date: String,
     pub pools: Vec<DayPoolSnapshot>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// One pool's counts on one UTC day.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct DayPoolSnapshot {
     pub consumer: String,
     pub pool: String,
@@ -695,6 +719,17 @@ impl DayCounts {
     }
 }
 
+/// This minute's calls per pool, the 429 hold, and the daily counts of the last 14 UTC days.
+#[utoipa::path(
+    get,
+    path = "/v1/budget",
+    tag = "gateway",
+    security(("bearer" = [])),
+    responses(
+        (status = 200, description = "The budget as it stands", body = BudgetSnapshot),
+        (status = 401, description = "No valid consumer token", body = ApiError),
+    )
+)]
 pub async fn readout(State(state): State<Arc<AppState>>) -> Json<BudgetSnapshot> {
     Json(state.budget.snapshot().await)
 }
