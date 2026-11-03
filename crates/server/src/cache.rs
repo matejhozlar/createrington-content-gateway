@@ -11,8 +11,11 @@ use axum::{
 use moka::{Expiry, sync::Cache};
 use tokio::sync::watch;
 
+use crate::redis_store::RedisStore;
+
 pub const STALE_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
+const FORMAT: u8 = 1;
 
 /// One answer CurseForge gave, kept as it came: status, content type and body bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,14 +61,19 @@ impl Entry {
     }
 }
 
-/// The answers of CurseForge, in memory, at most 256 MiB of them.
+/// The answers of CurseForge, in memory, at most 256 MiB of them, and in
+/// Redis when one is configured, so they survive a restart.
 ///
 /// An entry is kept 24 h past its fresh time, for answering when a call is
-/// refused or CurseForge fails. Requests for a key whose load is running
-/// wait for that load instead of starting one.
+/// refused or CurseForge fails. Memory answers first; Redis is asked only
+/// when memory has no entry, and an entry found there is kept in memory
+/// again. New entries go to Redis in the background, until their stale
+/// time. Requests for a key whose load is running wait for that load
+/// instead of starting one.
 pub struct AnswerCache {
     entries: Cache<String, Arc<Entry>>,
     loading: Mutex<HashMap<String, Waiting>>,
+    redis: Option<Arc<RedisStore>>,
 }
 
 /// What a load ended with, handed to every request that waited on it.
@@ -117,6 +125,12 @@ impl Expiry<String, Arc<Entry>> for KeepUntilStale {
 
 impl Default for AnswerCache {
     fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl AnswerCache {
+    pub fn new(redis: Option<Arc<RedisStore>>) -> Self {
         Self {
             entries: Cache::builder()
                 .max_capacity(MAX_BYTES)
@@ -126,17 +140,83 @@ impl Default for AnswerCache {
                 .expire_after(KeepUntilStale)
                 .build(),
             loading: Mutex::default(),
+            redis,
         }
     }
-}
 
-impl AnswerCache {
+    /// The entry kept in memory, without asking Redis.
     pub fn get(&self, key: &str) -> Option<Arc<Entry>> {
         self.entries.get(key)
     }
 
+    /// The entry kept in memory, or else the one kept in Redis.
+    pub async fn lookup(&self, key: &str) -> Option<Arc<Entry>> {
+        self.lookup_many(&[key.to_owned()]).await.pop().flatten()
+    }
+
+    /// The entries of `keys`, in their order, asking Redis once for every key memory has no entry for.
+    pub async fn lookup_many(&self, keys: &[String]) -> Vec<Option<Arc<Entry>>> {
+        let mut entries: Vec<Option<Arc<Entry>>> =
+            keys.iter().map(|key| self.entries.get(key)).collect();
+        let Some(redis) = &self.redis else {
+            return entries;
+        };
+        let missing: Vec<usize> = (0..keys.len())
+            .filter(|index| entries[*index].is_none())
+            .collect();
+        if missing.is_empty() {
+            return entries;
+        }
+        let stored_keys: Vec<String> = missing
+            .iter()
+            .map(|index| redis.key(&stored_key(&keys[*index])))
+            .collect();
+        let Some(stored) = redis
+            .run(|mut connection| async move {
+                redis::cmd("MGET")
+                    .arg(&stored_keys)
+                    .query_async::<Vec<Option<Vec<u8>>>>(&mut connection)
+                    .await
+            })
+            .await
+        else {
+            return entries;
+        };
+        for (index, bytes) in missing.into_iter().zip(stored) {
+            if let Some(entry) = bytes.and_then(decode) {
+                let entry = Arc::new(entry);
+                self.entries.insert(keys[index].clone(), entry.clone());
+                entries[index] = Some(entry);
+            }
+        }
+        entries
+    }
+
+    /// Keeps `entry` in memory, and writes it to Redis in the background until its stale time.
     pub fn insert(&self, key: &str, entry: Arc<Entry>) {
-        self.entries.insert(key.to_owned(), entry);
+        self.entries.insert(key.to_owned(), entry.clone());
+        let Some(redis) = self.redis.clone() else {
+            return;
+        };
+        let lifetime_ms = entry.stale_until_ms.saturating_sub(entry.stored_at_ms);
+        if lifetime_ms == 0 {
+            return;
+        }
+        let stored_key = redis.key(&stored_key(key));
+        tokio::spawn(async move {
+            let bytes = encode(&entry);
+            redis
+                .run(|mut connection| async move {
+                    redis::cmd("SET")
+                        .arg(stored_key)
+                        .arg(bytes)
+                        .arg("PX")
+                        .arg(lifetime_ms)
+                        .query_async::<()>(&mut connection)
+                        .await
+                })
+                .await;
+        });
     }
 
     /// Joins the load of `key` that is running, or registers a new one. The sender comes back only for a new load:
@@ -184,6 +264,108 @@ impl AnswerCache {
     fn loading(&self) -> std::sync::MutexGuard<'_, HashMap<String, Waiting>> {
         self.loading.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+fn stored_key(key: &str) -> String {
+    format!("cache:{key}")
+}
+
+fn encode(entry: &Entry) -> Vec<u8> {
+    let body = &entry.answer.body;
+    let content_type = entry
+        .answer
+        .content_type
+        .as_ref()
+        .map_or(&[][..], HeaderValue::as_bytes);
+    let row = entry.row.as_ref().and_then(|row| {
+        let start = (row.as_ptr() as usize).checked_sub(body.as_ptr() as usize)?;
+        let end = start.checked_add(row.len())?;
+        (end <= body.len()).then_some((u32::try_from(start).ok()?, u32::try_from(end).ok()?))
+    });
+
+    let mut bytes = Vec::with_capacity(48 + content_type.len() + body.len());
+    bytes.push(FORMAT);
+    bytes.extend_from_slice(&entry.answer.status.as_u16().to_be_bytes());
+    for ms in [
+        entry.stored_at_ms,
+        entry.fresh_until_ms,
+        entry.stale_until_ms,
+    ] {
+        bytes.extend_from_slice(&ms.to_be_bytes());
+    }
+    match entry.owner {
+        Some(owner) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&owner.to_be_bytes());
+        }
+        None => bytes.push(0),
+    }
+    match row {
+        Some((start, end)) => {
+            bytes.push(1);
+            bytes.extend_from_slice(&start.to_be_bytes());
+            bytes.extend_from_slice(&end.to_be_bytes());
+        }
+        None => bytes.push(0),
+    }
+    let content_type_length = u16::try_from(content_type.len()).unwrap_or(0);
+    bytes.extend_from_slice(&content_type_length.to_be_bytes());
+    bytes.extend_from_slice(&content_type[..usize::from(content_type_length)]);
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+fn decode(bytes: Vec<u8>) -> Option<Entry> {
+    let bytes = Bytes::from(bytes);
+    let mut at = 0;
+    let mut take = |length: usize| {
+        let part = bytes.get(at..at + length)?;
+        at += length;
+        Some(part)
+    };
+    if take(1)? != [FORMAT] {
+        return None;
+    }
+    let status = StatusCode::from_u16(u16::from_be_bytes(take(2)?.try_into().ok()?)).ok()?;
+    let mut ms = || Some(u64::from_be_bytes(take(8)?.try_into().ok()?));
+    let (stored_at_ms, fresh_until_ms, stale_until_ms) = (ms()?, ms()?, ms()?);
+    let owner = match take(1)? {
+        [0] => None,
+        [1] => Some(u64::from_be_bytes(take(8)?.try_into().ok()?)),
+        _ => return None,
+    };
+    let row = match take(1)? {
+        [0] => None,
+        [1] => {
+            let start = u32::from_be_bytes(take(4)?.try_into().ok()?);
+            let end = u32::from_be_bytes(take(4)?.try_into().ok()?);
+            Some((usize::try_from(start).ok()?, usize::try_from(end).ok()?))
+        }
+        _ => return None,
+    };
+    let content_type_length = usize::from(u16::from_be_bytes(take(2)?.try_into().ok()?));
+    let content_type = match take(content_type_length)? {
+        [] => None,
+        value => Some(HeaderValue::from_bytes(value).ok()?),
+    };
+    let body = bytes.slice(at..);
+    let row = match row {
+        Some((start, end)) if start <= end && end <= body.len() => Some(body.slice(start..end)),
+        Some(_) => return None,
+        None => None,
+    };
+    Some(Entry {
+        answer: Answer {
+            status,
+            content_type,
+            body,
+        },
+        row,
+        owner,
+        stored_at_ms,
+        fresh_until_ms,
+        stale_until_ms,
+    })
 }
 
 #[cfg(test)]
@@ -242,6 +424,102 @@ mod tests {
         assert_eq!(AnswerCache::wait(waiting).await, None);
         let (_, finisher) = cache.join("mods/1");
         assert!(finisher.is_some());
+    }
+
+    #[test]
+    fn an_entry_comes_back_from_its_stored_form_as_it_was() {
+        let body = Bytes::from_static(br#"{"data":{"id":50,"modId":5}}"#);
+        let row = body.slice(8..body.len() - 1);
+        let kept = Entry {
+            row: Some(row),
+            owner: Some(5),
+            ..Entry::new(
+                Answer {
+                    status: StatusCode::OK,
+                    content_type: Some(HeaderValue::from_static("application/json; charset=utf-8")),
+                    body,
+                },
+                1_000,
+                60_000,
+            )
+        };
+        let back = decode(encode(&kept)).unwrap();
+        assert_eq!(back, kept);
+        assert_eq!(back.row.unwrap(), r#"{"id":50,"modId":5}"#);
+
+        let not_found = Entry::new(
+            Answer {
+                status: StatusCode::NOT_FOUND,
+                content_type: None,
+                body: Bytes::new(),
+            },
+            1_000,
+            60_000,
+        );
+        assert_eq!(decode(encode(&not_found)).unwrap(), not_found);
+    }
+
+    #[test]
+    fn a_stored_form_that_does_not_read_is_no_entry() {
+        assert_eq!(decode(Vec::new()), None);
+        assert_eq!(decode(vec![FORMAT + 1, 0, 200]), None);
+        let mut cut = encode(&entry("one"));
+        cut.truncate(10);
+        assert_eq!(decode(cut), None);
+    }
+
+    #[tokio::test]
+    async fn entries_survive_in_redis_for_a_new_cache() {
+        let Ok(url) = std::env::var("CONTENT_GATEWAY_TEST_REDIS_URL") else {
+            eprintln!("CONTENT_GATEWAY_TEST_REDIS_URL is not set, skipped");
+            return;
+        };
+        let prefix = format!("content-gateway-test:cache:{}", std::process::id());
+        let open = || Arc::new(RedisStore::open(&url, prefix.clone()).unwrap());
+        let kept = AnswerCache::new(Some(open()));
+        kept.insert("mod:1", entry("one"));
+        kept.insert("mod:2", entry("two"));
+
+        let store = open();
+        let stored = vec![store.key("cache:mod:1"), store.key("cache:mod:2")];
+        for _ in 0..100 {
+            let keys = stored.clone();
+            let written = store
+                .run(|mut connection| async move {
+                    redis::cmd("EXISTS")
+                        .arg(keys)
+                        .query_async::<u32>(&mut connection)
+                        .await
+                })
+                .await;
+            if written == Some(2) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let after_restart = AnswerCache::new(Some(store.clone()));
+        let found = after_restart
+            .lookup_many(&["mod:2".to_owned(), "mod:3".to_owned(), "mod:1".to_owned()])
+            .await;
+        let bodies: Vec<Option<Bytes>> = found
+            .iter()
+            .map(|entry| entry.as_ref().map(|entry| entry.answer.body.clone()))
+            .collect();
+        assert_eq!(
+            bodies,
+            [Some(Bytes::from("two")), None, Some(Bytes::from("one"))]
+        );
+        assert!(after_restart.get("mod:1").is_some());
+
+        store
+            .run(|mut connection| async move {
+                redis::cmd("DEL")
+                    .arg(stored)
+                    .query_async::<()>(&mut connection)
+                    .await
+            })
+            .await;
     }
 
     #[tokio::test]

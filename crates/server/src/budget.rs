@@ -111,7 +111,7 @@ pub struct Budget {
 }
 
 struct Shared {
-    store: RedisStore,
+    store: Arc<RedisStore>,
     admit: Script,
     hold: Script,
     writing_days: tokio::sync::Mutex<()>,
@@ -201,7 +201,7 @@ impl Budget {
         limit_per_minute: u32,
         pools: impl IntoIterator<Item = (C, P)>,
         clock: Arc<dyn Clock>,
-        redis: Option<RedisStore>,
+        redis: Option<Arc<RedisStore>>,
     ) -> Self
     where
         C: Into<Arc<str>>,
@@ -829,7 +829,7 @@ mod tests {
                 let store = RedisStore::open(url, prefix.clone()).unwrap();
                 budgets.push((
                     Source::Redis,
-                    Budget::new(limit, POOLS, clock.clone(), Some(store)),
+                    Budget::new(limit, POOLS, clock.clone(), Some(Arc::new(store))),
                 ));
             }
             Self { redis, budgets }
@@ -1137,7 +1137,7 @@ mod tests {
                 5,
                 POOLS,
                 clock.clone(),
-                Some(RedisStore::open(&url, prefix.clone()).unwrap()),
+                Some(Arc::new(RedisStore::open(&url, prefix.clone()).unwrap())),
             )
         };
 
@@ -1183,7 +1183,7 @@ mod tests {
                 5,
                 POOLS,
                 clock.clone(),
-                Some(RedisStore::open(&url, prefix.clone()).unwrap()),
+                Some(Arc::new(RedisStore::open(&url, prefix.clone()).unwrap())),
             )
         };
 
@@ -1211,7 +1211,7 @@ mod tests {
         let clock = TestClock::at(NOV_3_2026_20H);
         let store = RedisStore::open(&url, prefix.clone()).unwrap();
         store.skip_for_a_while();
-        let before = Budget::new(5, POOLS, clock.clone(), Some(store));
+        let before = Budget::new(5, POOLS, clock.clone(), Some(Arc::new(store)));
         before.record("app", "app", Some(200), None).await;
         before.write_days_at_exit().await;
         drop(before);
@@ -1220,7 +1220,7 @@ mod tests {
             5,
             POOLS,
             clock,
-            Some(RedisStore::open(&url, prefix.clone()).unwrap()),
+            Some(Arc::new(RedisStore::open(&url, prefix.clone()).unwrap())),
         );
         let snapshot = after.snapshot().await;
         assert_eq!(snapshot.source, Source::Redis);
@@ -1241,7 +1241,7 @@ mod tests {
                 5,
                 POOLS,
                 clock.clone(),
-                Some(RedisStore::open(&url, prefix.clone()).unwrap()),
+                Some(Arc::new(RedisStore::open(&url, prefix.clone()).unwrap())),
             )
         };
         let (first, second) = (open(), open());
@@ -1260,7 +1260,7 @@ mod tests {
     async fn falls_back_to_memory_when_redis_does_not_answer() {
         let clock = TestClock::at(NOV_3_2026_20H);
         let store = RedisStore::open("redis://127.0.0.1:1", unique_prefix()).unwrap();
-        let budget = Budget::new(2, POOLS, clock.clone(), Some(store));
+        let budget = Budget::new(2, POOLS, clock.clone(), Some(Arc::new(store)));
 
         assert_eq!(budget.admit("app", "app", 2).await, Ok(()));
         assert!(budget.admit("app", "app", 1).await.is_err());

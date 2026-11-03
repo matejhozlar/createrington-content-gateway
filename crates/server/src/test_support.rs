@@ -23,6 +23,7 @@ use crate::{
     cache::AnswerCache,
     config::{ApiKey, Consumer, Token},
     curseforge::Upstream,
+    redis_store::RedisStore,
 };
 
 pub(crate) const NOV_3_2026_20H: u64 = 1_793_736_000_000;
@@ -111,6 +112,15 @@ pub(crate) struct Gateway {
 }
 
 pub(crate) fn gateway(mock: &Mock, limit: u32, timeout: Duration) -> Gateway {
+    gateway_on(mock, limit, timeout, None)
+}
+
+pub(crate) fn gateway_on(
+    mock: &Mock,
+    limit: u32,
+    timeout: Duration,
+    redis: Option<Arc<RedisStore>>,
+) -> Gateway {
     let clock = TestClock::at(NOV_3_2026_20H);
     let consumers = vec![Consumer {
         name: "app".to_owned(),
@@ -118,9 +128,9 @@ pub(crate) fn gateway(mock: &Mock, limit: u32, timeout: Duration) -> Gateway {
         pools: vec!["launcher".to_owned()],
     }];
     let state = Arc::new(AppState {
-        budget: Budget::new(limit, [("app", "launcher")], clock.clone(), None),
+        budget: Budget::new(limit, [("app", "launcher")], clock.clone(), redis.clone()),
         upstream: Upstream::new(mock.base.clone(), ApiKey::new(KEY), timeout).unwrap(),
-        cache: AnswerCache::default(),
+        cache: AnswerCache::new(redis),
         clock: clock.clone(),
         consumers,
     });

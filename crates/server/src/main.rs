@@ -48,7 +48,7 @@ async fn main() -> ExitCode {
         Some(url) => match RedisStore::open(url.as_str(), redis_store::DEFAULT_PREFIX) {
             Ok(store) => {
                 store.ping().await;
-                Some(store)
+                Some(Arc::new(store))
             }
             Err(error) => {
                 tracing::error!("cannot use REDIS_URL: {error}");
@@ -65,7 +65,7 @@ async fn main() -> ExitCode {
         }
     };
     tracing::info!(
-        "listening on {} for {} consumer(s), {} calls a minute, budget kept in {}",
+        "listening on {} for {} consumer(s), {} calls a minute, budget and cache kept in {}",
         config.listen,
         config.consumers.len(),
         config.budget_per_minute,
