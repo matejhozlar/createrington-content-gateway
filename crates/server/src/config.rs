@@ -112,7 +112,7 @@ pub fn log_filter_from_env() -> Result<EnvFilter, ConfigError> {
 fn log_filter_from_lookup(
     lookup: impl Fn(&str) -> Option<String>,
 ) -> Result<EnvFilter, ConfigError> {
-    match lookup(LOG_ENV) {
+    match set(lookup(LOG_ENV)) {
         None => Ok(EnvFilter::new(DEFAULT_LOG)),
         Some(value) => EnvFilter::try_new(&value).map_err(|error| ConfigError::LogFilter {
             name: LOG_ENV,
@@ -128,6 +128,7 @@ impl Config {
     }
 
     fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+        let lookup = |name: &str| set(lookup(name));
         let host = match lookup(HOST_ENV) {
             Some(value) => value.parse().map_err(|_| ConfigError::Host {
                 name: HOST_ENV,
@@ -180,6 +181,10 @@ impl Config {
             budget_per_minute,
         })
     }
+}
+
+fn set(value: Option<String>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty())
 }
 
 fn parse_consumers(json: &str) -> Result<Vec<Consumer>, ConfigError> {
@@ -383,6 +388,29 @@ mod tests {
             config_from(&[(CONSUMERS_ENV, &json), (TOKEN_ENV, TOKEN)]),
             Err(ConfigError::ConsumerSources)
         );
+    }
+
+    #[test]
+    fn an_empty_variable_counts_as_unset() {
+        let json = format!(r#"[{{"name":"app","token":"{TOKEN}","pools":["app"]}}]"#);
+        let config = config_from(&[
+            (CONSUMERS_ENV, &json),
+            (TOKEN_ENV, ""),
+            (HOST_ENV, " "),
+            (PORT_ENV, ""),
+            (BUDGET_ENV, ""),
+        ])
+        .unwrap();
+        assert_eq!(config.consumers[0].name, "app");
+        assert_eq!(config.listen, "127.0.0.1:5005".parse().unwrap());
+        assert_eq!(config.budget_per_minute, 300);
+        assert_eq!(
+            config_from(&[(TOKEN_ENV, "  ")]),
+            Err(ConfigError::NoConsumers)
+        );
+
+        let filter = log_filter_from_lookup(lookup_in(&[(LOG_ENV, "")])).unwrap();
+        assert_eq!(filter.to_string(), DEFAULT_LOG);
     }
 
     #[test]
