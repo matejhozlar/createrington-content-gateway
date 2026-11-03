@@ -13,8 +13,9 @@ use axum::{
 use crate::{
     app::AppState,
     auth::Pool,
+    batch::{self, Batch},
     budget::{self, Refusal},
-    cache::{Answer, AnswerCache, Entry, Finisher, LoadFailure, Outcome, STALE_FOR},
+    cache::{Answer, AnswerCache, Entry, Finisher, LoadFailure, Outcome},
     config::ApiKey,
     error::ApiError,
 };
@@ -27,13 +28,14 @@ const HOUR_MS: u64 = 60 * MINUTE_MS;
 const DAY_MS: u64 = 24 * HOUR_MS;
 const X_CACHE: HeaderName = HeaderName::from_static("x-cache");
 
-/// Why CurseForge gave no answer: it took longer than the timeout, could not be reached, or sent more than the
-/// gateway keeps.
+/// Why CurseForge gave no answer: it took longer than the timeout, could not be reached, sent more than the gateway
+/// keeps, or sent a batch answer the gateway could not split into rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamFailure {
     Timeout,
     Unreachable,
     TooLarge,
+    Unreadable,
 }
 
 /// The client that calls the CurseForge API with the gateway's key.
@@ -155,6 +157,26 @@ fn freshness(segments: &[&str]) -> Option<Freshness> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Share {
+    Mod(u64),
+    File { project: u64, file: u64 },
+}
+
+fn share_of(segments: &[&str], query: Option<&str>) -> Option<Share> {
+    if query.is_some_and(|query| !query.is_empty()) {
+        return None;
+    }
+    match segments {
+        ["mods", project] => project.parse().ok().map(Share::Mod),
+        ["mods", project, "files", file] => Some(Share::File {
+            project: project.parse().ok()?,
+            file: file.parse().ok()?,
+        }),
+        _ => None,
+    }
+}
+
 fn valid_segment(segment: &str) -> bool {
     !segment.is_empty()
         && segment
@@ -196,6 +218,15 @@ pub async fn passthrough(
         return ApiError::invalid_path().into_response();
     }
     let query = uri.query().map(str::to_owned);
+    let forced = wants_fresh(&headers);
+
+    if method == Method::POST
+        && query.as_deref().is_none_or(str::is_empty)
+        && let Some(batch) = Batch::of(&segments)
+        && let Some(ids) = batch.ids(&body)
+    {
+        return batch::answer(state, pool, batch, ids, forced).await;
+    }
 
     let Some(freshness) = (method == Method::GET)
         .then(|| freshness(&segments))
@@ -214,11 +245,25 @@ pub async fn passthrough(
         };
     };
 
-    let key = cache_key(&path, query.as_deref());
-    let forced = wants_fresh(&headers);
+    let share = share_of(&segments, query.as_deref());
+    let key = match share {
+        Some(Share::Mod(project)) => Batch::Mods.key(project),
+        _ => cache_key(&path, query.as_deref()),
+    };
     let now = state.clock.now_ms();
+    if !forced
+        && let Some(Share::File { project, file }) = share
+        && let Some(entry) = state.cache.get(&Batch::Files.key(file)).filter(|entry| {
+            entry.is_fresh(now)
+                && entry.answer.status == StatusCode::OK
+                && entry.owner == Some(project)
+        })
+    {
+        state.budget.record_hit(&pool.consumer, &pool.name);
+        return respond(&entry.answer, "hit");
+    }
     let cached = state.cache.get(&key);
-    if !forced && let Some(entry) = cached.as_ref().filter(|entry| entry.fresh_until_ms > now) {
+    if !forced && let Some(entry) = cached.as_ref().filter(|entry| entry.is_fresh(now)) {
         state.budget.record_hit(&pool.consumer, &pool.name);
         return respond(&entry.answer, "hit");
     }
@@ -239,6 +284,7 @@ pub async fn passthrough(
             path,
             query,
             freshness,
+            share,
             forced,
         };
         tokio::spawn(load.run(finisher));
@@ -262,7 +308,7 @@ pub async fn passthrough(
                 LoadFailure::Answered(answer) => answer.status.is_server_error(),
                 LoadFailure::Refused(_) | LoadFailure::Upstream(_) => true,
             };
-            let stale = cached.filter(|entry| entry.stale_until_ms > state.clock.now_ms());
+            let stale = cached.filter(|entry| entry.is_stale(state.clock.now_ms()));
             match stale {
                 Some(entry) if curseforge_failed => {
                     state.budget.record_hit(&pool.consumer, &pool.name);
@@ -282,6 +328,7 @@ struct Load {
     path: String,
     query: Option<String>,
     freshness: Freshness,
+    share: Option<Share>,
     forced: bool,
 }
 
@@ -297,7 +344,7 @@ impl Load {
             && let Some(entry) = state
                 .cache
                 .get(&self.key)
-                .filter(|entry| entry.fresh_until_ms > state.clock.now_ms())
+                .filter(|entry| entry.is_fresh(state.clock.now_ms()))
         {
             return Outcome {
                 loaded: Ok(entry),
@@ -333,14 +380,23 @@ impl Load {
                 called: true,
             };
         };
-        let now = state.clock.now_ms();
-        let entry = Arc::new(Entry {
-            answer,
-            stored_at_ms: now,
-            fresh_until_ms: now + fresh_ms,
-            stale_until_ms: now + fresh_ms + u64::try_from(STALE_FOR.as_millis()).unwrap_or(0),
-        });
+        let found = answer.status == StatusCode::OK;
+        let mut entry = Entry::new(answer, state.clock.now_ms(), fresh_ms);
+        if found
+            && self.share.is_some()
+            && let Some((row, owner)) = batch::row_of(&entry.answer.body)
+        {
+            entry.row = Some(row);
+            entry.owner = owner;
+        }
+        let entry = Arc::new(entry);
         state.cache.insert(&self.key, entry.clone());
+        if let Some(Share::File { project, file }) = self.share
+            && entry.row.is_some()
+            && entry.owner == Some(project)
+        {
+            state.cache.insert(&Batch::Files.key(file), entry.clone());
+        }
         Outcome {
             loaded: Ok(entry),
             called: true,
@@ -361,6 +417,18 @@ async fn call(
         .admit(&pool.consumer, &pool.name, 1)
         .await
         .map_err(LoadFailure::Refused)?;
+    send_recorded(state, pool, method, path, query, body).await
+}
+
+/// Sends one call the budget already admitted and records it. A 429 comes back as the hold it starts.
+pub async fn send_recorded(
+    state: &AppState,
+    pool: &Pool,
+    method: Method,
+    path: &str,
+    query: Option<&str>,
+    body: Bytes,
+) -> Result<Answer, LoadFailure> {
     match state.upstream.send(method, path, query, body).await {
         Ok((answer, retry_after)) => {
             state
@@ -389,7 +457,7 @@ async fn call(
     }
 }
 
-fn respond(answer: &Answer, cache: &'static str) -> Response {
+pub fn respond(answer: &Answer, cache: &'static str) -> Response {
     let mut response = (answer.status, answer.body.clone()).into_response();
     let headers = response.headers_mut();
     match &answer.content_type {
@@ -404,7 +472,7 @@ fn respond(answer: &Answer, cache: &'static str) -> Response {
     response
 }
 
-fn failed(failure: LoadFailure, pool: &Pool) -> Response {
+pub fn failed(failure: LoadFailure, pool: &Pool) -> Response {
     match failure {
         LoadFailure::Answered(answer) => respond(&answer, "miss"),
         LoadFailure::Refused(refusal) => ApiError::refused(refusal, &pool.name).into_response(),
@@ -743,14 +811,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_post_goes_through_with_its_body_and_is_counted() {
+    async fn a_post_that_is_not_a_plain_batch_goes_through_with_its_body() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, r#"{"data":[]}"#)).await;
         let gateway = gateway(&mock, 300, TIMEOUT);
         for _ in 0..2 {
             let got = send(
                 &gateway.router,
                 Request::post("/v1/curseforge/mods"),
-                r#"{"modIds":[1,2]}"#,
+                r#"{"modIds":[1,2],"filterPcOnly":true}"#,
             )
             .await;
             assert_eq!(got.body, r#"{"data":[]}"#);
@@ -760,7 +828,7 @@ mod tests {
             (seen[0].method.as_str(), seen[0].uri.as_str()),
             ("POST", "/v1/mods")
         );
-        assert_eq!(seen[0].body, r#"{"modIds":[1,2]}"#);
+        assert_eq!(seen[0].body, r#"{"modIds":[1,2],"filterPcOnly":true}"#);
         assert_eq!(gateway.state.budget.snapshot().await.used, 2);
     }
 

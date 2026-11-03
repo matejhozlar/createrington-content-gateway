@@ -80,6 +80,11 @@ impl ApiError {
                 "UPSTREAM_TOO_LARGE",
                 "CurseForge answered with more than the gateway keeps",
             ),
+            UpstreamFailure::Unreadable => Self::new(
+                StatusCode::BAD_GATEWAY,
+                "UPSTREAM_UNREADABLE",
+                "CurseForge answered a batch with something other than a list of rows with ids",
+            ),
         }
     }
 

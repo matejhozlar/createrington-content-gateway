@@ -23,13 +23,38 @@ pub struct Answer {
 }
 
 /// A cached answer, when it was stored, and until when it is fresh and after that stale, in milliseconds since the
-/// Unix epoch.
+/// Unix epoch. For a project or a file, `row` is the object under `data`, a slice of the body, and `owner` the
+/// project a file belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub answer: Answer,
+    pub row: Option<Bytes>,
+    pub owner: Option<u64>,
     pub stored_at_ms: u64,
     pub fresh_until_ms: u64,
     pub stale_until_ms: u64,
+}
+
+impl Entry {
+    pub fn new(answer: Answer, now_ms: u64, fresh_ms: u64) -> Self {
+        let fresh_until_ms = now_ms + fresh_ms;
+        Self {
+            answer,
+            row: None,
+            owner: None,
+            stored_at_ms: now_ms,
+            fresh_until_ms,
+            stale_until_ms: fresh_until_ms + u64::try_from(STALE_FOR.as_millis()).unwrap_or(0),
+        }
+    }
+
+    pub fn is_fresh(&self, now_ms: u64) -> bool {
+        self.fresh_until_ms > now_ms
+    }
+
+    pub fn is_stale(&self, now_ms: u64) -> bool {
+        self.stale_until_ms > now_ms
+    }
 }
 
 /// The answers of CurseForge, in memory, at most 256 MiB of them.
@@ -165,16 +190,15 @@ mod tests {
     use super::*;
 
     fn entry(body: &'static str) -> Arc<Entry> {
-        Arc::new(Entry {
-            answer: Answer {
+        Arc::new(Entry::new(
+            Answer {
                 status: StatusCode::OK,
                 content_type: None,
                 body: Bytes::from_static(body.as_bytes()),
             },
-            stored_at_ms: 0,
-            fresh_until_ms: 1_000,
-            stale_until_ms: 2_000,
-        })
+            0,
+            1_000,
+        ))
     }
 
     fn outcome(body: &'static str) -> Outcome {

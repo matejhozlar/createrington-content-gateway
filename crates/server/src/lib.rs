@@ -1,5 +1,6 @@
 pub mod app;
 pub mod auth;
+pub mod batch;
 pub mod budget;
 pub mod cache;
 pub mod config;
