@@ -21,7 +21,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn from_config(config: &Config, redis: Option<Arc<RedisStore>>) -> reqwest::Result<Self> {
+    pub fn from_config(
+        config: &Config,
+        budget_redis: Option<Arc<RedisStore>>,
+        cache_redis: Option<Arc<RedisStore>>,
+    ) -> reqwest::Result<Self> {
         let pools = config.consumers.iter().flat_map(|consumer| {
             consumer
                 .pools
@@ -30,18 +34,13 @@ impl AppState {
         });
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         Ok(Self {
-            budget: Budget::new(
-                config.budget_per_minute,
-                pools,
-                clock.clone(),
-                redis.clone(),
-            ),
+            budget: Budget::new(config.budget_per_minute, pools, clock.clone(), budget_redis),
             upstream: Upstream::new(
                 CURSEFORGE_API,
                 config.curseforge_api_key.clone(),
                 curseforge::TIMEOUT,
             )?,
-            cache: AnswerCache::new(redis),
+            cache: AnswerCache::new(cache_redis),
             clock,
             consumers: config.consumers.clone(),
         })

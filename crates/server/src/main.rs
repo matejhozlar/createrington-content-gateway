@@ -2,7 +2,7 @@ use std::{io::IsTerminal, process::ExitCode, sync::Arc, time::Duration};
 
 use content_gateway::{
     app::{self, AppState},
-    config::{self, Config, DEFAULT_LOG},
+    config::{self, Config, DEFAULT_LOG, RedisUrl},
     redis_store::{self, RedisStore},
     serve::{self, Stopped},
 };
@@ -43,21 +43,35 @@ async fn main() -> ExitCode {
         }
     };
 
-    let redis = match &config.redis_url {
-        None => None,
-        Some(url) => match RedisStore::open(url.as_str(), redis_store::DEFAULT_PREFIX) {
-            Ok(store) => {
-                store.ping().await;
-                Some(Arc::new(store))
-            }
-            Err(error) => {
-                tracing::error!("cannot use REDIS_URL: {error}");
-                return ExitCode::FAILURE;
-            }
-        },
+    let budget_keeps = if config.cache_redis_url.is_some() {
+        "the budget"
+    } else {
+        "the budget and the cache"
     };
+    let budget_redis = match open_redis(config.redis_url.as_ref(), "REDIS_URL", budget_keeps).await
+    {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let cache_redis = match &config.cache_redis_url {
+        None => budget_redis.clone(),
+        Some(url) => {
+            match open_redis(Some(url), "CONTENT_GATEWAY_CACHE_REDIS_URL", "the cache").await {
+                Ok(store) => store,
+                Err(code) => return code,
+            }
+        }
+    };
+    let kept_in = |store: &Option<Arc<RedisStore>>| {
+        if store.is_some() {
+            "Redis, in memory while it fails"
+        } else {
+            "memory"
+        }
+    };
+    let (budget_in, cache_in) = (kept_in(&budget_redis), kept_in(&cache_redis));
 
-    let state = match AppState::from_config(&config, redis) {
+    let state = match AppState::from_config(&config, budget_redis, cache_redis) {
         Ok(state) => Arc::new(state),
         Err(error) => {
             tracing::error!("cannot set up the CurseForge client: {error}");
@@ -65,15 +79,10 @@ async fn main() -> ExitCode {
         }
     };
     tracing::info!(
-        "listening on {} for {} consumer(s), {} calls a minute, budget and cache kept in {}",
+        "listening on {} for {} consumer(s), {} calls a minute, budget kept in {budget_in}, cache in {cache_in}",
         config.listen,
         config.consumers.len(),
         config.budget_per_minute,
-        if config.redis_url.is_some() {
-            "Redis, in memory while it fails"
-        } else {
-            "memory"
-        }
     );
     let stopped = serve::serve(
         listener,
@@ -98,6 +107,27 @@ async fn main() -> ExitCode {
         Err(error) => {
             tracing::error!("{error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+async fn open_redis(
+    url: Option<&RedisUrl>,
+    name: &str,
+    keeps: &'static str,
+) -> Result<Option<Arc<RedisStore>>, ExitCode> {
+    let Some(url) = url else {
+        return Ok(None);
+    };
+    match RedisStore::open(url.as_str(), redis_store::DEFAULT_PREFIX) {
+        Ok(store) => {
+            let store = store.keeping(keeps);
+            store.ping().await;
+            Ok(Some(Arc::new(store)))
+        }
+        Err(error) => {
+            tracing::error!("cannot use {name}: {error}");
+            Err(ExitCode::FAILURE)
         }
     }
 }

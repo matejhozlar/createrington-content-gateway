@@ -14,6 +14,7 @@ const CONSUMERS_ENV: &str = "CONTENT_GATEWAY_CONSUMERS";
 const TOKEN_ENV: &str = "CONTENT_GATEWAY_TOKEN";
 const BUDGET_ENV: &str = "CONTENT_GATEWAY_BUDGET_PER_MINUTE";
 const REDIS_ENV: &str = "REDIS_URL";
+const CACHE_REDIS_ENV: &str = "CONTENT_GATEWAY_CACHE_REDIS_URL";
 const API_KEY_ENV: &str = "CURSEFORGE_API_KEY";
 const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_PORT: u16 = 5005;
@@ -30,6 +31,7 @@ pub struct Config {
     pub consumers: Vec<Consumer>,
     pub budget_per_minute: u32,
     pub redis_url: Option<RedisUrl>,
+    pub cache_redis_url: Option<RedisUrl>,
     pub curseforge_api_key: ApiKey,
 }
 
@@ -209,13 +211,8 @@ impl Config {
             None => DEFAULT_BUDGET_PER_MINUTE,
         };
 
-        let redis_url = match lookup(REDIS_ENV) {
-            Some(value) => match redis::Client::open(value.as_str()) {
-                Ok(_) => Some(RedisUrl(value)),
-                Err(_) => return Err(ConfigError::RedisUrl { name: REDIS_ENV }),
-            },
-            None => None,
-        };
+        let redis_url = parse_redis_url(lookup(REDIS_ENV), REDIS_ENV)?;
+        let cache_redis_url = parse_redis_url(lookup(CACHE_REDIS_ENV), CACHE_REDIS_ENV)?;
 
         let consumers = match (lookup(CONSUMERS_ENV), lookup(TOKEN_ENV)) {
             (Some(_), Some(_)) => return Err(ConfigError::ConsumerSources),
@@ -238,9 +235,22 @@ impl Config {
             consumers,
             budget_per_minute,
             redis_url,
+            cache_redis_url,
             curseforge_api_key,
         })
     }
+}
+
+fn parse_redis_url(
+    value: Option<String>,
+    name: &'static str,
+) -> Result<Option<RedisUrl>, ConfigError> {
+    value
+        .map(|value| match redis::Client::open(value.as_str()) {
+            Ok(_) => Ok(RedisUrl(value)),
+            Err(_) => Err(ConfigError::RedisUrl { name }),
+        })
+        .transpose()
 }
 
 fn set(value: Option<String>) -> Option<String> {
@@ -425,6 +435,27 @@ mod tests {
         assert_eq!(
             config_with_token(&[(REDIS_ENV, "")]).unwrap().redis_url,
             None
+        );
+    }
+
+    #[test]
+    fn the_cache_can_have_a_redis_of_its_own() {
+        let config = config_with_token(&[
+            (REDIS_ENV, "redis://127.0.0.1:6379/0"),
+            (CACHE_REDIS_ENV, "redis://:cache-password@127.0.0.1:6382/0"),
+        ])
+        .unwrap();
+        assert_eq!(
+            config.cache_redis_url.as_ref().map(RedisUrl::as_str),
+            Some("redis://:cache-password@127.0.0.1:6382/0")
+        );
+        assert!(!format!("{config:?}").contains("cache-password"));
+        assert_eq!(config_with_token(&[]).unwrap().cache_redis_url, None);
+        assert_eq!(
+            config_with_token(&[(CACHE_REDIS_ENV, "http://127.0.0.1")]),
+            Err(ConfigError::RedisUrl {
+                name: CACHE_REDIS_ENV
+            })
         );
     }
 
