@@ -39,6 +39,30 @@ jobs:
       - name: Audit dependencies
         run: pnpm audit --audit-level=high
 
+  client:
+    runs-on: oracle
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup
+        uses: ./.gitea/actions/setup
+
+      - name: Check the generated types against openapi.json
+        run: pnpm --filter @createrington/content-gateway-client generate:check
+
+      - name: Type check
+        run: pnpm --filter @createrington/content-gateway-client typecheck
+
+      - name: Test
+        run: pnpm --filter @createrington/content-gateway-client test
+
+      - name: Build
+        run: pnpm --filter @createrington/content-gateway-client build
+
+      - name: Load the package in Node
+        working-directory: packages/client
+        run: node --input-type=module -e "const { ContentGateway } = await import('@createrington/content-gateway-client'); if (typeof ContentGateway !== 'function') process.exit(1)"
+
   rust-format:
     runs-on: hetzner
     steps:
