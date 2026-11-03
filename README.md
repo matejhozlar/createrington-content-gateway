@@ -90,7 +90,7 @@ The image is a static binary on a distroless base. Inside the container the gate
 
 `/v1/curseforge/<path>` sends the request to `https://api.curseforge.com/v1/<path>` with the same query string and body and the gateway's key, and answers with CurseForge's status, content type and body as they came. Every call that reaches CurseForge counts against the budget of the request's pool. A path is segments of letters, digits, `-` and `_`; anything else answers `400 INVALID_PATH`.
 
-These answers are kept and given again while they are fresh, marked `X-Cache: hit` (`miss` when CurseForge was asked). The order of query parameters does not matter. Requests for an answer that is being fetched wait for it and share it.
+These answers are kept and given again while they are fresh, marked `X-Cache: hit` (`miss` when CurseForge was asked). The order of query parameters does not matter. Requests for an answer that is being fetched wait for it and share it. A call that has started always finishes, is counted and is kept, also when the request that started it goes away.
 
 | Route (under `/v1/curseforge`)                                          | Fresh  | Not found (404) |
 | ----------------------------------------------------------------------- | ------ | --------------- |
@@ -104,7 +104,7 @@ These answers are kept and given again while they are fresh, marked `X-Cache: hi
 
 Every other route, and every `POST`, goes to CurseForge each time. Other statuses are never kept. `Cache-Control: no-cache` asks CurseForge again and keeps the new answer. A kept answer stays for 24 h after its fresh time and is given, marked `X-Cache: stale`, when the budget refuses the call, CurseForge holds the key off, answers 5xx or does not answer.
 
-Without a kept answer, a 429 from CurseForge answers `503 UPSTREAM_HOLD` like any held call, a CurseForge that does not answer within 15 s `504 UPSTREAM_TIMEOUT`, and one that cannot be reached `502 UPSTREAM_UNREACHABLE`.
+Without a kept answer, a 429 from CurseForge answers `503 UPSTREAM_HOLD` like any held call, a CurseForge that does not answer within 10 s `504 UPSTREAM_TIMEOUT`, and one that cannot be reached `502 UPSTREAM_UNREACHABLE`.
 
 Errors answer `{ "code", "message" }`. A call the budget refuses answers `503` with `Retry-After`, plus `pool` and `retryAfterMs` in the body; `code` is `BUDGET_SPENT` when the minute's ceiling is reached and `UPSTREAM_HOLD` while CurseForge's 429 hold lasts. A request that needs more calls than a whole minute allows answers `413 REQUEST_TOO_LARGE` without `Retry-After`, since waiting would not help.
 

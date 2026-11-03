@@ -20,7 +20,7 @@ use crate::{
 };
 
 pub const CURSEFORGE_API: &str = "https://api.curseforge.com";
-pub const TIMEOUT: Duration = Duration::from_secs(15);
+pub const TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ANSWER_BYTES: usize = 32 * 1024 * 1024;
 const MINUTE_MS: u64 = 60_000;
 const HOUR_MS: u64 = 60 * MINUTE_MS;
