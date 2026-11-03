@@ -5,9 +5,6 @@ inputs:
   cache-target:
     description: Also cache the target directory. Turn off for jobs that do not compile.
     default: "true"
-  cache-name:
-    description: A name that keeps the target directory of this job apart from the other jobs' caches.
-    default: ""
 
 runs:
   using: composite
@@ -61,6 +58,6 @@ runs:
       uses: actions/cache@v4
       with:
         path: target
-        key: ${{ runner.os }}-cargo-target${{ inputs.cache-name }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-target-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-cargo-target${{ inputs.cache-name }}-${{ hashFiles('rust-toolchain.toml') }}-
+          ${{ runner.os }}-cargo-target-${{ hashFiles('rust-toolchain.toml') }}-
