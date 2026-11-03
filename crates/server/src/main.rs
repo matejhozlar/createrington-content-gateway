@@ -1,13 +1,19 @@
 mod app;
 mod config;
 mod health;
+mod serve;
 
-use std::{io::IsTerminal, process::ExitCode};
+use std::{io::IsTerminal, process::ExitCode, time::Duration};
 
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
-use crate::config::{Config, DEFAULT_LOG};
+use crate::{
+    config::{Config, DEFAULT_LOG},
+    serve::Stopped,
+};
+
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -42,16 +48,23 @@ async fn main() -> ExitCode {
     };
 
     tracing::info!("listening on {}", config.listen);
-    if let Err(error) = axum::serve(listener, app::router())
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-    {
-        tracing::error!("server stopped: {error}");
-        return ExitCode::FAILURE;
+    match serve::serve(listener, app::router(), shutdown_signal(), SHUTDOWN_GRACE).await {
+        Ok(Stopped::Drained) => {
+            tracing::info!("stopped");
+            ExitCode::SUCCESS
+        }
+        Ok(Stopped::GraceExpired) => {
+            tracing::warn!(
+                "requests still open {} s after the shutdown signal, stopped anyway",
+                SHUTDOWN_GRACE.as_secs()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            tracing::error!("{error}");
+            ExitCode::FAILURE
+        }
     }
-
-    tracing::info!("stopped");
-    ExitCode::SUCCESS
 }
 
 async fn shutdown_signal() {
