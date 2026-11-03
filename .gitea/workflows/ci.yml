@@ -89,6 +89,11 @@ jobs:
 
   rust:
     runs-on: hetzner
+    services:
+      content-gateway-test-redis:
+        image: redis:8.10-alpine
+    env:
+      CONTENT_GATEWAY_TEST_REDIS_URL: redis://content-gateway-test-redis:6379/0
     steps:
       - uses: actions/checkout@v4
 

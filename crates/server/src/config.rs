@@ -13,6 +13,7 @@ const LOG_ENV: &str = "CONTENT_GATEWAY_LOG";
 const CONSUMERS_ENV: &str = "CONTENT_GATEWAY_CONSUMERS";
 const TOKEN_ENV: &str = "CONTENT_GATEWAY_TOKEN";
 const BUDGET_ENV: &str = "CONTENT_GATEWAY_BUDGET_PER_MINUTE";
+const REDIS_ENV: &str = "REDIS_URL";
 const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_PORT: u16 = 5005;
 const DEFAULT_BUDGET_PER_MINUTE: u32 = 300;
@@ -27,6 +28,7 @@ pub struct Config {
     pub listen: SocketAddr,
     pub consumers: Vec<Consumer>,
     pub budget_per_minute: u32,
+    pub redis_url: Option<RedisUrl>,
 }
 
 /// A process allowed to call the gateway, and the budget pools it may draw from.
@@ -59,6 +61,22 @@ impl fmt::Debug for Token {
     }
 }
 
+/// The Redis URL, which may carry a password. Its `Debug` output never shows the value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct RedisUrl(String);
+
+impl RedisUrl {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for RedisUrl {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("RedisUrl(..)")
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ConfigError {
     #[error("{name} must be an IP address, got {value:?}")]
@@ -73,6 +91,10 @@ pub enum ConfigError {
     },
     #[error("{name} must be a whole number of calls per minute from 1 up, got {value:?}")]
     Budget { name: &'static str, value: String },
+    #[error(
+        "{name} must be a URL such as redis://:password@127.0.0.1:6379/0 (rediss:// is not supported)"
+    )]
+    RedisUrl { name: &'static str },
     #[error("set {CONSUMERS_ENV} or {TOKEN_ENV} so that something can call the gateway")]
     NoConsumers,
     #[error("set {CONSUMERS_ENV} or {TOKEN_ENV}, not both")]
@@ -163,6 +185,14 @@ impl Config {
             None => DEFAULT_BUDGET_PER_MINUTE,
         };
 
+        let redis_url = match lookup(REDIS_ENV) {
+            Some(value) => match redis::Client::open(value.as_str()) {
+                Ok(_) => Some(RedisUrl(value)),
+                Err(_) => return Err(ConfigError::RedisUrl { name: REDIS_ENV }),
+            },
+            None => None,
+        };
+
         let consumers = match (lookup(CONSUMERS_ENV), lookup(TOKEN_ENV)) {
             (Some(_), Some(_)) => return Err(ConfigError::ConsumerSources),
             (None, None) => return Err(ConfigError::NoConsumers),
@@ -179,6 +209,7 @@ impl Config {
             listen: SocketAddr::new(host, port),
             consumers,
             budget_per_minute,
+            redis_url,
         })
     }
 }
@@ -351,6 +382,36 @@ mod tests {
                     value: value.to_owned(),
                 })
             );
+        }
+    }
+
+    #[test]
+    fn redis_is_optional() {
+        assert_eq!(config_with_token(&[]).unwrap().redis_url, None);
+        assert_eq!(
+            config_with_token(&[(REDIS_ENV, "")]).unwrap().redis_url,
+            None
+        );
+    }
+
+    #[test]
+    fn reads_a_redis_url_and_keeps_its_password_out_of_debug_output() {
+        let url = "redis://:hunter2-redis-password@127.0.0.1:6379/2";
+        let config = config_with_token(&[(REDIS_ENV, url)]).unwrap();
+        assert_eq!(config.redis_url.as_ref().map(RedisUrl::as_str), Some(url));
+        assert!(!format!("{config:?}").contains("hunter2"));
+    }
+
+    #[test]
+    fn rejects_a_redis_url_that_does_not_parse_without_echoing_it() {
+        for value in [
+            "127.0.0.1:6379",
+            "http://127.0.0.1:6379",
+            "rediss://:secret@127.0.0.1:6379",
+        ] {
+            let error = config_with_token(&[(REDIS_ENV, value)]).unwrap_err();
+            assert_eq!(error, ConfigError::RedisUrl { name: REDIS_ENV }, "{value}");
+            assert!(!error.to_string().contains("secret"));
         }
     }
 

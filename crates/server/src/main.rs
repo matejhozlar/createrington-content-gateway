@@ -3,6 +3,7 @@ use std::{io::IsTerminal, process::ExitCode, sync::Arc, time::Duration};
 use content_gateway::{
     app::{self, AppState},
     config::{self, Config, DEFAULT_LOG},
+    redis_store::{self, RedisStore},
     serve::{self, Stopped},
 };
 use tokio::net::TcpListener;
@@ -42,21 +43,41 @@ async fn main() -> ExitCode {
         }
     };
 
-    let state = Arc::new(AppState::from_config(&config));
+    let redis = match &config.redis_url {
+        None => None,
+        Some(url) => match RedisStore::open(url.as_str(), redis_store::DEFAULT_PREFIX) {
+            Ok(store) => {
+                store.ping().await;
+                Some(store)
+            }
+            Err(error) => {
+                tracing::error!("cannot use REDIS_URL: {error}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+
+    let state = Arc::new(AppState::from_config(&config, redis));
     tracing::info!(
-        "listening on {} for {} consumer(s), {} calls a minute",
+        "listening on {} for {} consumer(s), {} calls a minute, budget kept in {}",
         config.listen,
         config.consumers.len(),
-        config.budget_per_minute
+        config.budget_per_minute,
+        if config.redis_url.is_some() {
+            "Redis, in memory while it fails"
+        } else {
+            "memory"
+        }
     );
-    match serve::serve(
+    let stopped = serve::serve(
         listener,
-        app::router(state),
+        app::router(state.clone()),
         shutdown_signal(),
         SHUTDOWN_GRACE,
     )
-    .await
-    {
+    .await;
+    state.budget.write_days_at_exit().await;
+    match stopped {
         Ok(Stopped::Drained) => {
             tracing::info!("stopped");
             ExitCode::SUCCESS
