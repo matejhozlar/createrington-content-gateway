@@ -12,7 +12,9 @@
     "dev": "infisical run --env=dev -- cargo run",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "prepare": "husky"
+    "prepare": "husky",
+    "branch:done": "node scripts/finish-branch.mjs",
+    "post-release": "node scripts/post-release.mjs"
   },
   "devDependencies": {
     "@infisical/cli": "^0.44.12",
