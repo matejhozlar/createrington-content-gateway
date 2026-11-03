@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -18,7 +18,7 @@ const SHORTEST_HOLD_MS: u64 = 1_000;
 const LONGEST_HOLD_MS: u64 = 10 * MINUTE_MS;
 const DAYS_KEPT: u64 = 14;
 const MINUTE_KEY_TTL_MS: u64 = 2 * MINUTE_MS;
-const DAY_KEY_TTL_MS: i64 = ((DAYS_KEPT + 1) * DAY_MS) as i64;
+const DAYS_TRIMMED: u64 = 31;
 const HOLD_KEY: &str = "budget:held-until";
 const HTTP_FORBIDDEN: u16 = 403;
 const HTTP_TOO_MANY_REQUESTS: u16 = 429;
@@ -115,6 +115,7 @@ struct Shared {
     admit: Script,
     hold: Script,
     writing_days: tokio::sync::Mutex<()>,
+    trimmed_on: Mutex<Option<String>>,
 }
 
 type PoolKey = (Arc<str>, Arc<str>);
@@ -221,6 +222,7 @@ impl Budget {
                     admit: Script::new(ADMIT_SCRIPT),
                     hold: Script::new(HOLD_SCRIPT),
                     writing_days: tokio::sync::Mutex::new(()),
+                    trimmed_on: Mutex::new(None),
                 })
             }),
         }
@@ -304,7 +306,7 @@ impl Budget {
         let Some(redis) = &self.redis else {
             return;
         };
-        let lost = redis.write_days(&self.memory, true).await;
+        let lost = redis.write_days(&self.memory, &*self.clock, true).await;
         if lost > 0 {
             tracing::warn!("Redis did not take the last daily counts, {lost} of them are lost");
         }
@@ -522,9 +524,9 @@ impl Budget {
 
     fn write_days_soon(&self) {
         if let Some(redis) = &self.redis {
-            let (redis, memory) = (redis.clone(), self.memory.clone());
+            let (redis, memory, clock) = (redis.clone(), self.memory.clone(), self.clock.clone());
             tokio::spawn(async move {
-                redis.write_days(&memory, false).await;
+                redis.write_days(&memory, &*clock, false).await;
             });
         }
     }
@@ -553,7 +555,12 @@ impl Budget {
 }
 
 impl Shared {
-    async fn write_days(&self, memory: &Mutex<Counts>, even_if_paused: bool) -> u64 {
+    async fn write_days(
+        &self,
+        memory: &Mutex<Counts>,
+        clock: &dyn Clock,
+        even_if_paused: bool,
+    ) -> u64 {
         let _writing = self.writing_days.lock().await;
         let unwritten: Vec<(String, PoolKey, DayCounts)> = {
             let state = memory.lock().unwrap_or_else(PoisonError::into_inner);
@@ -573,7 +580,6 @@ impl Shared {
 
         let mut pipeline = redis::pipe();
         pipeline.atomic();
-        let mut day_keys = BTreeSet::new();
         for (date, key, counts) in &unwritten {
             let day_key = self.store.key(&day_key(date));
             for (name, count) in counts.named() {
@@ -583,10 +589,23 @@ impl Shared {
                         .ignore();
                 }
             }
-            day_keys.insert(day_key);
         }
-        for day_key in &day_keys {
-            pipeline.pexpire(day_key, DAY_KEY_TTL_MS).ignore();
+        let now = clock.now_ms();
+        let today = utc_date(now);
+        let trim = self
+            .trimmed_on
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            != Some(&today);
+        if trim {
+            let gone: Vec<String> = (DAYS_KEPT..DAYS_KEPT + DAYS_TRIMMED)
+                .map(|days_ago| {
+                    self.store
+                        .key(&day_key(&utc_date(now.saturating_sub(days_ago * DAY_MS))))
+                })
+                .collect();
+            pipeline.del(gone).ignore();
         }
         let write = |mut connection: ConnectionManager| async move {
             pipeline.query_async::<()>(&mut connection).await
@@ -604,6 +623,12 @@ impl Shared {
                 .sum();
         }
 
+        if trim {
+            *self
+                .trimmed_on
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(today);
+        }
         let mut state = memory.lock().unwrap_or_else(PoisonError::into_inner);
         for (date, key, counts) in unwritten {
             let Some(pools) = state.days.get_mut(&date) else {
@@ -1225,6 +1250,48 @@ mod tests {
         let snapshot = after.snapshot().await;
         assert_eq!(snapshot.source, Source::Redis);
         assert_eq!(snapshot.days[0].pools[0].counts.calls, 1);
+        forget(&url, &prefix).await;
+    }
+
+    #[tokio::test]
+    async fn daily_counts_never_expire_and_days_past_the_fourteen_are_deleted() {
+        let Some(url) = test_redis_url() else {
+            eprintln!("{TEST_REDIS_ENV} is not set, skipped");
+            return;
+        };
+        let prefix = unique_prefix();
+        let clock = TestClock::at(NOV_3_2026_20H);
+        let store = Arc::new(RedisStore::open(&url, prefix.clone()).unwrap());
+        let budget = Budget::new(300, POOLS, clock.clone(), Some(store.clone()));
+        for _ in 0..20 {
+            budget.record("app", "app", Some(200), None).await;
+            budget.write_days_at_exit().await;
+            clock.advance(DAY_MS);
+        }
+
+        let pattern = store.key("budget:day:*");
+        let mut days = store
+            .run(|mut connection| async move {
+                redis::cmd("KEYS")
+                    .arg(pattern)
+                    .query_async::<Vec<String>>(&mut connection)
+                    .await
+            })
+            .await
+            .unwrap();
+        days.sort();
+        assert_eq!(days.len(), 14);
+        assert!(days[0].ends_with("2026-11-09"), "{days:?}");
+        let newest = days[13].clone();
+        let ttl = store
+            .run(|mut connection| async move {
+                redis::cmd("PTTL")
+                    .arg(newest)
+                    .query_async::<i64>(&mut connection)
+                    .await
+            })
+            .await;
+        assert_eq!(ttl, Some(-1));
         forget(&url, &prefix).await;
     }
 
