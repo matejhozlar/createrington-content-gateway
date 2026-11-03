@@ -1129,6 +1129,7 @@ mod tests {
         };
         let prefix = format!("content-gateway-test:restart:{}", std::process::id());
         let open = || Some(Arc::new(RedisStore::open(&url, prefix.clone()).unwrap()));
+        forget_prefix(&RedisStore::open(&url, prefix.clone()).unwrap()).await;
         let mock = Mock::start(Duration::ZERO, curseforge).await;
 
         let before = gateway_on(&mock, 300, TIMEOUT, open());
@@ -1176,20 +1177,22 @@ mod tests {
         );
         assert_eq!(mock.calls(), calls);
 
-        let keys = vec![store.key("*")];
-        let mut stored: Vec<String> = Vec::new();
-        for pattern in keys {
-            stored.extend(
-                store
-                    .run(|mut connection| async move {
-                        redis::cmd("KEYS")
-                            .arg(pattern)
-                            .query_async::<Vec<String>>(&mut connection)
-                            .await
-                    })
+        forget_prefix(&store).await;
+    }
+
+    async fn forget_prefix(store: &RedisStore) {
+        let pattern = store.key("*");
+        let stored = store
+            .run(|mut connection| async move {
+                redis::cmd("KEYS")
+                    .arg(pattern)
+                    .query_async::<Vec<String>>(&mut connection)
                     .await
-                    .unwrap_or_default(),
-            );
+            })
+            .await
+            .unwrap_or_default();
+        if stored.is_empty() {
+            return;
         }
         store
             .run(|mut connection| async move {
