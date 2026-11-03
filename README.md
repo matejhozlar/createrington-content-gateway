@@ -31,14 +31,25 @@ All configuration comes from environment variables.
 | `CONTENT_GATEWAY_PORT` | `5005`      | Port to listen on                                                                                                                                   |
 | `CONTENT_GATEWAY_LOG`  | `info`      | Log filter, in [`tracing-subscriber` `EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax |
 
+An invalid value stops the gateway at startup with a message naming the variable.
+
+Two more variables are read at build time, not at runtime. `/v1/healthz` reports them, and they are `null` when unset:
+
+| Variable                   | Meaning                                    |
+| -------------------------- | ------------------------------------------ |
+| `CONTENT_GATEWAY_COMMIT`   | Commit the binary was built from           |
+| `CONTENT_GATEWAY_BUILT_AT` | When the binary was built, ISO 8601 in UTC |
+
 ### Docker
 
 ```bash
-docker build -t content-gateway .
+docker build -t content-gateway \
+  --build-arg CONTENT_GATEWAY_COMMIT="$(git rev-parse HEAD)" \
+  --build-arg CONTENT_GATEWAY_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" .
 docker run --rm -p 127.0.0.1:5005:5005 content-gateway
 ```
 
-The image is a static binary on a distroless base. Inside the container the gateway listens on `0.0.0.0`; publish the port on `127.0.0.1` as above.
+The image is a static binary on a distroless base. Inside the container the gateway listens on `0.0.0.0`; publish the port on `127.0.0.1` as above. The build keeps downloaded crates and compiled dependencies in BuildKit cache mounts, so a rebuild after an update only compiles what changed.
 
 ## Keep it private
 
