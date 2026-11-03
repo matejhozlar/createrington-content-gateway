@@ -11,6 +11,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked --bin content-gateway \
     && cp target/release/content-gateway /content-gateway
 
+FROM scratch AS binary
+COPY --from=build /content-gateway /content-gateway
+
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /content-gateway /usr/local/bin/content-gateway
 ENV CONTENT_GATEWAY_HOST=0.0.0.0 \

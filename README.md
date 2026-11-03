@@ -78,6 +78,22 @@ docker run --rm --env-file .env -p 127.0.0.1:5005:5005 content-gateway
 
 The image is a static binary on a distroless base. Inside the container the gateway listens on `0.0.0.0`; publish the port on `127.0.0.1` as above. The build keeps downloaded crates and compiled dependencies in BuildKit cache mounts, so a rebuild after an update only compiles what changed.
 
+### As a host process
+
+The binary has no runtime dependencies, so it can run straight from a directory under systemd. `docker build --target binary --output type=local,dest=build .` writes the static binary to `build/content-gateway` without making an image (a native `cargo build --release` does the same on a machine with the toolchain). A unit for a directory `/opt/content-gateway` that holds the binary and a `.env` with the variables above:
+
+```ini
+[Service]
+WorkingDirectory=/opt/content-gateway
+ExecStart=/opt/content-gateway/content-gateway
+EnvironmentFile=/opt/content-gateway/.env
+Restart=always
+RestartSec=5
+User=content-gateway
+```
+
+This is how the gateway runs for Createrington: `.gitea/workflows/deploy.yml` builds the binary when a release merges into `main`, writes `.env` from Infisical, keeps the previous binary as `content-gateway.previous` for a rollback, touches `.restart-trigger` for a systemd path unit that restarts the service, and waits until `/v1/healthz` reports the deployed commit. The directory and the Infisical project come from the `DEPLOY_DIR` and `INFISICAL_PROJECT_ID` repository variables, the Infisical credentials from secrets.
+
 ## Endpoints
 
 | Route                                           | Auth  | What it answers                                                                                                                                                                                           |

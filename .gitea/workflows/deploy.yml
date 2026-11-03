@@ -1,0 +1,122 @@
+name: Deploy
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
+  INFISICAL_API_URL: ${{ secrets.INFISICAL_API_URL }}
+  INFISICAL_PROJECT_ID: ${{ vars.INFISICAL_PROJECT_ID }}
+
+jobs:
+  deploy:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+      || github.event.pull_request.merged == true
+    runs-on: hetzner
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Check the deploy configuration
+        shell: bash
+        run: |
+          if [ -z "$DEPLOY_DIR" ]; then
+            echo "::error::Set the DEPLOY_DIR variable to the directory the gateway runs from on the host"
+            exit 1
+          fi
+          if [ -z "$INFISICAL_PROJECT_ID" ]; then
+            echo "::error::Set the INFISICAL_PROJECT_ID variable to the Infisical project that holds the gateway's prod environment"
+            exit 1
+          fi
+          if [ ! -d "$DEPLOY_DIR" ]; then
+            echo "::error::$DEPLOY_DIR does not exist in this job; create it on the host and mount it into the runner's job containers"
+            exit 1
+          fi
+          echo "COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - name: Ensure the docker CLI
+        shell: bash
+        run: |
+          command -v docker >/dev/null 2>&1 && exit 0
+          if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=; fi
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends docker.io
+
+      - name: Build the static binary
+        shell: bash
+        run: |
+          docker build \
+            --target binary \
+            --output type=local,dest=build \
+            --build-arg CONTENT_GATEWAY_COMMIT="$COMMIT" \
+            --build-arg CONTENT_GATEWAY_BUILT_AT="$BUILT_AT" \
+            .
+          test -x build/content-gateway
+
+      - name: Ensure the Infisical CLI
+        shell: bash
+        run: |
+          command -v infisical >/dev/null 2>&1 && exit 0
+          if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=; fi
+          curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | $SUDO bash
+          $SUDO apt-get install -y infisical
+
+      - name: Log in to Infisical
+        shell: bash
+        env:
+          INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
+          INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
+        run: |
+          TOKEN=$(infisical login \
+            --method=universal-auth \
+            --client-id="$INFISICAL_CLIENT_ID" \
+            --client-secret="$INFISICAL_CLIENT_SECRET" \
+            --plain --silent)
+          echo "INFISICAL_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - name: Write the runtime env from Infisical
+        shell: bash
+        run: |
+          infisical export --projectId="$INFISICAL_PROJECT_ID" --env=prod --format=dotenv \
+            > "$DEPLOY_DIR/.env.new"
+          chmod 600 "$DEPLOY_DIR/.env.new"
+          chown --reference="$DEPLOY_DIR" "$DEPLOY_DIR/.env.new"
+          mv "$DEPLOY_DIR/.env.new" "$DEPLOY_DIR/.env"
+
+      - name: Install the binary, keeping the previous one for a rollback
+        shell: bash
+        run: |
+          install -m 755 build/content-gateway "$DEPLOY_DIR/content-gateway.new"
+          chown --reference="$DEPLOY_DIR" "$DEPLOY_DIR/content-gateway.new"
+          if [ -f "$DEPLOY_DIR/content-gateway" ]; then
+            mv "$DEPLOY_DIR/content-gateway" "$DEPLOY_DIR/content-gateway.previous"
+          fi
+          mv "$DEPLOY_DIR/content-gateway.new" "$DEPLOY_DIR/content-gateway"
+          touch "$DEPLOY_DIR/.restart-trigger"
+          chown --reference="$DEPLOY_DIR" "$DEPLOY_DIR/.restart-trigger"
+
+      - name: Wait for the new build to answer
+        shell: bash
+        run: |
+          port=$(sed -n 's/^CONTENT_GATEWAY_PORT=//p' "$DEPLOY_DIR/.env" | tr -d "\"'" | tail -1)
+          port=${port:-5005}
+          for attempt in $(seq 1 30); do
+            if health=$(docker run --rm --network host curlimages/curl:8.16.0 -fsS "http://127.0.0.1:${port}/v1/healthz" 2>/dev/null) \
+              && [ "${health#*\"commit\":\"$COMMIT\"}" != "$health" ]; then
+              echo "$health"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::The gateway did not answer /v1/healthz with commit $COMMIT within 60 s. Last answer: ${health:-none}"
+          exit 1
