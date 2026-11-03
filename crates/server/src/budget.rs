@@ -356,6 +356,10 @@ impl Budget {
         let dates: Vec<String> = (0..DAYS_KEPT)
             .map(|days_ago| utc_date(now.saturating_sub(days_ago * DAY_MS)))
             .collect();
+        let _writing = match &self.redis {
+            Some(redis) => Some(redis.writing_days.lock().await),
+            None => None,
+        };
         let (source, stored) = match &self.redis {
             None => (Source::Memory, None),
             Some(redis) => match self.read_redis(redis, now, &dates).await {
