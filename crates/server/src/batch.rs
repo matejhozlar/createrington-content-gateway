@@ -507,14 +507,13 @@ fn kept_row(
     now: u64,
 ) -> Entry {
     if batch.is_fingerprints() {
-        let row = Bytes::copy_from_slice(row);
         return Entry {
             row: Some(row.clone()),
             ..Entry::new(
                 Answer {
                     status: StatusCode::OK,
                     content_type: content_type.clone(),
-                    body: row,
+                    body: row.clone(),
                 },
                 now,
                 batch.found_ms(),

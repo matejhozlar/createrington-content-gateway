@@ -24,7 +24,8 @@ pub struct Answer {
 
 /// A cached answer, when it was stored, and until when it is fresh and after that stale, in milliseconds since the
 /// Unix epoch. For a project or a file, `row` is the object under `data`, a slice of the body, and `owner` the
-/// project a file belongs to.
+/// project a file belongs to. For a fingerprint, the body and `row` are the `exactMatches` items it matched, joined
+/// with commas: not JSON on its own, so such an entry is only ever joined into a rebuilt answer, never sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub answer: Answer,
