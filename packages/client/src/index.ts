@@ -5,6 +5,7 @@ export {
   type CacheStatus,
   type ContentGatewayOptions,
   type CurseForgeAnswer,
+  type CurseForgeMethod,
   type CurseForgeRequest,
   type Query,
 } from "./client.js";

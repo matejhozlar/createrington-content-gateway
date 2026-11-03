@@ -29,12 +29,12 @@ export type Query =
   | URLSearchParams
   | Record<string, string | number | boolean | null | undefined>;
 
-export interface CurseForgeRequest {
-  /** `GET` unless a body is given. */
-  method?: "GET" | "POST";
+/** A request's method and body: a `GET` carries none, a body makes the request a `POST`. */
+export type CurseForgeMethod =
+  { method?: "GET"; body?: undefined } | { method?: "POST"; body?: unknown };
+
+export type CurseForgeRequest = CurseForgeMethod & {
   query?: Query;
-  /** Sent as JSON, which also makes the request a `POST`. */
-  body?: unknown;
   /** The pool this call draws from instead of the client's. */
   pool?: string;
   /** Ask CurseForge again instead of answering from the cache (`Cache-Control: no-cache`). */
@@ -47,7 +47,7 @@ export interface CurseForgeRequest {
    */
   waitUpToMs?: number;
   signal?: AbortSignal;
-}
+};
 
 /** How the gateway answered a passthrough call, from `X-Cache`. */
 export type CacheStatus = (typeof CACHE_STATUSES)[number];
@@ -154,6 +154,11 @@ export class ContentGateway {
   ): Promise<CurseForgeAnswer> {
     const method =
       request.method ?? (request.body === undefined ? "GET" : "POST");
+    if (method === "GET" && request.body !== undefined) {
+      throw new TypeError(
+        `a GET to ${path} cannot carry a body; leave method unset or make it POST`,
+      );
+    }
     const { response, body } = await this.send({
       method,
       path: `/v1/curseforge/${path.replace(/^\/+/, "")}`,

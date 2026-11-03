@@ -120,6 +120,16 @@ describe("the CurseForge passthrough", () => {
     expect(seen?.headers["x-budget-pool"]).toBe("app");
   });
 
+  it("refuses a GET with a body before sending anything", async () => {
+    const request = { method: "GET", body: { modIds: [1] } } as const;
+    const error = (await client()
+      .curseforge("mods", request as never)
+      .catch((error: unknown) => error)) as Error;
+    expect(error).toBeInstanceOf(TypeError);
+    expect(error.message).toContain("cannot carry a body");
+    expect(gateway.seen).toHaveLength(0);
+  });
+
   it("asks for a fresh answer with Cache-Control: no-cache", async () => {
     gateway.reply(json(200, { data: [] }, "miss"));
     await client().curseforge("mods/1/files", { fresh: true });
