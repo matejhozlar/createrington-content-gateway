@@ -141,6 +141,7 @@ impl Budget {
     }
 
     /// Reserves `calls` upstream calls for one request, all or none. Zero calls (everything cached) always passes.
+    /// Refused calls are counted as withheld, call by call.
     pub fn admit(&self, consumer: &str, pool: &str, calls: u32) -> Result<(), Refusal> {
         if calls == 0 {
             return Ok(());
@@ -167,10 +168,10 @@ impl Budget {
         };
 
         if let Some(refusal) = refusal {
-            state.withheld = state.withheld.saturating_add(1);
+            state.withheld = state.withheld.saturating_add(calls);
             let minute = state.pools.entry(key.clone()).or_default();
-            minute.withheld = minute.withheld.saturating_add(1);
-            state.day(now, key).withheld += 1;
+            minute.withheld = minute.withheld.saturating_add(calls);
+            state.day(now, key).withheld += u64::from(calls);
             return Err(refusal);
         }
 
@@ -401,6 +402,18 @@ mod tests {
             })
         );
         assert_eq!(budget.admit("sandbox", "jobs", 5), Ok(()));
+    }
+
+    #[test]
+    fn withheld_counts_calls_like_used_does() {
+        let budget = budget(5, TestClock::at(NOV_3_2026_20H));
+        budget.admit("app", "app", 4).unwrap();
+        budget.admit("app", "app", 3).unwrap_err();
+
+        let snapshot = budget.snapshot();
+        assert_eq!((snapshot.used, snapshot.withheld), (4, 3));
+        assert_eq!(snapshot.pools[1].withheld, 3);
+        assert_eq!(snapshot.days[0].pools[0].counts.withheld, 3);
     }
 
     #[test]
