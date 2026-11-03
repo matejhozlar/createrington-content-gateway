@@ -33,6 +33,7 @@ All configuration comes from environment variables.
 | `CONTENT_GATEWAY_TOKEN`             |             | The token of a single consumer named `default` with one pool named `default`                                                                        |
 | `CONTENT_GATEWAY_CONSUMERS`         |             | Several consumers as JSON, see below. Set this or `CONTENT_GATEWAY_TOKEN`, not both                                                                 |
 | `CONTENT_GATEWAY_BUDGET_PER_MINUTE` | `300`       | Calls to CurseForge per minute over all consumers and pools                                                                                         |
+| `REDIS_URL`                         |             | Redis to keep the budget in across restarts, such as `redis://:password@127.0.0.1:6379/0`. Without it everything stays in memory                    |
 
 ### Consumers and pools
 
@@ -56,6 +57,12 @@ Two more variables are read at build time, not at runtime. `/v1/healthz` reports
 | `CONTENT_GATEWAY_COMMIT`   | Commit the binary was built from           |
 | `CONTENT_GATEWAY_BUILT_AT` | When the binary was built, ISO 8601 in UTC |
 
+### Redis
+
+Redis is optional. With it, the minute's count, CurseForge's 429 hold and the daily counts survive a restart of the gateway. While Redis cannot be reached, the gateway keeps counting in memory and writes the daily counts once Redis answers again; a request never waits more than a second on Redis. Without Redis everything stays in memory, which is correct for a single gateway process.
+
+Every key starts with `content-gateway:`, so the gateway can share a Redis with other services; pick a database in the URL (`/0`, `/1`, ...) to keep them further apart. TLS (`rediss://`) is not supported, keep Redis on the same machine or a private network.
+
 ### Docker
 
 ```bash
@@ -75,6 +82,8 @@ The image is a static binary on a distroless base. Inside the container the gate
 | `GET /v1/healthz` | none  | `{ status, version, commit, builtAt }`                                                                                                                 |
 | `GET /v1/budget`  | token | This minute's calls sent and withheld per pool, the 429 hold, and daily counts for the last 14 UTC days. Every count is a count of calls to CurseForge |
 
+`source` in the budget says where its counts come from: `redis` for the stored ones, `memory` when no Redis is configured, and `unavailable` when Redis did not answer, in which case the minute is the gateway's own count and the days show only what is not written to Redis yet.
+
 Errors answer `{ "code", "message" }`. A call the budget refuses answers `503` with `Retry-After`, plus `pool` and `retryAfterMs` in the body; `code` is `BUDGET_SPENT` when the minute's ceiling is reached and `UPSTREAM_HOLD` while CurseForge's 429 hold lasts. A request that needs more calls than a whole minute allows answers `413 REQUEST_TOO_LARGE` without `Retry-After`, since waiting would not help.
 
 ## Keep it private
@@ -91,6 +100,8 @@ pnpm install        # Prettier, the pre-commit hook and the Infisical CLI
 pnpm dev            # cargo run with the env injected from Infisical (maintainers)
 pnpm format:check
 ```
+
+The budget's tests also run against a real Redis when `CONTENT_GATEWAY_TEST_REDIS_URL` names one, for example `docker run --rm -p 127.0.0.1:6390:6379 redis:8.10-alpine` and `CONTENT_GATEWAY_TEST_REDIS_URL=redis://127.0.0.1:6390/0 cargo test`. Each test uses its own key prefix and deletes its keys; CI runs them against a throwaway Redis.
 
 ## License
 

@@ -7,6 +7,7 @@ use crate::{
     budget::{self, Budget, SystemClock},
     config::{Config, Consumer},
     health,
+    redis_store::RedisStore,
 };
 
 pub struct AppState {
@@ -15,7 +16,7 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn from_config(config: &Config) -> Self {
+    pub fn from_config(config: &Config, redis: Option<RedisStore>) -> Self {
         let pools = config.consumers.iter().flat_map(|consumer| {
             consumer
                 .pools
@@ -23,7 +24,12 @@ impl AppState {
                 .map(|pool| (consumer.name.as_str(), pool.as_str()))
         });
         Self {
-            budget: Budget::new(config.budget_per_minute, pools, Arc::new(SystemClock)),
+            budget: Budget::new(
+                config.budget_per_minute,
+                pools,
+                Arc::new(SystemClock),
+                redis,
+            ),
             consumers: config.consumers.clone(),
         }
     }
@@ -55,7 +61,7 @@ pub(crate) fn test_state(consumers: Vec<Consumer>) -> Arc<AppState> {
         })
         .collect();
     Arc::new(AppState {
-        budget: Budget::new(300, pools, Arc::new(SystemClock)),
+        budget: Budget::new(300, pools, Arc::new(SystemClock), None),
         consumers,
     })
 }
