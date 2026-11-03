@@ -31,7 +31,12 @@ const ADMIT_SCRIPT: &str = r"
 local calls = tonumber(ARGV[1])
 local limit = tonumber(ARGV[2])
 local now = tonumber(ARGV[3])
-local held = math.max(tonumber(ARGV[4]), tonumber(redis.call('GET', KEYS[2]) or '0') or 0)
+local known = tonumber(ARGV[4])
+local stored = tonumber(redis.call('GET', KEYS[2]) or '0') or 0
+if known > stored and known > now then
+  redis.call('SET', KEYS[2], ARGV[4], 'PX', known - now)
+end
+local held = math.max(known, stored)
 local used = tonumber(redis.call('HGET', KEYS[1], 'used') or '0') or 0
 local verdict = 0
 if calls > limit then
@@ -91,8 +96,9 @@ pub enum Refusal {
 /// Daily counts per pool are kept for the last 14 UTC days.
 ///
 /// With Redis, the minute's counts, the hold and the daily counts live there
-/// and survive a restart: admitting is one atomic script, daily counts are
-/// added up in memory and written after every change. While Redis fails, the
+/// and survive a restart: admitting is one atomic script, which also stores a
+/// hold only this process knew of, and daily counts are added up in memory
+/// and written after every change. While Redis fails, the
 /// minute is counted in memory and the daily counts wait in memory until it
 /// answers again. Without Redis everything stays in memory, which is correct
 /// for a single gateway process.
@@ -1091,6 +1097,37 @@ mod tests {
 
         clock.advance(60_000);
         assert_eq!(after.admit("sandbox", "jobs", 5).await, Ok(()));
+        forget(&url, &prefix).await;
+    }
+
+    #[tokio::test]
+    async fn a_hold_redis_missed_is_stored_by_the_next_admit() {
+        let Some(url) = test_redis_url() else {
+            eprintln!("{TEST_REDIS_ENV} is not set, skipped");
+            return;
+        };
+        let prefix = unique_prefix();
+        let clock = TestClock::at(NOV_3_2026_20H);
+        let open = || {
+            Budget::new(
+                5,
+                POOLS,
+                clock.clone(),
+                Some(RedisStore::open(&url, prefix.clone()).unwrap()),
+            )
+        };
+
+        let first = open();
+        first.lock(NOV_3_2026_20H).held_until_ms = NOV_3_2026_20H + 60_000;
+        assert!(first.admit("app", "app", 1).await.is_err());
+
+        let second = open();
+        assert_eq!(
+            second.admit("sandbox", "jobs", 1).await,
+            Err(Refusal::Hold {
+                retry_after_ms: 60_000
+            })
+        );
         forget(&url, &prefix).await;
     }
 
