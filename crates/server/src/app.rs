@@ -1,9 +1,63 @@
-use axum::{Router, routing::get};
+use std::sync::Arc;
 
-use crate::health;
+use axum::{Router, middleware, routing::get};
 
-pub fn router() -> Router {
-    Router::new().route("/v1/healthz", get(health::healthz))
+use crate::{
+    auth,
+    budget::{self, Budget, SystemClock},
+    config::{Config, Consumer},
+    health,
+};
+
+pub struct AppState {
+    pub consumers: Vec<Consumer>,
+    pub budget: Budget,
+}
+
+impl AppState {
+    pub fn from_config(config: &Config) -> Self {
+        let pools = config.consumers.iter().flat_map(|consumer| {
+            consumer
+                .pools
+                .iter()
+                .map(|pool| (consumer.name.as_str(), pool.as_str()))
+        });
+        Self {
+            budget: Budget::new(config.budget_per_minute, pools, Arc::new(SystemClock)),
+            consumers: config.consumers.clone(),
+        }
+    }
+}
+
+pub fn router(state: Arc<AppState>) -> Router {
+    let authenticated = Router::new()
+        .route("/v1/budget", get(budget::readout))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::authenticate,
+        ));
+
+    Router::new()
+        .route("/v1/healthz", get(health::healthz))
+        .merge(authenticated)
+        .with_state(state)
+}
+
+#[cfg(test)]
+pub(crate) fn test_state(consumers: Vec<Consumer>) -> Arc<AppState> {
+    let pools: Vec<(String, String)> = consumers
+        .iter()
+        .flat_map(|consumer| {
+            consumer
+                .pools
+                .iter()
+                .map(|pool| (consumer.name.clone(), pool.clone()))
+        })
+        .collect();
+    Arc::new(AppState {
+        budget: Budget::new(300, pools, Arc::new(SystemClock)),
+        consumers,
+    })
 }
 
 #[cfg(test)]
@@ -17,10 +71,25 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::config::Token;
 
-    async fn get(uri: &str) -> (StatusCode, Option<String>, Vec<u8>) {
-        let response = router()
-            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+    const TOKEN: &str = "app-token-0123456789abcdef0123456789";
+
+    fn app() -> Router {
+        router(test_state(vec![Consumer {
+            name: "app".to_owned(),
+            token: Token::new(TOKEN),
+            pools: vec!["launcher".to_owned(), "app".to_owned()],
+        }]))
+    }
+
+    async fn get(uri: &str, token: Option<&str>) -> (StatusCode, Option<String>, Vec<u8>) {
+        let mut request = Request::get(uri);
+        if let Some(token) = token {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        let response = app()
+            .oneshot(request.body(Body::empty()).unwrap())
             .await
             .unwrap();
         let status = response.status();
@@ -33,8 +102,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn healthz_answers_ok_as_json() {
-        let (status, content_type, body) = get("/v1/healthz").await;
+    async fn healthz_answers_ok_as_json_without_a_token() {
+        let (status, content_type, body) = get("/v1/healthz", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(content_type.as_deref(), Some("application/json"));
 
@@ -46,8 +115,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_routes_answer_not_found() {
-        let (status, _, _) = get("/v1/nothing-here").await;
+    async fn the_budget_needs_a_token() {
+        let (status, _, _) = get("/v1/budget", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_budget_lists_every_pool_without_a_pool_header() {
+        let (status, _, body) = get("/v1/budget", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["limitPerMinute"], 300);
+        assert_eq!(body["used"], 0);
+        assert_eq!(body["heldUntil"], Value::Null);
+        assert_eq!(body["source"], "memory");
+        assert_eq!(body["pools"][0]["consumer"], "app");
+        assert_eq!(body["pools"][1]["pool"], "app");
+    }
+
+    #[tokio::test]
+    async fn unknown_routes_answer_not_found_without_a_token() {
+        let (status, _, _) = get("/v1/nothing-here", None).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

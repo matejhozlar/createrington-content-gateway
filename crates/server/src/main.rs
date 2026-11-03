@@ -1,17 +1,12 @@
-mod app;
-mod config;
-mod health;
-mod serve;
+use std::{io::IsTerminal, process::ExitCode, sync::Arc, time::Duration};
 
-use std::{io::IsTerminal, process::ExitCode, time::Duration};
-
+use content_gateway::{
+    app::{self, AppState},
+    config::{self, Config, DEFAULT_LOG},
+    serve::{self, Stopped},
+};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
-
-use crate::{
-    config::{Config, DEFAULT_LOG},
-    serve::Stopped,
-};
 
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
@@ -47,8 +42,21 @@ async fn main() -> ExitCode {
         }
     };
 
-    tracing::info!("listening on {}", config.listen);
-    match serve::serve(listener, app::router(), shutdown_signal(), SHUTDOWN_GRACE).await {
+    let state = Arc::new(AppState::from_config(&config));
+    tracing::info!(
+        "listening on {} for {} consumer(s), {} calls a minute",
+        config.listen,
+        config.consumers.len(),
+        config.budget_per_minute
+    );
+    match serve::serve(
+        listener,
+        app::router(state),
+        shutdown_signal(),
+        SHUTDOWN_GRACE,
+    )
+    .await
+    {
         Ok(Stopped::Drained) => {
             tracing::info!("stopped");
             ExitCode::SUCCESS

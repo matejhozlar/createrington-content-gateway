@@ -1,0 +1,180 @@
+use axum::{
+    Json,
+    http::{HeaderValue, StatusCode, header},
+    response::{IntoResponse, Response},
+};
+use serde::Serialize;
+
+use crate::budget::Refusal;
+
+/// The JSON error every route answers with: `{ code, message }`, plus `pool` and `retryAfterMs` on a refused call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiError {
+    #[serde(skip)]
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pool: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retry_after_ms: Option<u64>,
+}
+
+impl ApiError {
+    pub fn unauthorized() -> Self {
+        Self::new(
+            StatusCode::UNAUTHORIZED,
+            "UNAUTHORIZED",
+            "send a consumer token as Authorization: Bearer <token>",
+        )
+    }
+
+    pub fn pool_required(pools: &[impl AsRef<str>]) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "POOL_REQUIRED",
+            format!(
+                "this token draws from several pools, name one in X-Budget-Pool: {}",
+                join(pools)
+            ),
+        )
+    }
+
+    pub fn unknown_pool(pool: &str, pools: &[impl AsRef<str>]) -> Self {
+        Self {
+            pool: Some(pool.to_owned()),
+            ..Self::new(
+                StatusCode::BAD_REQUEST,
+                "UNKNOWN_POOL",
+                format!(
+                    "this token cannot draw from pool {pool:?}, only from: {}",
+                    join(pools)
+                ),
+            )
+        }
+    }
+
+    pub fn refused(refusal: Refusal, pool: &str) -> Self {
+        let (code, retry_after_ms, message) = match refusal {
+            Refusal::Spent { retry_after_ms } => (
+                "BUDGET_SPENT",
+                retry_after_ms,
+                "the gateway has asked CurseForge enough this minute",
+            ),
+            Refusal::Hold { retry_after_ms } => (
+                "UPSTREAM_HOLD",
+                retry_after_ms,
+                "CurseForge answered 429, every call waits until the hold ends",
+            ),
+        };
+        Self {
+            pool: Some(pool.to_owned()),
+            retry_after_ms: Some(retry_after_ms),
+            ..Self::new(StatusCode::SERVICE_UNAVAILABLE, code, message)
+        }
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.code
+    }
+
+    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+            pool: None,
+            retry_after_ms: None,
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let status = self.status;
+        let retry_after_ms = self.retry_after_ms;
+        let mut response = (status, Json(self)).into_response();
+        let headers = response.headers_mut();
+        if status == StatusCode::UNAUTHORIZED {
+            headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
+        if let Some(ms) = retry_after_ms {
+            headers.insert(
+                header::RETRY_AFTER,
+                HeaderValue::from(ms.div_ceil(1000).max(1)),
+            );
+        }
+        response
+    }
+}
+
+fn join(pools: &[impl AsRef<str>]) -> String {
+    pools
+        .iter()
+        .map(AsRef::as_ref)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(test)]
+mod tests {
+    use http_body_util::BodyExt;
+    use serde_json::{Value, json};
+
+    use super::*;
+
+    async fn parts(error: ApiError) -> (StatusCode, axum::http::HeaderMap, Value) {
+        let response = error.into_response();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, headers, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn unauthorized_asks_for_a_bearer_token() {
+        let (status, headers, body) = parts(ApiError::unauthorized()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(headers[header::WWW_AUTHENTICATE], "Bearer");
+        assert_eq!(body["code"], "UNAUTHORIZED");
+        assert!(body.get("pool").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refusal_carries_its_pool_and_when_to_come_back() {
+        let (status, headers, body) = parts(ApiError::refused(
+            Refusal::Spent {
+                retry_after_ms: 12_300,
+            },
+            "launcher",
+        ))
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(headers[header::RETRY_AFTER], "13");
+        assert_eq!(
+            body,
+            json!({
+                "code": "BUDGET_SPENT",
+                "message": "the gateway has asked CurseForge enough this minute",
+                "pool": "launcher",
+                "retryAfterMs": 12_300,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_after_is_at_least_one_second() {
+        let (_, headers, body) = parts(ApiError::refused(
+            Refusal::Hold { retry_after_ms: 40 },
+            "jobs",
+        ))
+        .await;
+        assert_eq!(headers[header::RETRY_AFTER], "1");
+        assert_eq!(body["code"], "UPSTREAM_HOLD");
+    }
+}
