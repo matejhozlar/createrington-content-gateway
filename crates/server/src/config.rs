@@ -14,6 +14,7 @@ const CONSUMERS_ENV: &str = "CONTENT_GATEWAY_CONSUMERS";
 const TOKEN_ENV: &str = "CONTENT_GATEWAY_TOKEN";
 const BUDGET_ENV: &str = "CONTENT_GATEWAY_BUDGET_PER_MINUTE";
 const REDIS_ENV: &str = "REDIS_URL";
+const API_KEY_ENV: &str = "CURSEFORGE_API_KEY";
 const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_PORT: u16 = 5005;
 const DEFAULT_BUDGET_PER_MINUTE: u32 = 300;
@@ -29,6 +30,7 @@ pub struct Config {
     pub consumers: Vec<Consumer>,
     pub budget_per_minute: u32,
     pub redis_url: Option<RedisUrl>,
+    pub curseforge_api_key: ApiKey,
 }
 
 /// A process allowed to call the gateway, and the budget pools it may draw from.
@@ -58,6 +60,26 @@ impl Token {
 impl fmt::Debug for Token {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("Token(..)")
+    }
+}
+
+/// The CurseForge API key. Its `Debug` output never shows the value.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiKey(String);
+
+impl ApiKey {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ApiKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ApiKey(..)")
     }
 }
 
@@ -95,6 +117,8 @@ pub enum ConfigError {
         "{name} must be a URL such as redis://:password@127.0.0.1:6379/0 (rediss:// is not supported)"
     )]
     RedisUrl { name: &'static str },
+    #[error("set {API_KEY_ENV} to the CurseForge API key the gateway calls CurseForge with")]
+    NoApiKey,
     #[error("set {CONSUMERS_ENV} or {TOKEN_ENV} so that something can call the gateway")]
     NoConsumers,
     #[error("set {CONSUMERS_ENV} or {TOKEN_ENV}, not both")]
@@ -205,11 +229,16 @@ impl Config {
         };
         validate_consumers(&consumers)?;
 
+        let curseforge_api_key = lookup(API_KEY_ENV)
+            .map(|key| ApiKey(key.trim().to_owned()))
+            .ok_or(ConfigError::NoApiKey)?;
+
         Ok(Self {
             listen: SocketAddr::new(host, port),
             consumers,
             budget_per_minute,
             redis_url,
+            curseforge_api_key,
         })
     }
 }
@@ -302,6 +331,7 @@ mod tests {
 
     const TOKEN: &str = "test-token-0123456789abcdef0123456789";
     const OTHER_TOKEN: &str = "test-token-fedcba9876543210fedcba9876";
+    const API_KEY: &str = "test-curseforge-key";
 
     fn lookup_in(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let env: HashMap<String, String> = pairs
@@ -312,7 +342,11 @@ mod tests {
     }
 
     fn config_from(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
-        Config::from_lookup(lookup_in(pairs))
+        let mut pairs = pairs.to_vec();
+        if !pairs.iter().any(|(name, _)| *name == API_KEY_ENV) {
+            pairs.push((API_KEY_ENV, API_KEY));
+        }
+        Config::from_lookup(lookup_in(&pairs))
     }
 
     fn config_with_token(pairs: &[(&str, &str)]) -> Result<Config, ConfigError> {
@@ -413,6 +447,19 @@ mod tests {
             assert_eq!(error, ConfigError::RedisUrl { name: REDIS_ENV }, "{value}");
             assert!(!error.to_string().contains("secret"));
         }
+    }
+
+    #[test]
+    fn needs_a_curseforge_api_key_and_keeps_it_out_of_debug_output() {
+        for value in ["", "  "] {
+            assert_eq!(
+                config_with_token(&[(API_KEY_ENV, value)]),
+                Err(ConfigError::NoApiKey)
+            );
+        }
+        let config = config_with_token(&[]).unwrap();
+        assert_eq!(config.curseforge_api_key.as_str(), API_KEY);
+        assert!(!format!("{config:?}").contains(API_KEY));
     }
 
     #[test]

@@ -138,6 +138,7 @@ struct MinuteCounts {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct DayCounts {
     pub calls: u64,
+    pub hits: u64,
     pub withheld: u64,
     pub forbidden: u64,
     pub throttled: u64,
@@ -286,6 +287,14 @@ impl Budget {
                 })
                 .await;
         }
+        self.write_days_soon();
+    }
+
+    /// Counts one request answered without a call to CurseForge: from the cache, or by joining a call already made.
+    pub fn record_hit(&self, consumer: &str, pool: &str) {
+        let now = self.clock.now_ms();
+        let key = self.key(consumer, pool);
+        self.lock(now).day(now, key).hits += 1;
         self.write_days_soon();
     }
 
@@ -626,9 +635,10 @@ impl Counts {
 }
 
 impl DayCounts {
-    fn named(&self) -> [(&'static str, u64); 4] {
+    fn named(&self) -> [(&'static str, u64); 5] {
         [
             ("calls", self.calls),
+            ("hits", self.hits),
             ("withheld", self.withheld),
             ("forbidden", self.forbidden),
             ("throttled", self.throttled),
@@ -638,6 +648,7 @@ impl DayCounts {
     fn add(&mut self, name: &str, count: u64) {
         let field = match name {
             "calls" => &mut self.calls,
+            "hits" => &mut self.hits,
             "withheld" => &mut self.withheld,
             "forbidden" => &mut self.forbidden,
             "throttled" => &mut self.throttled,
@@ -648,6 +659,7 @@ impl DayCounts {
 
     fn subtract(&mut self, written: &Self) {
         self.calls = self.calls.saturating_sub(written.calls);
+        self.hits = self.hits.saturating_sub(written.hits);
         self.withheld = self.withheld.saturating_sub(written.withheld);
         self.forbidden = self.forbidden.saturating_sub(written.forbidden);
         self.throttled = self.throttled.saturating_sub(written.throttled);
@@ -693,7 +705,8 @@ fn parse_day_field(field: &str) -> Option<(&str, &str, &str)> {
     Some((consumer, pool, name))
 }
 
-fn hold_ms(retry_after: Option<&str>, now: u64) -> u64 {
+/// How long a 429 with this `Retry-After` holds every call off: 30 s without one, 1 s to 10 min.
+pub fn hold_ms(retry_after: Option<&str>, now: u64) -> u64 {
     let wait = retry_after
         .map(str::trim)
         .and_then(|header| {
@@ -734,6 +747,27 @@ fn utc_date(ms: u64) -> String {
 }
 
 #[cfg(test)]
+pub(crate) struct TestClock(std::sync::atomic::AtomicU64);
+
+#[cfg(test)]
+impl TestClock {
+    pub(crate) fn at(ms: u64) -> Arc<Self> {
+        Arc::new(Self(std::sync::atomic::AtomicU64::new(ms)))
+    }
+
+    pub(crate) fn advance(&self, ms: u64) {
+        self.0.fetch_add(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+impl Clock for TestClock {
+    fn now_ms(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -742,24 +776,6 @@ mod tests {
     const NOV_3_2026_20H: u64 = 1_793_736_000_000;
     const TEST_REDIS_ENV: &str = "CONTENT_GATEWAY_TEST_REDIS_URL";
     const POOLS: [(&str, &str); 3] = [("app", "launcher"), ("app", "app"), ("sandbox", "jobs")];
-
-    struct TestClock(AtomicU64);
-
-    impl TestClock {
-        fn at(ms: u64) -> Arc<Self> {
-            Arc::new(Self(AtomicU64::new(ms)))
-        }
-
-        fn advance(&self, ms: u64) {
-            self.0.fetch_add(ms, Ordering::SeqCst);
-        }
-    }
-
-    impl Clock for TestClock {
-        fn now_ms(&self) -> u64 {
-            self.0.load(Ordering::SeqCst)
-        }
-    }
 
     fn test_redis_url() -> Option<String> {
         std::env::var(TEST_REDIS_ENV)
@@ -1023,6 +1039,7 @@ mod tests {
                     pool: "launcher".to_owned(),
                     counts: DayCounts {
                         calls: 3,
+                        hits: 0,
                         withheld: 1,
                         forbidden: 1,
                         throttled: 0,
@@ -1031,6 +1048,21 @@ mod tests {
                 "{source:?}"
             );
             assert_eq!(snapshot.days[0].pools[0].counts.throttled, 1, "{source:?}");
+        }
+        backends.forget().await;
+    }
+
+    #[tokio::test]
+    async fn counts_cache_hits_per_pool_and_day() {
+        let clock = TestClock::at(NOV_3_2026_20H);
+        let backends = Backends::new(300, &clock);
+        for (source, budget) in &backends.budgets {
+            budget.record_hit("app", "launcher");
+            budget.record_hit("app", "launcher");
+            let snapshot = budget.snapshot().await;
+            assert_eq!(snapshot.used, 0, "{source:?}");
+            assert_eq!(snapshot.days[0].pools[0].counts.hits, 2, "{source:?}");
+            assert_eq!(snapshot.days[0].pools[0].counts.calls, 0, "{source:?}");
         }
         backends.forget().await;
     }
@@ -1243,6 +1275,7 @@ mod tests {
             snapshot.days[0].pools[0].counts,
             DayCounts {
                 calls: 1,
+                hits: 0,
                 withheld: 1,
                 forbidden: 0,
                 throttled: 1,
