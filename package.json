@@ -9,11 +9,13 @@
     "node": ">=24"
   },
   "scripts": {
+    "dev": "infisical run --env=dev -- cargo run",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "prepare": "husky"
   },
   "devDependencies": {
+    "@infisical/cli": "^0.44.12",
     "husky": "^9.1.7",
     "lint-staged": "^17.6.0",
     "prettier": "^3.9.10"

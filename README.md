@@ -31,7 +31,7 @@ All configuration comes from environment variables.
 | `CONTENT_GATEWAY_PORT` | `5005`      | Port to listen on                                                                                                                                   |
 | `CONTENT_GATEWAY_LOG`  | `info`      | Log filter, in [`tracing-subscriber` `EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax |
 
-An invalid value stops the gateway at startup with a message naming the variable.
+An invalid value stops the gateway at startup with a message naming the variable. `.env.example` lists every variable. The gateway does not read a `.env` file by itself: export the variables, or pass the file with `docker run --env-file .env`.
 
 Two more variables are read at build time, not at runtime. `/v1/healthz` reports them, and they are `null` when unset:
 
@@ -61,7 +61,8 @@ Run the gateway on loopback or a private network only, with your own CurseForge 
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
-pnpm install        # Prettier and the pre-commit hook
+pnpm install        # Prettier, the pre-commit hook and the Infisical CLI
+pnpm dev            # cargo run with the env injected from Infisical (maintainers)
 pnpm format:check
 ```
 
