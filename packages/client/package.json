@@ -1,6 +1,6 @@
 {
   "name": "@createrington/content-gateway-client",
-  "version": "0.1.0",
+  "version": "0.0.0",
   "description": "Typed client for content-gateway: the gateway's own routes from its OpenAPI document, the CurseForge passthrough with the budget's refusals handled, and loose zod schemas for the CurseForge answers consumers read.",
   "license": "MIT",
   "type": "module",

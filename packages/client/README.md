@@ -64,6 +64,8 @@ A consumer that needs more of a file than its ids extends the file schema for th
 
 `src/generated/openapi.ts` is generated from the gateway's `openapi.json` with [openapi-typescript](https://openapi-ts.dev/) and checked in; `pnpm openapi` at the repository root regenerates both, and CI fails when either is stale. Never edit it by hand.
 
+A change consumers can notice comes with a changeset (`pnpm changeset` at the repository root); the release PR turns the changesets into the version and `CHANGELOG.md`, and the merge into `main` publishes. Never edit the version by hand.
+
 ```bash
 pnpm --filter @createrington/content-gateway-client test
 pnpm --filter @createrington/content-gateway-client typecheck

@@ -137,6 +137,10 @@ pnpm format:check
 
 `openapi.json` and `packages/client/src/generated/openapi.ts` are generated and checked in: `cargo test` fails when the document no longer matches the server, and the client's `generate:check` fails when the types no longer match the document.
 
+### Releasing the client
+
+The client package is versioned with [changesets](https://github.com/changesets/changesets), apart from the server. A change to `packages/client` comes with a changeset written on its branch (`pnpm changeset`); CI refuses a changed client without one. The release PR runs `pnpm version-packages`, which turns the changesets into the version bump and the package's `CHANGELOG.md` entry, and the merge into `main` publishes that version to the npm registry named in the package's `publishConfig` (`.gitea/workflows/publish-client.yml`, with the registry token in the `NPM_PUBLISH_TOKEN` secret). A version the registry already has is not published again, and a merge that still carries unconsumed changesets fails instead of publishing.
+
 The budget's tests also run against a real Redis when `CONTENT_GATEWAY_TEST_REDIS_URL` names one, for example `docker run --rm -p 127.0.0.1:6390:6379 redis:8.10-alpine` and `CONTENT_GATEWAY_TEST_REDIS_URL=redis://127.0.0.1:6390/0 cargo test`. Each test uses its own key prefix and deletes its keys; CI runs them against a throwaway Redis.
 
 ## License

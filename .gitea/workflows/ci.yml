@@ -43,9 +43,15 @@ jobs:
     runs-on: oracle
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup
         uses: ./.gitea/actions/setup
+
+      - name: Require a changeset for a changed client
+        if: github.event_name == 'pull_request'
+        run: pnpm changeset:check "origin/${{ github.base_ref }}"
 
       - name: Check the generated types against openapi.json
         run: pnpm --filter @createrington/content-gateway-client generate:check
