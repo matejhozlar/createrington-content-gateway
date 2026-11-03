@@ -19,12 +19,18 @@ use crate::curseforge::{HOUR_MS, MINUTE_MS};
 
 pub const IDS_PER_CALL: usize = 100;
 
-/// A batch route of CurseForge whose answer is one row per id: `POST /mods` or `POST /mods/files`.
+/// A batch route of CurseForge whose answer is made of rows per id: `POST /mods`, `POST /mods/files`, and
+/// `POST /fingerprints` with or without Minecraft's game id, where an id is a fingerprint and its rows are the files
+/// that have it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Batch {
     Mods,
     Files,
+    Fingerprints,
+    MinecraftFingerprints,
 }
+
+const MINECRAFT: &str = "432";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -38,6 +44,43 @@ struct ModIds {
 struct FileIds {
     #[serde(rename = "fileIds")]
     ids: Vec<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FingerprintIds {
+    fingerprints: Vec<u64>,
+}
+
+#[derive(Deserialize)]
+struct Matches<'a> {
+    #[serde(borrow)]
+    data: MatchLists<'a>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MatchLists<'a> {
+    is_cache_built: bool,
+    #[serde(borrow)]
+    exact_matches: Vec<&'a RawValue>,
+    #[serde(borrow)]
+    partial_matches: Vec<&'a RawValue>,
+    #[serde(borrow)]
+    partial_match_fingerprints: &'a RawValue,
+    #[serde(borrow, default)]
+    unmatched_fingerprints: Option<&'a RawValue>,
+}
+
+#[derive(Deserialize)]
+struct Match {
+    file: MatchedFile,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MatchedFile {
+    file_fingerprint: u64,
 }
 
 #[derive(Deserialize)]
@@ -64,18 +107,23 @@ impl Batch {
         match segments {
             ["mods"] => Some(Self::Mods),
             ["mods", "files"] => Some(Self::Files),
+            ["fingerprints"] => Some(Self::Fingerprints),
+            ["fingerprints", MINECRAFT] => Some(Self::MinecraftFingerprints),
             _ => None,
         }
     }
 
-    /// The ids of a body that holds only them, in their first order without repeats. `None` for any other body.
+    /// The ids of a body that holds only them, as asked. `None` for any other body.
     pub fn ids(self, body: &[u8]) -> Option<Vec<u64>> {
         let ids = match self {
             Self::Mods => serde_json::from_slice::<ModIds>(body).ok()?.ids,
             Self::Files => serde_json::from_slice::<FileIds>(body).ok()?.ids,
+            Self::Fingerprints | Self::MinecraftFingerprints => {
+                serde_json::from_slice::<FingerprintIds>(body)
+                    .ok()?
+                    .fingerprints
+            }
         };
-        let mut seen = HashSet::new();
-        let ids: Vec<u64> = ids.into_iter().filter(|id| seen.insert(*id)).collect();
         (!ids.is_empty()).then_some(ids)
     }
 
@@ -84,12 +132,14 @@ impl Batch {
         match self {
             Self::Mods => format!("mod:{id}"),
             Self::Files => format!("file:{id}"),
+            Self::Fingerprints => format!("fingerprint:{id}"),
+            Self::MinecraftFingerprints => format!("fingerprint:{MINECRAFT}:{id}"),
         }
     }
 
     pub fn found_ms(self) -> u64 {
         match self {
-            Self::Mods => HOUR_MS,
+            Self::Mods | Self::Fingerprints | Self::MinecraftFingerprints => HOUR_MS,
             Self::Files => 10 * MINUTE_MS,
         }
     }
@@ -97,14 +147,20 @@ impl Batch {
     pub fn not_found_ms(self) -> u64 {
         match self {
             Self::Mods => 5 * MINUTE_MS,
-            Self::Files => 10 * MINUTE_MS,
+            Self::Files | Self::Fingerprints | Self::MinecraftFingerprints => 10 * MINUTE_MS,
         }
+    }
+
+    fn is_fingerprints(self) -> bool {
+        matches!(self, Self::Fingerprints | Self::MinecraftFingerprints)
     }
 
     fn path(self) -> &'static str {
         match self {
             Self::Mods => "mods",
             Self::Files => "mods/files",
+            Self::Fingerprints => "fingerprints",
+            Self::MinecraftFingerprints => "fingerprints/432",
         }
     }
 
@@ -112,6 +168,7 @@ impl Batch {
         let field = match self {
             Self::Mods => "modIds",
             Self::Files => "fileIds",
+            Self::Fingerprints | Self::MinecraftFingerprints => "fingerprints",
         };
         let ids: Vec<String> = ids.iter().map(u64::to_string).collect();
         format!("{{\"{field}\":[{}]}}", ids.join(",")).into()
@@ -142,10 +199,16 @@ pub async fn answer(
     state: Arc<AppState>,
     pool: Pool,
     batch: Batch,
-    ids: Vec<u64>,
+    asked: Vec<u64>,
     forced: bool,
 ) -> Response {
     let now = state.clock.now_ms();
+    let mut seen = HashSet::new();
+    let ids: Vec<u64> = asked
+        .iter()
+        .copied()
+        .filter(|id| seen.insert(*id))
+        .collect();
     let mut slots = Vec::with_capacity(ids.len());
     let mut mine = Vec::new();
     for &id in &ids {
@@ -179,7 +242,7 @@ pub async fn answer(
     let mut rows = Vec::with_capacity(slots.len());
     let mut stale = false;
     let mut called = false;
-    for (_, kept, slot) in slots {
+    for (id, kept, slot) in slots {
         let loaded = match slot {
             Slot::Kept(entry) => Ok(entry),
             Slot::Waiting { waiting, started } => match AnswerCache::wait(waiting).await {
@@ -211,7 +274,7 @@ pub async fn answer(
             }
         };
         if let Some(row) = &entry.row {
-            rows.push(row.clone());
+            rows.push((id, row.clone()));
         }
     }
 
@@ -225,6 +288,9 @@ pub async fn answer(
     } else {
         "hit"
     };
+    if batch.is_fingerprints() {
+        return curseforge::respond(&json(fingerprint_answer(&rows, &asked)), cache);
+    }
     if rows.is_empty() {
         let answer = Answer {
             status: StatusCode::NOT_FOUND,
@@ -233,21 +299,47 @@ pub async fn answer(
         };
         return curseforge::respond(&answer, cache);
     }
-    let mut body = Vec::with_capacity(rows.iter().map(Bytes::len).sum::<usize>() + rows.len() + 11);
+    let mut body =
+        Vec::with_capacity(rows.iter().map(|(_, row)| row.len() + 1).sum::<usize>() + 11);
     body.extend_from_slice(b"{\"data\":[");
-    for (index, row) in rows.iter().enumerate() {
-        if index > 0 {
-            body.push(b',');
-        }
-        body.extend_from_slice(row);
-    }
+    join(&mut body, rows.iter().map(|(_, row)| row.as_ref()));
     body.extend_from_slice(b"]}");
-    let answer = Answer {
+    curseforge::respond(&json(body), cache)
+}
+
+fn json(body: Vec<u8>) -> Answer {
+    Answer {
         status: StatusCode::OK,
         content_type: Some(HeaderValue::from_static("application/json; charset=utf-8")),
         body: body.into(),
+    }
+}
+
+fn join<'a>(body: &mut Vec<u8>, parts: impl Iterator<Item = &'a [u8]>) {
+    for (index, part) in parts.enumerate() {
+        if index > 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(part);
+    }
+}
+
+fn fingerprint_answer(rows: &[(u64, Bytes)], asked: &[u64]) -> Vec<u8> {
+    let numbers = |ids: &mut dyn Iterator<Item = u64>| {
+        ids.map(|id| id.to_string()).collect::<Vec<_>>().join(",")
     };
-    curseforge::respond(&answer, cache)
+    let mut body =
+        Vec::with_capacity(rows.iter().map(|(_, row)| row.len() + 1).sum::<usize>() + 256);
+    body.extend_from_slice(b"{\"data\":{\"isCacheBuilt\":true,\"exactMatches\":[");
+    join(&mut body, rows.iter().map(|(_, row)| row.as_ref()));
+    body.extend_from_slice(b"],\"exactFingerprints\":[");
+    body.extend_from_slice(numbers(&mut rows.iter().map(|(id, _)| *id)).as_bytes());
+    body.extend_from_slice(
+        b"],\"partialMatches\":[],\"partialMatchFingerprints\":{},\"installedFingerprints\":[",
+    );
+    body.extend_from_slice(numbers(&mut asked.iter().copied()).as_bytes());
+    body.extend_from_slice(b"],\"unmatchedFingerprints\":null}}");
+    body
 }
 
 fn usable(entry: &Entry) -> bool {
@@ -313,7 +405,7 @@ async fn fetch_chunk(state: Arc<AppState>, pool: Pool, batch: Batch, chunk: Vec<
     )
     .await;
     let found = match sent {
-        Ok(answer) if answer.status == StatusCode::OK => match split(&answer) {
+        Ok(answer) if answer.status == StatusCode::OK => match split(batch, &answer) {
             Some(found) => Ok((found, answer.content_type)),
             None => Err(LoadFailure::Upstream(UpstreamFailure::Unreadable)),
         },
@@ -354,7 +446,10 @@ async fn fetch_chunk(state: Arc<AppState>, pool: Pool, batch: Batch, chunk: Vec<
     }
 }
 
-fn split(answer: &Answer) -> Option<Vec<(u64, Bytes, Option<u64>)>> {
+fn split(batch: Batch, answer: &Answer) -> Option<Vec<(u64, Bytes, Option<u64>)>> {
+    if batch.is_fingerprints() {
+        return split_matches(answer);
+    }
     let rows: Rows<'_> = serde_json::from_slice(&answer.body).ok()?;
     rows.data
         .iter()
@@ -369,6 +464,39 @@ fn split(answer: &Answer) -> Option<Vec<(u64, Bytes, Option<u64>)>> {
         .collect()
 }
 
+fn split_matches(answer: &Answer) -> Option<Vec<(u64, Bytes, Option<u64>)>> {
+    let matches: Matches<'_> = serde_json::from_slice(&answer.body).ok()?;
+    let lists = matches.data;
+    let plain = lists.is_cache_built
+        && lists.partial_matches.is_empty()
+        && lists.partial_match_fingerprints.get().trim() == "{}"
+        && lists.unmatched_fingerprints.is_none();
+    if !plain {
+        return None;
+    }
+    let mut grouped: Vec<(u64, Vec<&[u8]>)> = Vec::new();
+    for raw in lists.exact_matches {
+        let fingerprint = serde_json::from_str::<Match>(raw.get())
+            .ok()?
+            .file
+            .file_fingerprint;
+        match grouped.iter_mut().find(|(known, _)| *known == fingerprint) {
+            Some((_, rows)) => rows.push(raw.get().as_bytes()),
+            None => grouped.push((fingerprint, vec![raw.get().as_bytes()])),
+        }
+    }
+    Some(
+        grouped
+            .into_iter()
+            .map(|(fingerprint, rows)| {
+                let mut row = Vec::new();
+                join(&mut row, rows.into_iter());
+                (fingerprint, Bytes::from(row), None)
+            })
+            .collect(),
+    )
+}
+
 fn kept_row(
     batch: Batch,
     row: &Bytes,
@@ -376,6 +504,21 @@ fn kept_row(
     content_type: &Option<HeaderValue>,
     now: u64,
 ) -> Entry {
+    if batch.is_fingerprints() {
+        let row = Bytes::copy_from_slice(row);
+        return Entry {
+            row: Some(row.clone()),
+            ..Entry::new(
+                Answer {
+                    status: StatusCode::OK,
+                    content_type: content_type.clone(),
+                    body: row,
+                },
+                now,
+                batch.found_ms(),
+            )
+        };
+    }
     let mut body = Vec::with_capacity(row.len() + 9);
     body.extend_from_slice(b"{\"data\":");
     body.extend_from_slice(row);
@@ -723,9 +866,197 @@ mod tests {
         assert_eq!(mock.calls(), 1);
     }
 
+    fn fingerprints_in(body: &str) -> Vec<u64> {
+        let body: serde_json::Value = serde_json::from_str(body).unwrap();
+        body["fingerprints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_u64().unwrap())
+            .collect()
+    }
+
+    fn file_match(fingerprint: u64, file: u64) -> String {
+        format!(
+            r#"{{"id":{},"file":{{"id":{file},"fileFingerprint":{fingerprint}}},"latestFiles":[]}}"#,
+            fingerprint * 10
+        )
+    }
+
+    fn matches_for(fingerprint: u64) -> Vec<String> {
+        match fingerprint {
+            0..=99 => vec![file_match(fingerprint, fingerprint * 100)],
+            100..=199 => vec![
+                file_match(fingerprint, fingerprint * 100),
+                file_match(fingerprint, fingerprint * 100 + 1),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    fn lists(exact: &[String], exact_fingerprints: &[u64], installed: &[u64]) -> String {
+        let numbers = |ids: &[u64]| ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+        format!(
+            r#"{{"data":{{"isCacheBuilt":true,"exactMatches":[{}],"exactFingerprints":[{}],"partialMatches":[],"partialMatchFingerprints":{{}},"installedFingerprints":[{}],"unmatchedFingerprints":null}}}}"#,
+            exact.join(","),
+            numbers(exact_fingerprints),
+            numbers(installed)
+        )
+    }
+
+    fn expected(asked: &[u64]) -> String {
+        let mut seen = HashSet::new();
+        let known: Vec<u64> = asked
+            .iter()
+            .copied()
+            .filter(|id| seen.insert(*id) && !matches_for(*id).is_empty())
+            .collect();
+        let exact: Vec<String> = known.iter().flat_map(|id| matches_for(*id)).collect();
+        lists(&exact, &known, asked)
+    }
+
+    fn fingerprint_api(_: usize, seen: &Seen) -> Reply {
+        let asked = fingerprints_in(&seen.body);
+        reply(200, expected(&asked))
+    }
+
+    #[tokio::test]
+    async fn rebuilds_a_fingerprint_answer_from_what_each_fingerprint_matched() {
+        let mock = Mock::start(Duration::ZERO, fingerprint_api).await;
+        let gateway = gateway(&mock, 300, TIMEOUT);
+        let got = post(
+            &gateway,
+            "/v1/curseforge/fingerprints/432",
+            r#"{"fingerprints":[2,150,2,999]}"#,
+        )
+        .await;
+        assert_eq!(
+            (got.status, got.header("x-cache")),
+            (StatusCode::OK, Some("miss"))
+        );
+        assert_eq!(got.body, expected(&[2, 150, 2, 999]));
+        assert_eq!(mock.seen()[0].uri, "/v1/fingerprints/432");
+        assert_eq!(mock.seen()[0].body, r#"{"fingerprints":[2,150,999]}"#);
+    }
+
+    #[tokio::test]
+    async fn kept_fingerprints_answer_later_lookups_in_any_order() {
+        let mock = Mock::start(Duration::ZERO, fingerprint_api).await;
+        let gateway = gateway(&mock, 300, TIMEOUT);
+        post(
+            &gateway,
+            "/v1/curseforge/fingerprints/432",
+            r#"{"fingerprints":[2,150,999]}"#,
+        )
+        .await;
+
+        let again = post(
+            &gateway,
+            "/v1/curseforge/fingerprints/432",
+            r#"{"fingerprints":[999,150,2]}"#,
+        )
+        .await;
+        assert_eq!(again.header("x-cache"), Some("hit"));
+        assert_eq!(again.body, expected(&[999, 150, 2]));
+        let more = post(
+            &gateway,
+            "/v1/curseforge/fingerprints/432",
+            r#"{"fingerprints":[2,3]}"#,
+        )
+        .await;
+        assert_eq!(more.body, expected(&[2, 3]));
+        assert_eq!(mock.seen()[1].body, r#"{"fingerprints":[3]}"#);
+    }
+
+    #[tokio::test]
+    async fn fingerprints_curseforge_knows_none_of_are_an_answer_not_a_404() {
+        let mock = Mock::start(Duration::ZERO, fingerprint_api).await;
+        let gateway = gateway(&mock, 300, TIMEOUT);
+        for cache in ["miss", "hit"] {
+            let got = post(
+                &gateway,
+                "/v1/curseforge/fingerprints/432",
+                r#"{"fingerprints":[998,999]}"#,
+            )
+            .await;
+            assert_eq!(
+                (got.status, got.header("x-cache")),
+                (StatusCode::OK, Some(cache))
+            );
+            assert_eq!(got.body, expected(&[998, 999]));
+        }
+        assert_eq!(mock.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_route_without_a_game_keeps_its_own_fingerprints() {
+        let mock = Mock::start(Duration::ZERO, fingerprint_api).await;
+        let gateway = gateway(&mock, 300, TIMEOUT);
+        post(
+            &gateway,
+            "/v1/curseforge/fingerprints/432",
+            r#"{"fingerprints":[2]}"#,
+        )
+        .await;
+        let other = post(
+            &gateway,
+            "/v1/curseforge/fingerprints",
+            r#"{"fingerprints":[2]}"#,
+        )
+        .await;
+        assert_eq!(other.header("x-cache"), Some("miss"));
+        assert_eq!(other.body, expected(&[2]));
+        assert_eq!(mock.seen()[1].uri, "/v1/fingerprints");
+        let again = post(
+            &gateway,
+            "/v1/curseforge/fingerprints",
+            r#"{"fingerprints":[2]}"#,
+        )
+        .await;
+        assert_eq!(again.header("x-cache"), Some("hit"));
+    }
+
+    #[tokio::test]
+    async fn another_game_passes_through() {
+        let mock = Mock::start(Duration::ZERO, fingerprint_api).await;
+        let gateway = gateway(&mock, 300, TIMEOUT);
+        for _ in 0..2 {
+            post(
+                &gateway,
+                "/v1/curseforge/fingerprints/1",
+                r#"{"fingerprints":[2]}"#,
+            )
+            .await;
+        }
+        assert_eq!(mock.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_answer_with_partial_matches_is_not_split() {
+        let mock = Mock::start(Duration::ZERO, |_, _| {
+            reply(
+                200,
+                r#"{"data":{"isCacheBuilt":true,"exactMatches":[],"exactFingerprints":[],"partialMatches":[{"id":1}],"partialMatchFingerprints":{"1":[2]},"installedFingerprints":[2],"unmatchedFingerprints":null}}"#,
+            )
+        })
+        .await;
+        let gateway = gateway(&mock, 300, TIMEOUT);
+        let got = post(
+            &gateway,
+            "/v1/curseforge/fingerprints/432",
+            r#"{"fingerprints":[2]}"#,
+        )
+        .await;
+        assert_eq!(got.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(got.json()["code"], "UPSTREAM_UNREADABLE");
+    }
+
     #[test]
     fn reads_only_a_body_of_nothing_but_ids() {
-        assert_eq!(Batch::Mods.ids(br#"{"modIds":[3,1,3]}"#), Some(vec![3, 1]));
+        assert_eq!(
+            Batch::Mods.ids(br#"{"modIds":[3,1,3]}"#),
+            Some(vec![3, 1, 3])
+        );
         assert_eq!(Batch::Files.ids(br#"{"fileIds":[7]}"#), Some(vec![7]));
         assert_eq!(Batch::Mods.ids(br#"{"modIds":[]}"#), None);
         assert_eq!(
@@ -734,6 +1065,10 @@ mod tests {
         );
         assert_eq!(Batch::Mods.ids(br#"{"fileIds":[1]}"#), None);
         assert_eq!(Batch::Mods.ids(b"not json"), None);
+        assert_eq!(
+            Batch::MinecraftFingerprints.ids(br#"{"fingerprints":[4,4]}"#),
+            Some(vec![4, 4])
+        );
     }
 
     #[test]
