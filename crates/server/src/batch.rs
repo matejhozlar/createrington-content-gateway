@@ -190,6 +190,13 @@ pub async fn answer(
                 None => Err(LoadFailure::Upstream(UpstreamFailure::Unreachable)),
             },
         };
+        let loaded = loaded.and_then(|entry| {
+            if usable(&entry) {
+                Ok(entry)
+            } else {
+                Err(LoadFailure::Upstream(UpstreamFailure::Unreadable))
+            }
+        });
         let entry = match loaded {
             Ok(entry) => entry,
             Err(failure) => {
@@ -695,6 +702,25 @@ mod tests {
         );
         assert_eq!(mock.calls(), 1);
         assert_eq!(gateway.state.budget.snapshot().await.used, 1);
+    }
+
+    #[tokio::test]
+    async fn a_joined_answer_without_a_row_fails_the_batch_instead_of_dropping_the_id() {
+        let mock = Mock::start(Duration::from_millis(200), |_, _| {
+            reply(200, r#"{"error":"not a project"}"#)
+        })
+        .await;
+        let gateway = gateway(&mock, 300, TIMEOUT);
+        let single = {
+            let router = gateway.router.clone();
+            tokio::spawn(async move { get(&router, "/v1/curseforge/mods/1").await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let got = post(&gateway, "/v1/curseforge/mods", r#"{"modIds":[1]}"#).await;
+        assert_eq!(single.await.unwrap().status, StatusCode::OK);
+        assert_eq!(got.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(got.json()["code"], "UPSTREAM_UNREADABLE");
+        assert_eq!(mock.calls(), 1);
     }
 
     #[test]
