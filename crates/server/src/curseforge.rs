@@ -23,8 +23,8 @@ use crate::{
 pub const CURSEFORGE_API: &str = "https://api.curseforge.com";
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ANSWER_BYTES: usize = 32 * 1024 * 1024;
-const MINUTE_MS: u64 = 60_000;
-const HOUR_MS: u64 = 60 * MINUTE_MS;
+pub const MINUTE_MS: u64 = 60_000;
+pub const HOUR_MS: u64 = 60 * MINUTE_MS;
 const DAY_MS: u64 = 24 * HOUR_MS;
 const X_CACHE: HeaderName = HeaderName::from_static("x-cache");
 
@@ -141,11 +141,13 @@ fn freshness(segments: &[&str]) -> Option<Freshness> {
         ["categories"] | ["minecraft", "version"] | ["minecraft", "modloader"] => {
             fresh(DAY_MS, None)
         }
-        ["mods", project] if id(project) => fresh(HOUR_MS, Some(5 * MINUTE_MS)),
+        ["mods", project] if id(project) => {
+            fresh(Batch::Mods.found_ms(), Some(Batch::Mods.not_found_ms()))
+        }
         ["mods", project, "files"] if id(project) => fresh(10 * MINUTE_MS, None),
         ["mods", project, "description"] if id(project) => fresh(DAY_MS, None),
         ["mods", project, "files", file] if id(project) && id(file) => {
-            fresh(10 * MINUTE_MS, Some(10 * MINUTE_MS))
+            fresh(Batch::Files.found_ms(), Some(Batch::Files.not_found_ms()))
         }
         ["mods", project, "files", file, "download-url"] if id(project) && id(file) => {
             fresh(HOUR_MS, Some(10 * MINUTE_MS))

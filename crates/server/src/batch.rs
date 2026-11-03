@@ -15,8 +15,8 @@ use crate::{
     curseforge::{self, UpstreamFailure},
 };
 
-const MINUTE_MS: u64 = 60_000;
-const HOUR_MS: u64 = 60 * MINUTE_MS;
+use crate::curseforge::{HOUR_MS, MINUTE_MS};
+
 pub const IDS_PER_CALL: usize = 100;
 
 /// A batch route of CurseForge whose answer is one row per id: `POST /mods` or `POST /mods/files`.
