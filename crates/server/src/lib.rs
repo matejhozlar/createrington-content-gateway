@@ -8,3 +8,5 @@ pub mod error;
 pub mod health;
 pub mod redis_store;
 pub mod serve;
+#[cfg(test)]
+mod test_support;
