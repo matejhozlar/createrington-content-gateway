@@ -1072,6 +1072,54 @@ mod tests {
         assert_eq!(got.body, expected(&[998]));
     }
 
+    #[tokio::test]
+    async fn an_answer_whose_cache_is_not_built_or_that_lists_unmatched_ones_is_not_split() {
+        for lists in [
+            r#"{"data":{"isCacheBuilt":false,"exactMatches":[],"partialMatches":[],"partialMatchFingerprints":{},"unmatchedFingerprints":null}}"#,
+            r#"{"data":{"isCacheBuilt":true,"exactMatches":[],"partialMatches":[],"partialMatchFingerprints":{},"unmatchedFingerprints":[2]}}"#,
+        ] {
+            let mock = Mock::start(Duration::ZERO, move |_, _| reply(200, lists)).await;
+            let gateway = gateway(&mock, 300, TIMEOUT);
+            let got = post(
+                &gateway,
+                "/v1/curseforge/fingerprints/432",
+                r#"{"fingerprints":[2]}"#,
+            )
+            .await;
+            assert_eq!(got.status, StatusCode::BAD_GATEWAY, "{lists}");
+            assert_eq!(got.json()["code"], "UPSTREAM_UNREADABLE", "{lists}");
+        }
+    }
+
+    #[tokio::test]
+    async fn kept_fingerprints_answer_stale_when_curseforge_fails() {
+        let mock = Mock::start(Duration::ZERO, |call, seen| match call {
+            0 => fingerprint_api(call, seen),
+            _ => reply(500, "boom"),
+        })
+        .await;
+        let gateway = gateway(&mock, 300, TIMEOUT);
+        post(
+            &gateway,
+            "/v1/curseforge/fingerprints/432",
+            r#"{"fingerprints":[2,150,999]}"#,
+        )
+        .await;
+        gateway.clock.advance(2 * HOUR_MS);
+
+        let stale = post(
+            &gateway,
+            "/v1/curseforge/fingerprints/432",
+            r#"{"fingerprints":[150,2,2]}"#,
+        )
+        .await;
+        assert_eq!(
+            (stale.status, stale.header("x-cache")),
+            (StatusCode::OK, Some("stale"))
+        );
+        assert_eq!(stale.body, expected(&[150, 2, 2]));
+    }
+
     #[test]
     fn reads_only_a_body_of_nothing_but_ids() {
         assert_eq!(
