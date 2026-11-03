@@ -129,7 +129,7 @@ pub fn row_of(body: &Bytes) -> Option<(Bytes, Option<u64>)> {
 
 enum Slot {
     Kept(Arc<Entry>),
-    Waiting(Waiting),
+    Waiting { waiting: Waiting, started: bool },
 }
 
 struct Mine {
@@ -161,6 +161,7 @@ pub async fn answer(
             key
         };
         let (waiting, finisher) = state.cache.join(&load_key);
+        let started = finisher.is_some();
         if let Some(finisher) = finisher {
             mine.push(Mine {
                 id,
@@ -168,23 +169,26 @@ pub async fn answer(
                 finisher,
             });
         }
-        slots.push((id, kept, Slot::Waiting(waiting)));
+        slots.push((id, kept, Slot::Waiting { waiting, started }));
     }
 
-    let called = !mine.is_empty();
-    if called {
-        tokio::spawn(fetch(state.clone(), pool.clone(), batch, mine));
+    if !mine.is_empty() {
+        tokio::spawn(fetch(state.clone(), pool.clone(), batch, mine, forced));
     }
 
     let mut rows = Vec::with_capacity(slots.len());
     let mut stale = false;
+    let mut called = false;
     for (_, kept, slot) in slots {
         let loaded = match slot {
             Slot::Kept(entry) => Ok(entry),
-            Slot::Waiting(waiting) => AnswerCache::wait(waiting).await.map_or(
-                Err(LoadFailure::Upstream(UpstreamFailure::Unreachable)),
-                |outcome| outcome.loaded,
-            ),
+            Slot::Waiting { waiting, started } => match AnswerCache::wait(waiting).await {
+                Some(outcome) => {
+                    called |= started && outcome.called;
+                    outcome.loaded
+                }
+                None => Err(LoadFailure::Upstream(UpstreamFailure::Unreachable)),
+            },
         };
         let entry = match loaded {
             Ok(entry) => entry,
@@ -250,7 +254,28 @@ fn failed_upstream(failure: &LoadFailure) -> bool {
     }
 }
 
-async fn fetch(state: Arc<AppState>, pool: Pool, batch: Batch, mine: Vec<Mine>) {
+async fn fetch(state: Arc<AppState>, pool: Pool, batch: Batch, mine: Vec<Mine>, forced: bool) {
+    let mut missing = Vec::with_capacity(mine.len());
+    for load in mine {
+        let kept = state
+            .cache
+            .get(&batch.key(load.id))
+            .filter(|entry| !forced && usable(entry) && entry.is_fresh(state.clock.now_ms()));
+        match kept {
+            Some(entry) => {
+                let outcome = Outcome {
+                    loaded: Ok(entry),
+                    called: false,
+                };
+                state.cache.finish(&load.load_key, load.finisher, outcome);
+            }
+            None => missing.push(load),
+        }
+    }
+    if missing.is_empty() {
+        return;
+    }
+    let mine = missing;
     let calls = u32::try_from(mine.len().div_ceil(IDS_PER_CALL)).unwrap_or(u32::MAX);
     if let Err(refusal) = state.budget.admit(&pool.consumer, &pool.name, calls).await {
         for load in mine {
@@ -642,6 +667,34 @@ mod tests {
         .await;
         assert_eq!(forced.header("x-cache"), Some("miss"));
         assert_eq!(mock.seen()[1].body, r#"{"modIds":[1,2]}"#);
+    }
+
+    #[tokio::test]
+    async fn an_id_kept_meanwhile_is_neither_asked_for_nor_counted() {
+        let mock = Mock::start(Duration::ZERO, curseforge).await;
+        let gateway = gateway(&mock, 300, TIMEOUT);
+        get(&gateway.router, "/v1/curseforge/mods/1").await;
+
+        let (waiting, finisher) = gateway.state.cache.join("mod:1");
+        let pool = Pool {
+            consumer: "app".into(),
+            name: "launcher".into(),
+        };
+        let mine = vec![Mine {
+            id: 1,
+            load_key: "mod:1".to_owned(),
+            finisher: finisher.unwrap(),
+        }];
+        fetch(gateway.state.clone(), pool, Batch::Mods, mine, false).await;
+
+        let outcome = AnswerCache::wait(waiting).await.unwrap();
+        assert!(!outcome.called);
+        assert_eq!(
+            outcome.loaded.unwrap().row.clone().unwrap(),
+            Bytes::from(mod_row(1))
+        );
+        assert_eq!(mock.calls(), 1);
+        assert_eq!(gateway.state.budget.snapshot().await.used, 1);
     }
 
     #[test]
