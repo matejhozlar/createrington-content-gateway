@@ -6,7 +6,7 @@ use std::{
 
 use axum::{Json, extract::State};
 use jiff::{Timestamp, fmt::rfc2822};
-use redis::{Script, Value};
+use redis::{Script, Value, aio::ConnectionManager};
 use serde::Serialize;
 
 use crate::{app::AppState, redis_store::RedisStore};
@@ -98,7 +98,7 @@ pub enum Refusal {
 /// With Redis, the minute's counts, the hold and the daily counts live there
 /// and survive a restart: admitting is one atomic script, which also stores a
 /// hold only this process knew of, and daily counts are added up in memory
-/// and written after every change. While Redis fails, the
+/// and written in the background after every change. While Redis fails, the
 /// minute is counted in memory and the daily counts wait in memory until it
 /// answers again. Without Redis everything stays in memory, which is correct
 /// for a single gateway process.
@@ -106,8 +106,8 @@ pub struct Budget {
     limit_per_minute: u32,
     pools: Vec<PoolKey>,
     clock: Arc<dyn Clock>,
-    memory: Mutex<Counts>,
-    redis: Option<Shared>,
+    memory: Arc<Mutex<Counts>>,
+    redis: Option<Arc<Shared>>,
 }
 
 struct Shared {
@@ -213,12 +213,14 @@ impl Budget {
                 .map(|(consumer, pool)| (consumer.into(), pool.into()))
                 .collect(),
             clock,
-            memory: Mutex::new(Counts::default()),
-            redis: redis.map(|store| Shared {
-                store,
-                admit: Script::new(ADMIT_SCRIPT),
-                hold: Script::new(HOLD_SCRIPT),
-                writing_days: tokio::sync::Mutex::new(()),
+            memory: Arc::default(),
+            redis: redis.map(|store| {
+                Arc::new(Shared {
+                    store,
+                    admit: Script::new(ADMIT_SCRIPT),
+                    hold: Script::new(HOLD_SCRIPT),
+                    writing_days: tokio::sync::Mutex::new(()),
+                })
             }),
         }
     }
@@ -241,7 +243,7 @@ impl Budget {
         };
         if verdict.is_err() {
             self.lock(now).day(now, key).withheld += u64::from(calls);
-            self.write_days().await;
+            self.write_days_soon();
         }
         verdict
     }
@@ -284,70 +286,18 @@ impl Budget {
                 })
                 .await;
         }
-        self.write_days().await;
+        self.write_days_soon();
     }
 
-    /// Writes the daily counts that are not in Redis yet. Without Redis, or while it fails, they stay in memory.
-    pub async fn write_days(&self) {
+    /// Writes the daily counts that are not in Redis yet, even while Redis is being skipped after a failure, and
+    /// logs how many are lost when that fails too. For shutdown.
+    pub async fn write_days_at_exit(&self) {
         let Some(redis) = &self.redis else {
             return;
         };
-        let _writing = redis.writing_days.lock().await;
-        let unwritten: Vec<(String, PoolKey, DayCounts)> = {
-            let state = self.memory.lock().unwrap_or_else(PoisonError::into_inner);
-            state
-                .days
-                .iter()
-                .flat_map(|(date, pools)| {
-                    pools
-                        .iter()
-                        .map(|(key, counts)| (date.clone(), key.clone(), *counts))
-                })
-                .collect()
-        };
-        if unwritten.is_empty() {
-            return;
-        }
-
-        let mut pipeline = redis::pipe();
-        pipeline.atomic();
-        let mut day_keys = BTreeSet::new();
-        for (date, key, counts) in &unwritten {
-            let day_key = redis.store.key(&day_key(date));
-            for (name, count) in counts.named() {
-                if count > 0 {
-                    pipeline
-                        .hincr(&day_key, day_field(key, name), count)
-                        .ignore();
-                }
-            }
-            day_keys.insert(day_key);
-        }
-        for day_key in &day_keys {
-            pipeline.pexpire(day_key, DAY_KEY_TTL_MS).ignore();
-        }
-        let written = redis
-            .store
-            .run(|mut connection| async move { pipeline.query_async::<()>(&mut connection).await })
-            .await;
-        if written.is_none() {
-            return;
-        }
-
-        let mut state = self.memory.lock().unwrap_or_else(PoisonError::into_inner);
-        for (date, key, counts) in unwritten {
-            let Some(pools) = state.days.get_mut(&date) else {
-                continue;
-            };
-            if let Some(left) = pools.get_mut(&key) {
-                left.subtract(&counts);
-                if left.is_empty() {
-                    pools.remove(&key);
-                }
-            }
-            if pools.is_empty() {
-                state.days.remove(&date);
-            }
+        let lost = redis.write_days(&self.memory, true).await;
+        if lost > 0 {
+            tracing::warn!("Redis did not take the last daily counts, {lost} of them are lost");
         }
     }
 
@@ -561,6 +511,15 @@ impl Budget {
         })
     }
 
+    fn write_days_soon(&self) {
+        if let Some(redis) = &self.redis {
+            let (redis, memory) = (redis.clone(), self.memory.clone());
+            tokio::spawn(async move {
+                redis.write_days(&memory, false).await;
+            });
+        }
+    }
+
     fn key(&self, consumer: &str, pool: &str) -> PoolKey {
         self.pools
             .iter()
@@ -581,6 +540,77 @@ impl Budget {
             state.pools.clear();
         }
         state
+    }
+}
+
+impl Shared {
+    async fn write_days(&self, memory: &Mutex<Counts>, even_if_paused: bool) -> u64 {
+        let _writing = self.writing_days.lock().await;
+        let unwritten: Vec<(String, PoolKey, DayCounts)> = {
+            let state = memory.lock().unwrap_or_else(PoisonError::into_inner);
+            state
+                .days
+                .iter()
+                .flat_map(|(date, pools)| {
+                    pools
+                        .iter()
+                        .map(|(key, counts)| (date.clone(), key.clone(), *counts))
+                })
+                .collect()
+        };
+        if unwritten.is_empty() {
+            return 0;
+        }
+
+        let mut pipeline = redis::pipe();
+        pipeline.atomic();
+        let mut day_keys = BTreeSet::new();
+        for (date, key, counts) in &unwritten {
+            let day_key = self.store.key(&day_key(date));
+            for (name, count) in counts.named() {
+                if count > 0 {
+                    pipeline
+                        .hincr(&day_key, day_field(key, name), count)
+                        .ignore();
+                }
+            }
+            day_keys.insert(day_key);
+        }
+        for day_key in &day_keys {
+            pipeline.pexpire(day_key, DAY_KEY_TTL_MS).ignore();
+        }
+        let write = |mut connection: ConnectionManager| async move {
+            pipeline.query_async::<()>(&mut connection).await
+        };
+        let written = if even_if_paused {
+            self.store.run_even_if_paused(write).await
+        } else {
+            self.store.run(write).await
+        };
+        if written.is_none() {
+            return unwritten
+                .iter()
+                .flat_map(|(_, _, counts)| counts.named())
+                .map(|(_, count)| count)
+                .sum();
+        }
+
+        let mut state = memory.lock().unwrap_or_else(PoisonError::into_inner);
+        for (date, key, counts) in unwritten {
+            let Some(pools) = state.days.get_mut(&date) else {
+                continue;
+            };
+            if let Some(left) = pools.get_mut(&key) {
+                left.subtract(&counts);
+                if left.is_empty() {
+                    pools.remove(&key);
+                }
+            }
+            if pools.is_empty() {
+                state.days.remove(&date);
+            }
+        }
+        0
     }
 }
 
@@ -791,6 +821,9 @@ mod tests {
 
         async fn forget(self) {
             if let Some((url, prefix)) = &self.redis {
+                for (_, budget) in &self.budgets {
+                    budget.write_days_at_exit().await;
+                }
                 forget(url, prefix).await;
             }
         }
@@ -1082,6 +1115,7 @@ mod tests {
         before
             .record("app", "launcher", Some(429), Some("60"))
             .await;
+        before.write_days_at_exit().await;
         drop(before);
 
         let after = open();
@@ -1132,6 +1166,33 @@ mod tests {
                 retry_after_ms: 60_000
             })
         );
+        forget(&url, &prefix).await;
+    }
+
+    #[tokio::test]
+    async fn the_exit_write_tries_redis_even_while_it_is_skipped() {
+        let Some(url) = test_redis_url() else {
+            eprintln!("{TEST_REDIS_ENV} is not set, skipped");
+            return;
+        };
+        let prefix = unique_prefix();
+        let clock = TestClock::at(NOV_3_2026_20H);
+        let store = RedisStore::open(&url, prefix.clone()).unwrap();
+        store.skip_for_a_while();
+        let before = Budget::new(5, POOLS, clock.clone(), Some(store));
+        before.record("app", "app", Some(200), None).await;
+        before.write_days_at_exit().await;
+        drop(before);
+
+        let after = Budget::new(
+            5,
+            POOLS,
+            clock,
+            Some(RedisStore::open(&url, prefix.clone()).unwrap()),
+        );
+        let snapshot = after.snapshot().await;
+        assert_eq!(snapshot.source, Source::Redis);
+        assert_eq!(snapshot.days[0].pools[0].counts.calls, 1);
         forget(&url, &prefix).await;
     }
 

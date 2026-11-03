@@ -76,7 +76,7 @@ async fn main() -> ExitCode {
         SHUTDOWN_GRACE,
     )
     .await;
-    state.budget.write_days().await;
+    state.budget.write_days_at_exit().await;
     match stopped {
         Ok(Stopped::Drained) => {
             tracing::info!("stopped");

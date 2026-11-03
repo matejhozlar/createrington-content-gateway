@@ -74,6 +74,15 @@ impl RedisStore {
         {
             return None;
         }
+        self.run_even_if_paused(operation).await
+    }
+
+    /// Like `run`, but tries Redis even while it is being skipped after a failure.
+    pub async fn run_even_if_paused<T, F, Fut>(&self, operation: F) -> Option<T>
+    where
+        F: FnOnce(ConnectionManager) -> Fut,
+        Fut: Future<Output = RedisResult<T>>,
+    {
         match tokio::time::timeout(COMMAND_TIMEOUT, operation(self.connection.clone())).await {
             Ok(Ok(value)) => {
                 self.mark_up();
@@ -97,6 +106,11 @@ impl RedisStore {
         })
         .await
         .is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn skip_for_a_while(&self) {
+        self.link().paused_until = Some(Instant::now() + PAUSE_AFTER_FAILURE);
     }
 
     fn link(&self) -> MutexGuard<'_, Link> {
