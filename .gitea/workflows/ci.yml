@@ -53,6 +53,16 @@ jobs:
         if: github.event_name == 'pull_request'
         run: pnpm changeset:check "origin/${{ github.base_ref }}"
 
+      - name: Refuse a release that leaves changesets unconsumed
+        if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        run: |
+          pending=$(find .changeset -name '*.md' ! -name README.md)
+          if [ -n "$pending" ]; then
+            echo "::error::These changesets were not turned into a version, run pnpm version-packages on the release branch:"
+            echo "$pending"
+            exit 1
+          fi
+
       - name: Check the generated types against openapi.json
         run: pnpm --filter @createrington/content-gateway-client generate:check
 
