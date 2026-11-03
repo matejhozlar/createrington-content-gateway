@@ -4,19 +4,40 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use crate::{budget::Refusal, curseforge::UpstreamFailure};
 
+/// What went wrong, for a consumer to branch on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ErrorCode {
+    Unauthorized,
+    PoolRequired,
+    UnknownPool,
+    InvalidPath,
+    UpstreamTimeout,
+    UpstreamUnreachable,
+    UpstreamTooLarge,
+    UpstreamUnreadable,
+    BudgetSpent,
+    UpstreamHold,
+    RequestTooLarge,
+}
+
 /// The JSON error every route answers with: `{ code, message }`, plus `pool` and `retryAfterMs` on a refused call.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiError {
     #[serde(skip)]
     status: StatusCode,
-    code: &'static str,
+    code: ErrorCode,
+    /// What happened, in one sentence for a log line.
     message: String,
+    /// The pool the refused call would have drawn from, on a refused call and an unknown pool.
     #[serde(skip_serializing_if = "Option::is_none")]
     pool: Option<String>,
+    /// When the next call can go out, on a refused call. `Retry-After` carries the same in whole seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     retry_after_ms: Option<u64>,
 }
@@ -25,7 +46,7 @@ impl ApiError {
     pub fn unauthorized() -> Self {
         Self::new(
             StatusCode::UNAUTHORIZED,
-            "UNAUTHORIZED",
+            ErrorCode::Unauthorized,
             "send a consumer token as Authorization: Bearer <token>",
         )
     }
@@ -33,7 +54,7 @@ impl ApiError {
     pub fn pool_required(pools: &[impl AsRef<str>]) -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
-            "POOL_REQUIRED",
+            ErrorCode::PoolRequired,
             format!(
                 "this token draws from several pools, name one in X-Budget-Pool: {}",
                 join(pools)
@@ -46,7 +67,7 @@ impl ApiError {
             pool: Some(pool.to_owned()),
             ..Self::new(
                 StatusCode::BAD_REQUEST,
-                "UNKNOWN_POOL",
+                ErrorCode::UnknownPool,
                 format!(
                     "this token cannot draw from pool {pool:?}, only from: {}",
                     join(pools)
@@ -58,7 +79,7 @@ impl ApiError {
     pub fn invalid_path() -> Self {
         Self::new(
             StatusCode::BAD_REQUEST,
-            "INVALID_PATH",
+            ErrorCode::InvalidPath,
             "a CurseForge path is segments of letters, digits, - and _, separated by single slashes",
         )
     }
@@ -67,22 +88,22 @@ impl ApiError {
         match failure {
             UpstreamFailure::Timeout => Self::new(
                 StatusCode::GATEWAY_TIMEOUT,
-                "UPSTREAM_TIMEOUT",
+                ErrorCode::UpstreamTimeout,
                 "CurseForge did not answer in time",
             ),
             UpstreamFailure::Unreachable => Self::new(
                 StatusCode::BAD_GATEWAY,
-                "UPSTREAM_UNREACHABLE",
+                ErrorCode::UpstreamUnreachable,
                 "CurseForge could not be reached",
             ),
             UpstreamFailure::TooLarge => Self::new(
                 StatusCode::BAD_GATEWAY,
-                "UPSTREAM_TOO_LARGE",
+                ErrorCode::UpstreamTooLarge,
                 "CurseForge answered with more than the gateway keeps",
             ),
             UpstreamFailure::Unreadable => Self::new(
                 StatusCode::BAD_GATEWAY,
-                "UPSTREAM_UNREADABLE",
+                ErrorCode::UpstreamUnreadable,
                 "CurseForge answered a batch with something other than a list of rows with ids",
             ),
         }
@@ -93,7 +114,7 @@ impl ApiError {
             Refusal::Spent { retry_after_ms } => (
                 Self::new(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "BUDGET_SPENT",
+                    ErrorCode::BudgetSpent,
                     "the gateway has asked CurseForge enough this minute",
                 ),
                 Some(retry_after_ms),
@@ -101,7 +122,7 @@ impl ApiError {
             Refusal::Hold { retry_after_ms } => (
                 Self::new(
                     StatusCode::SERVICE_UNAVAILABLE,
-                    "UPSTREAM_HOLD",
+                    ErrorCode::UpstreamHold,
                     "CurseForge answered 429, every call waits until the hold ends",
                 ),
                 Some(retry_after_ms),
@@ -112,7 +133,7 @@ impl ApiError {
             } => (
                 Self::new(
                     StatusCode::PAYLOAD_TOO_LARGE,
-                    "REQUEST_TOO_LARGE",
+                    ErrorCode::RequestTooLarge,
                     format!(
                         "this request needs {calls} calls to CurseForge, more than the {limit_per_minute} a minute allows; split it"
                     ),
@@ -131,11 +152,11 @@ impl ApiError {
         self.status
     }
 
-    pub fn code(&self) -> &'static str {
+    pub fn code(&self) -> ErrorCode {
         self.code
     }
 
-    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+    fn new(status: StatusCode, code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             status,
             code,

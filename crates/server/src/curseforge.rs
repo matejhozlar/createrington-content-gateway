@@ -206,9 +206,83 @@ fn wants_fresh(headers: &HeaderMap) -> bool {
     })
 }
 
-pub async fn passthrough(
+/// What `GET api.curseforge.com/v1/{path}` answers, from the cache while it is fresh.
+///
+/// The query string goes to CurseForge as it came, and the answer comes back with CurseForge's status, content type
+/// and body, marked `X-Cache`. The routes of the cache table are kept for their fresh time; every other route is
+/// asked each time. `Cache-Control: no-cache` asks CurseForge again and keeps the new answer. A kept answer that is
+/// no longer fresh is still given, marked `stale`, when the budget refuses the call or CurseForge fails.
+#[utoipa::path(
+    get,
+    path = "/v1/curseforge/{path}",
+    tag = "curseforge",
+    security(("bearer" = [])),
+    params(
+        ("path" = String, Path, description = "The path under `api.curseforge.com/v1/`, such as `mods/search` or `mods/238222/files`: segments of letters, digits, `-` and `_`", example = "mods/search"),
+        ("X-Budget-Pool" = Option<String>, Header, description = "The pool the call draws from. Required when the token has more than one pool"),
+        ("Cache-Control" = Option<String>, Header, description = "`no-cache` asks CurseForge again instead of answering from the cache"),
+    ),
+    responses(
+        (status = 200, description = "CurseForge's answer, as it came", body = Value, headers(("X-Cache" = String, description = "`hit` from the cache, `miss` from CurseForge, `stale` an old answer given because CurseForge could not be asked"))),
+        (status = 400, description = "`INVALID_PATH`, `POOL_REQUIRED` or `UNKNOWN_POOL`", body = ApiError),
+        (status = 401, description = "No valid consumer token", body = ApiError),
+        (status = 502, description = "CurseForge could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`", body = ApiError),
+        (status = 503, description = "The call was refused: `BUDGET_SPENT` this minute or `UPSTREAM_HOLD` after a 429 from CurseForge", body = ApiError, headers(("Retry-After" = u64, description = "Seconds until the next call can go out"))),
+        (status = 504, description = "CurseForge did not answer in time, `UPSTREAM_TIMEOUT`", body = ApiError),
+        (status = "default", description = "Any other status CurseForge answered, with its body. Only the gateway's own answers lack `X-Cache`"),
+    )
+)]
+pub async fn passthrough_get(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,
+    pool: Pool,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    passthrough(state, path, pool, Method::GET, uri, headers, Bytes::new()).await
+}
+
+/// What `POST api.curseforge.com/v1/{path}` answers to this body.
+///
+/// `POST mods` with only `{"modIds": [...]}`, `POST mods/files` with only `{"fileIds": [...]}`, and
+/// `POST fingerprints/432` or `POST fingerprints` with only `{"fingerprints": [...]}` are answered per id from the
+/// cache, and only the ids not kept are asked for, 100 per call. Every other body goes to CurseForge each time.
+#[utoipa::path(
+    post,
+    path = "/v1/curseforge/{path}",
+    tag = "curseforge",
+    security(("bearer" = [])),
+    params(
+        ("path" = String, Path, description = "The path under `api.curseforge.com/v1/`, such as `mods` or `fingerprints/432`: segments of letters, digits, `-` and `_`", example = "mods"),
+        ("X-Budget-Pool" = Option<String>, Header, description = "The pool the call draws from. Required when the token has more than one pool"),
+        ("Cache-Control" = Option<String>, Header, description = "`no-cache` asks CurseForge again instead of answering from the cache"),
+    ),
+    request_body(content = Value, description = "The JSON body CurseForge expects at this path", content_type = "application/json"),
+    responses(
+        (status = 200, description = "CurseForge's answer, as it came, or one built from the kept rows of a batch", body = Value, headers(("X-Cache" = String, description = "`hit` when every id was kept, `miss` when CurseForge was asked, `stale` an old answer given because CurseForge could not be asked"))),
+        (status = 400, description = "`INVALID_PATH`, `POOL_REQUIRED` or `UNKNOWN_POOL`", body = ApiError),
+        (status = 401, description = "No valid consumer token", body = ApiError),
+        (status = 413, description = "The batch needs more calls than a whole minute allows, `REQUEST_TOO_LARGE`; split it", body = ApiError),
+        (status = 502, description = "CurseForge could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`", body = ApiError),
+        (status = 503, description = "The call was refused: `BUDGET_SPENT` this minute or `UPSTREAM_HOLD` after a 429 from CurseForge", body = ApiError, headers(("Retry-After" = u64, description = "Seconds until the next call can go out"))),
+        (status = 504, description = "CurseForge did not answer in time, `UPSTREAM_TIMEOUT`", body = ApiError),
+        (status = "default", description = "Any other status CurseForge answered, with its body. Only the gateway's own answers lack `X-Cache`"),
+    )
+)]
+pub async fn passthrough_post(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+    pool: Pool,
+    uri: Uri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    passthrough(state, path, pool, Method::POST, uri, headers, body).await
+}
+
+async fn passthrough(
+    state: Arc<AppState>,
+    path: String,
     pool: Pool,
     method: Method,
     uri: Uri,
