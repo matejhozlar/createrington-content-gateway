@@ -56,22 +56,41 @@ impl ApiError {
     }
 
     pub fn refused(refusal: Refusal, pool: &str) -> Self {
-        let (code, retry_after_ms, message) = match refusal {
+        let (error, retry_after_ms) = match refusal {
             Refusal::Spent { retry_after_ms } => (
-                "BUDGET_SPENT",
-                retry_after_ms,
-                "the gateway has asked CurseForge enough this minute",
+                Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "BUDGET_SPENT",
+                    "the gateway has asked CurseForge enough this minute",
+                ),
+                Some(retry_after_ms),
             ),
             Refusal::Hold { retry_after_ms } => (
-                "UPSTREAM_HOLD",
-                retry_after_ms,
-                "CurseForge answered 429, every call waits until the hold ends",
+                Self::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "UPSTREAM_HOLD",
+                    "CurseForge answered 429, every call waits until the hold ends",
+                ),
+                Some(retry_after_ms),
+            ),
+            Refusal::TooLarge {
+                calls,
+                limit_per_minute,
+            } => (
+                Self::new(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "REQUEST_TOO_LARGE",
+                    format!(
+                        "this request needs {calls} calls to CurseForge, more than the {limit_per_minute} a minute allows; split it"
+                    ),
+                ),
+                None,
             ),
         };
         Self {
             pool: Some(pool.to_owned()),
-            retry_after_ms: Some(retry_after_ms),
-            ..Self::new(StatusCode::SERVICE_UNAVAILABLE, code, message)
+            retry_after_ms,
+            ..error
         }
     }
 
@@ -165,6 +184,23 @@ mod tests {
                 "retryAfterMs": 12_300,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn a_request_too_large_for_any_minute_is_not_told_to_retry() {
+        let (status, headers, body) = parts(ApiError::refused(
+            Refusal::TooLarge {
+                calls: 400,
+                limit_per_minute: 300,
+            },
+            "jobs",
+        ))
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(headers.get(header::RETRY_AFTER).is_none());
+        assert_eq!(body["code"], "REQUEST_TOO_LARGE");
+        assert_eq!(body["pool"], "jobs");
+        assert!(body.get("retryAfterMs").is_none());
     }
 
     #[tokio::test]

@@ -35,11 +35,13 @@ impl Clock for SystemClock {
     }
 }
 
-/// Why calls were not let through: the minute's budget is spent, or CurseForge answered 429 and the hold has not ended.
+/// Why calls were not let through: the minute's budget is spent, CurseForge answered 429 and the hold has not ended,
+/// or the request needs more calls than a whole minute allows, which no retry can fix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     Spent { retry_after_ms: u64 },
     Hold { retry_after_ms: u64 },
+    TooLarge { calls: u32, limit_per_minute: u32 },
 }
 
 /// Counts and caps the calls every consumer makes on the CurseForge key.
@@ -147,7 +149,12 @@ impl Budget {
         let key = self.key(consumer, pool);
         let mut state = self.lock(now);
 
-        let refusal = if state.held_until_ms > now {
+        let refusal = if calls > self.limit_per_minute {
+            Some(Refusal::TooLarge {
+                calls,
+                limit_per_minute: self.limit_per_minute,
+            })
+        } else if state.held_until_ms > now {
             Some(Refusal::Hold {
                 retry_after_ms: state.held_until_ms - now,
             })
@@ -381,6 +388,19 @@ mod tests {
         assert!(budget.admit("app", "app", 2).is_err());
         assert_eq!(budget.admit("app", "app", 1), Ok(()));
         assert_eq!(budget.snapshot().used, 5);
+    }
+
+    #[test]
+    fn a_request_larger_than_a_whole_minute_is_refused_for_good() {
+        let budget = budget(5, TestClock::at(NOV_3_2026_20H));
+        assert_eq!(
+            budget.admit("sandbox", "jobs", 6),
+            Err(Refusal::TooLarge {
+                calls: 6,
+                limit_per_minute: 5
+            })
+        );
+        assert_eq!(budget.admit("sandbox", "jobs", 5), Ok(()));
     }
 
     #[test]
