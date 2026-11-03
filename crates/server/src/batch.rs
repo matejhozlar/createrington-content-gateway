@@ -1,11 +1,14 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use axum::{
     body::Bytes,
     http::{HeaderValue, Method, StatusCode},
     response::Response,
 };
-use serde::Deserialize;
+use serde::{Deserialize, de::IgnoredAny};
 use serde_json::value::RawValue;
 
 use crate::{
@@ -66,8 +69,7 @@ struct MatchLists<'a> {
     exact_matches: Vec<&'a RawValue>,
     #[serde(borrow)]
     partial_matches: Vec<&'a RawValue>,
-    #[serde(borrow)]
-    partial_match_fingerprints: &'a RawValue,
+    partial_match_fingerprints: HashMap<String, IgnoredAny>,
     #[serde(borrow, default)]
     unmatched_fingerprints: Option<&'a RawValue>,
 }
@@ -469,7 +471,7 @@ fn split_matches(answer: &Answer) -> Option<Vec<(u64, Bytes, Option<u64>)>> {
     let lists = matches.data;
     let plain = lists.is_cache_built
         && lists.partial_matches.is_empty()
-        && lists.partial_match_fingerprints.get().trim() == "{}"
+        && lists.partial_match_fingerprints.is_empty()
         && lists.unmatched_fingerprints.is_none();
     if !plain {
         return None;
@@ -1049,6 +1051,26 @@ mod tests {
         .await;
         assert_eq!(got.status, StatusCode::BAD_GATEWAY);
         assert_eq!(got.json()["code"], "UPSTREAM_UNREADABLE");
+    }
+
+    #[tokio::test]
+    async fn reads_curseforge_lists_in_any_spacing() {
+        let mock = Mock::start(Duration::ZERO, |_, _| {
+            reply(
+                200,
+                "{ \"data\" : { \"isCacheBuilt\" : true, \"exactMatches\" : [ ], \"partialMatches\" : [ ],\n  \"partialMatchFingerprints\" : { }, \"unmatchedFingerprints\" : null } }",
+            )
+        })
+        .await;
+        let gateway = gateway(&mock, 300, TIMEOUT);
+        let got = post(
+            &gateway,
+            "/v1/curseforge/fingerprints/432",
+            r#"{"fingerprints":[998]}"#,
+        )
+        .await;
+        assert_eq!(got.status, StatusCode::OK);
+        assert_eq!(got.body, expected(&[998]));
     }
 
     #[test]
