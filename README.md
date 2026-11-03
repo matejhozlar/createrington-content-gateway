@@ -2,7 +2,7 @@
 
 A small HTTP service that sits between your own services and the [CurseForge](https://docs.curseforge.com/rest-api/) and [Modrinth](https://docs.modrinth.com/api/) APIs. It holds the CurseForge API key so your services do not have to, shares one cache between all of them, counts every call made on the key, and holds every caller off when CurseForge answers 429.
 
-> **Status:** early. Consumers, tokens, the call budget and the CurseForge passthrough with its cache exist. Batch routes are not split per id yet, and cached answers live in memory only. The rest is being built in the open; the plan lives in [Createrington/app#1692](https://gitea.matejhoz.com/Createrington/app/issues/1692).
+> **Status:** early. Consumers, tokens, the call budget and the CurseForge passthrough with its cache exist. Fingerprint lookups are not cached per fingerprint yet, and cached answers live in memory only. The rest is being built in the open; the plan lives in [Createrington/app#1692](https://gitea.matejhoz.com/Createrington/app/issues/1692).
 
 ## What it will do
 
@@ -96,13 +96,15 @@ These answers are kept and given again while they are fresh, marked `X-Cache: hi
 | ----------------------------------------------------------------------- | ------ | --------------- |
 | `GET /mods/search`                                                      | 5 min  |                 |
 | `GET /categories`, `GET /minecraft/version`, `GET /minecraft/modloader` | 24 h   |                 |
-| `GET /mods/{id}`                                                        | 1 h    | 5 min           |
+| `GET /mods/{id}`, `POST /mods` (per id)                                 | 1 h    | 5 min           |
 | `GET /mods/{id}/files`                                                  | 10 min |                 |
-| `GET /mods/{id}/files/{fileId}`                                         | 10 min | 10 min          |
+| `GET /mods/{id}/files/{fileId}`, `POST /mods/files` (per id)            | 10 min | 10 min          |
 | `GET /mods/{id}/files/{fileId}/download-url`                            | 1 h    | 10 min          |
 | `GET /mods/{id}/files/{fileId}/changelog`, `GET /mods/{id}/description` | 24 h   |                 |
 
-Every other route, and every `POST`, goes to CurseForge each time. Other statuses are never kept. `Cache-Control: no-cache` asks CurseForge again and keeps the new answer. A kept answer stays for 24 h after its fresh time and is given, marked `X-Cache: stale`, when the budget refuses the call, CurseForge holds the key off, answers 5xx or does not answer.
+`POST /mods` with a body of only `{"modIds": [...]}` and `POST /mods/files` with only `{"fileIds": [...]}` are kept per id, and each id is shared with `GET /mods/{id}` or `GET /mods/{id}/files/{fileId}` (a file only under its own project, since CurseForge answers 404 for a file under another one). Only the ids that are not kept are asked for, 100 per call, and the budget admits all of those calls or none. The answer is `{"data": [...]}` with one row per known id in the order asked, without repeats, or a 404 without a body when CurseForge knows none of them, as it answers itself.
+
+Every other route, and every other `POST`, goes to CurseForge each time. Other statuses are never kept. `Cache-Control: no-cache` asks CurseForge again and keeps the new answer. A kept answer stays for 24 h after its fresh time and is given, marked `X-Cache: stale`, when the budget refuses the call, CurseForge holds the key off, answers 5xx or does not answer.
 
 Without a kept answer, a 429 from CurseForge answers `503 UPSTREAM_HOLD` like any held call, a CurseForge that does not answer within 10 s `504 UPSTREAM_TIMEOUT`, and one that cannot be reached `502 UPSTREAM_UNREACHABLE`.
 
