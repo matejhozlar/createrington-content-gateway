@@ -223,7 +223,11 @@ pub async fn passthrough(
         return respond(&entry.answer, "hit");
     }
 
-    let load_key = key.clone();
+    let load_key = if forced {
+        format!("{key} no-cache")
+    } else {
+        key.clone()
+    };
     let (waiting, finisher) = state.cache.join(&load_key);
     let started = finisher.is_some();
     if let Some(finisher) = finisher {
@@ -783,6 +787,31 @@ mod tests {
                 .header("x-cache"),
             Some("hit")
         );
+    }
+
+    #[tokio::test]
+    async fn no_cache_does_not_join_a_load_that_may_not_ask_curseforge() {
+        let mock = Mock::start(Duration::from_millis(200), |call, _| {
+            reply(200, format!("{{\"call\":{call}}}"))
+        })
+        .await;
+        let gateway = gateway(&mock, 300, TIMEOUT);
+        let plain = {
+            let router = gateway.router.clone();
+            tokio::spawn(async move { get(&router, "/v1/curseforge/mods/1").await })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let forced = send(
+            &gateway.router,
+            Request::get("/v1/curseforge/mods/1").header("cache-control", "no-cache"),
+            "",
+        )
+        .await;
+        plain.await.unwrap();
+
+        assert_eq!(forced.header("x-cache"), Some("miss"));
+        assert_eq!(forced.body, r#"{"call":1}"#);
+        assert_eq!(mock.calls(), 2);
     }
 
     #[tokio::test]
