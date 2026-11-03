@@ -204,18 +204,19 @@ pub async fn answer(
     asked: Vec<u64>,
     forced: bool,
 ) -> Response {
-    let now = state.clock.now_ms();
     let mut seen = HashSet::new();
     let ids: Vec<u64> = asked
         .iter()
         .copied()
         .filter(|id| seen.insert(*id))
         .collect();
+    let keys: Vec<String> = ids.iter().map(|id| batch.key(*id)).collect();
+    let found = state.cache.lookup_many(&keys, state.clock.now_ms()).await;
+    let now = state.clock.now_ms();
     let mut slots = Vec::with_capacity(ids.len());
     let mut mine = Vec::new();
-    for &id in &ids {
-        let key = batch.key(id);
-        let kept = state.cache.get(&key).filter(|entry| usable(entry));
+    for ((&id, key), kept) in ids.iter().zip(keys).zip(found) {
+        let kept = kept.filter(|entry| usable(entry));
         if !forced && let Some(entry) = kept.clone().filter(|entry| entry.is_fresh(now)) {
             slots.push((id, kept, Slot::Kept(entry)));
             continue;
@@ -548,7 +549,7 @@ mod tests {
     use axum::http::Request;
 
     use super::*;
-    use crate::{curseforge::TIMEOUT, test_support::*};
+    use crate::{curseforge::TIMEOUT, redis_store::RedisStore, test_support::*};
 
     fn ids_in(body: &str) -> Vec<u64> {
         let body: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -1118,6 +1119,89 @@ mod tests {
             (StatusCode::OK, Some("stale"))
         );
         assert_eq!(stale.body, expected(&[150, 2, 2]));
+    }
+
+    #[tokio::test]
+    async fn answers_kept_in_redis_are_hits_after_a_restart() {
+        let Ok(url) = std::env::var("CONTENT_GATEWAY_TEST_REDIS_URL") else {
+            eprintln!("CONTENT_GATEWAY_TEST_REDIS_URL is not set, skipped");
+            return;
+        };
+        let prefix = format!("content-gateway-test:restart:{}", std::process::id());
+        let open = || Some(Arc::new(RedisStore::open(&url, prefix.clone()).unwrap()));
+        forget_prefix(&RedisStore::open(&url, prefix.clone()).unwrap()).await;
+        let mock = Mock::start(Duration::ZERO, curseforge).await;
+
+        let before = gateway_on(&mock, 300, TIMEOUT, open());
+        get(&before.router, "/v1/curseforge/mods/1").await;
+        post(&before, "/v1/curseforge/mods", r#"{"modIds":[2,1000]}"#).await;
+        get(&before.router, "/v1/curseforge/mods/3/files/30").await;
+
+        let store = RedisStore::open(&url, prefix.clone()).unwrap();
+        let written: Vec<String> = ["mod:1", "mod:2", "mod:1000", "mods/3/files/30?", "file:30"]
+            .iter()
+            .map(|key| store.key(&format!("cache:{key}")))
+            .collect();
+        for _ in 0..100 {
+            let keys = written.clone();
+            let found = store
+                .run(|mut connection| async move {
+                    redis::cmd("EXISTS")
+                        .arg(keys)
+                        .query_async::<usize>(&mut connection)
+                        .await
+                })
+                .await;
+            if found == Some(written.len()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let calls = mock.calls();
+
+        let after = gateway_on(&mock, 300, TIMEOUT, open());
+        let single = get(&after.router, "/v1/curseforge/mods/2").await;
+        assert_eq!(single.header("x-cache"), Some("hit"));
+        assert_eq!(single.body, format!(r#"{{"data":{}}}"#, mod_row(2)));
+        let joined = post(&after, "/v1/curseforge/mods", r#"{"modIds":[1,2,1000]}"#).await;
+        assert_eq!(joined.header("x-cache"), Some("hit"));
+        assert_eq!(
+            joined.body,
+            format!(r#"{{"data":[{},{}]}}"#, mod_row(1), mod_row(2))
+        );
+        assert_eq!(
+            get(&after.router, "/v1/curseforge/mods/3/files/30")
+                .await
+                .header("x-cache"),
+            Some("hit")
+        );
+        assert_eq!(mock.calls(), calls);
+
+        forget_prefix(&store).await;
+    }
+
+    async fn forget_prefix(store: &RedisStore) {
+        let pattern = store.key("*");
+        let stored = store
+            .run(|mut connection| async move {
+                redis::cmd("KEYS")
+                    .arg(pattern)
+                    .query_async::<Vec<String>>(&mut connection)
+                    .await
+            })
+            .await
+            .unwrap_or_default();
+        if stored.is_empty() {
+            return;
+        }
+        store
+            .run(|mut connection| async move {
+                redis::cmd("DEL")
+                    .arg(stored)
+                    .query_async::<()>(&mut connection)
+                    .await
+            })
+            .await;
     }
 
     #[test]

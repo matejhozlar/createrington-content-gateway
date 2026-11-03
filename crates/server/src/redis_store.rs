@@ -125,7 +125,7 @@ impl RedisStore {
         match before {
             LinkState::Untried => tracing::info!("Redis connected"),
             LinkState::Down => {
-                tracing::info!("Redis answers again, the budget is kept in it again")
+                tracing::info!("Redis answers again, the budget and the cache use it again")
             }
             LinkState::Up => {}
         }
@@ -138,7 +138,7 @@ impl RedisStore {
         drop(link);
         if before != LinkState::Down {
             tracing::warn!(
-                "Redis failed, the budget is kept in memory until it answers again: {reason}"
+                "Redis failed, the budget and the cache use memory until it answers again: {reason}"
             );
         }
     }

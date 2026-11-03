@@ -252,10 +252,21 @@ pub async fn passthrough(
         Some(Share::Mod(project)) => Batch::Mods.key(project),
         _ => cache_key(&path, query.as_deref()),
     };
+    let (shared_file, cached) = match share {
+        Some(Share::File { file, .. }) => {
+            let mut found = state
+                .cache
+                .lookup_many(&[Batch::Files.key(file), key.clone()], state.clock.now_ms())
+                .await;
+            let cached = found.pop().flatten();
+            (found.pop().flatten(), cached)
+        }
+        _ => (None, state.cache.lookup(&key, state.clock.now_ms()).await),
+    };
     let now = state.clock.now_ms();
     if !forced
-        && let Some(Share::File { project, file }) = share
-        && let Some(entry) = state.cache.get(&Batch::Files.key(file)).filter(|entry| {
+        && let Some(Share::File { project, .. }) = share
+        && let Some(entry) = shared_file.filter(|entry| {
             entry.is_fresh(now)
                 && entry.answer.status == StatusCode::OK
                 && entry.owner == Some(project)
@@ -264,7 +275,6 @@ pub async fn passthrough(
         state.budget.record_hit(&pool.consumer, &pool.name);
         return respond(&entry.answer, "hit");
     }
-    let cached = state.cache.get(&key);
     if !forced && let Some(entry) = cached.as_ref().filter(|entry| entry.is_fresh(now)) {
         state.budget.record_hit(&pool.consumer, &pool.name);
         return respond(&entry.answer, "hit");
