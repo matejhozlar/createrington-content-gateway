@@ -1,0 +1,7 @@
+node_modules
+target
+pnpm-lock.yaml
+Cargo.lock
+CHANGELOG.md
+.claude
+.pnpm-store

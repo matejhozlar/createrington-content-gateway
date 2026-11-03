@@ -1,0 +1,8 @@
+target
+node_modules
+.git
+.gitea
+.husky
+.claude
+.env
+.env.*

@@ -1,0 +1,66 @@
+name: Setup Rust
+description: Install the toolchain pinned in rust-toolchain.toml and use the runner's persistent caches, or restore the cargo caches
+
+inputs:
+  cache-target:
+    description: Also cache the target directory. Turn off for jobs that do not compile.
+    default: "true"
+  cache-name:
+    description: A name that keeps the target directory of this job apart from the other jobs' caches.
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Use the runner's persistent caches
+      if: env.CI_PERSISTENT_RUST == '1'
+      shell: bash
+      run: |
+        if [ ! -d "$CI_RUST_CACHE/cargo" ] || ! command -v sccache > /dev/null; then
+          echo "::warning::CI_PERSISTENT_RUST is set but $CI_RUST_CACHE/cargo or sccache is missing in this container, falling back to the action caches"
+          echo "CI_PERSISTENT_RUST=0" >> "$GITHUB_ENV"
+          exit 0
+        fi
+        {
+          echo "CARGO_HOME=$CI_RUST_CACHE/cargo"
+          echo "RUSTUP_HOME=$CI_RUST_CACHE/rustup"
+          echo "RUSTC_WRAPPER=sccache"
+        } >> "$GITHUB_ENV"
+        echo "$CI_RUST_CACHE/cargo/bin" >> "$GITHUB_PATH"
+
+    - name: Install rustup
+      shell: bash
+      run: |
+        if [ ! -x "${CARGO_HOME:-$HOME/.cargo}/bin/rustup" ]; then
+          curl --proto '=https' --tlsv1.2 --retry 3 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain none --profile minimal
+        fi
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+    - name: Install pinned toolchain
+      shell: bash
+      run: |
+        rustup toolchain install
+        rustc --version
+        cargo --version
+
+    - name: Cache cargo registry
+      if: env.CI_PERSISTENT_RUST != '1'
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+        key: ${{ runner.os }}-cargo-registry-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-registry-
+
+    - name: Cache target directory
+      if: env.CI_PERSISTENT_RUST != '1' && inputs.cache-target == 'true'
+      uses: actions/cache@v4
+      with:
+        path: target
+        key: ${{ runner.os }}-cargo-target${{ inputs.cache-name }}-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-target${{ inputs.cache-name }}-${{ hashFiles('rust-toolchain.toml') }}-

@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+      - dev
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  HUSKY: "0"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  format:
+    runs-on: oracle
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup
+        uses: ./.gitea/actions/setup
+
+      - name: Check formatting
+        run: pnpm format:check
+
+  audit:
+    runs-on: oracle
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup
+        uses: ./.gitea/actions/setup
+
+      - name: Audit dependencies
+        run: pnpm audit --audit-level=high
+
+  rust-format:
+    runs-on: hetzner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: ./.gitea/actions/setup-rust
+        with:
+          cache-target: "false"
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  rust-deps:
+    runs-on: hetzner
+    env:
+      CARGO_DENY_VERSION: "0.20.2"
+      CARGO_MACHETE_VERSION: "0.9.2"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: ./.gitea/actions/setup-rust
+        with:
+          cache-target: "false"
+
+      - name: Cache dependency tools
+        if: env.CI_PERSISTENT_RUST != '1'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-machete
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-deps-tools-${{ env.CARGO_DENY_VERSION }}-${{ env.CARGO_MACHETE_VERSION }}
+
+      - name: Install dependency tools
+        run: |
+          cargo-deny --version 2> /dev/null | grep -qF "$CARGO_DENY_VERSION" \
+            || cargo install --locked "cargo-deny@$CARGO_DENY_VERSION"
+          cargo-machete --version 2> /dev/null | grep -qF "$CARGO_MACHETE_VERSION" \
+            || cargo install --locked "cargo-machete@$CARGO_MACHETE_VERSION"
+
+      - name: Check advisories, licences, bans and sources
+        run: cargo deny --locked check
+
+      - name: Find unused dependencies
+        run: cargo machete
+
+  rust:
+    runs-on: hetzner
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: ./.gitea/actions/setup-rust
+
+      - name: Check
+        run: cargo check --workspace --locked
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Show the compile cache statistics
+        if: always() && env.RUSTC_WRAPPER == 'sccache'
+        run: sccache --show-stats
