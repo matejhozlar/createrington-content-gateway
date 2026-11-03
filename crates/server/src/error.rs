@@ -5,7 +5,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use crate::budget::Refusal;
+use crate::{budget::Refusal, curseforge::UpstreamFailure};
 
 /// The JSON error every route answers with: `{ code, message }`, plus `pool` and `retryAfterMs` on a refused call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -52,6 +52,34 @@ impl ApiError {
                     join(pools)
                 ),
             )
+        }
+    }
+
+    pub fn invalid_path() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            "INVALID_PATH",
+            "a CurseForge path is segments of letters, digits, - and _, separated by single slashes",
+        )
+    }
+
+    pub fn upstream(failure: UpstreamFailure) -> Self {
+        match failure {
+            UpstreamFailure::Timeout => Self::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "UPSTREAM_TIMEOUT",
+                "CurseForge did not answer in time",
+            ),
+            UpstreamFailure::Unreachable => Self::new(
+                StatusCode::BAD_GATEWAY,
+                "UPSTREAM_UNREACHABLE",
+                "CurseForge could not be reached",
+            ),
+            UpstreamFailure::TooLarge => Self::new(
+                StatusCode::BAD_GATEWAY,
+                "UPSTREAM_TOO_LARGE",
+                "CurseForge answered with more than the gateway keeps",
+            ),
         }
     }
 

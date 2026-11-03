@@ -2,7 +2,7 @@
 
 A small HTTP service that sits between your own services and the [CurseForge](https://docs.curseforge.com/rest-api/) and [Modrinth](https://docs.modrinth.com/api/) APIs. It holds the CurseForge API key so your services do not have to, shares one cache between all of them, counts every call made on the key, and holds every caller off when CurseForge answers 429.
 
-> **Status:** early. Consumers, tokens and the call budget exist; CurseForge is not called yet. The rest is being built in the open; the plan lives in [Createrington/app#1692](https://gitea.matejhoz.com/Createrington/app/issues/1692).
+> **Status:** early. Consumers, tokens, the call budget and the CurseForge passthrough with its cache exist. Batch routes are not split per id yet, and cached answers live in memory only. The rest is being built in the open; the plan lives in [Createrington/app#1692](https://gitea.matejhoz.com/Createrington/app/issues/1692).
 
 ## What it will do
 
@@ -17,7 +17,7 @@ A small HTTP service that sits between your own services and the [CurseForge](ht
 Requires the Rust toolchain pinned in `rust-toolchain.toml` (installed automatically by `rustup`).
 
 ```bash
-CONTENT_GATEWAY_TOKEN="$(openssl rand -base64 32)" cargo run
+CURSEFORGE_API_KEY="<your key>" CONTENT_GATEWAY_TOKEN="$(openssl rand -base64 32)" cargo run
 curl http://127.0.0.1:5005/v1/healthz
 ```
 
@@ -27,6 +27,7 @@ All configuration comes from environment variables.
 
 | Variable                            | Default     | Meaning                                                                                                                                             |
 | ----------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CURSEFORGE_API_KEY`                |             | Required. The [CurseForge API key](https://console.curseforge.com/) every call to CurseForge is made with                                           |
 | `CONTENT_GATEWAY_HOST`              | `127.0.0.1` | IP address to listen on                                                                                                                             |
 | `CONTENT_GATEWAY_PORT`              | `5005`      | Port to listen on                                                                                                                                   |
 | `CONTENT_GATEWAY_LOG`               | `info`      | Log filter, in [`tracing-subscriber` `EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax |
@@ -69,7 +70,7 @@ Every key starts with `content-gateway:`, so the gateway can share a Redis with 
 docker build -t content-gateway \
   --build-arg CONTENT_GATEWAY_COMMIT="$(git rev-parse HEAD)" \
   --build-arg CONTENT_GATEWAY_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" .
-cp .env.example .env   # then set CONTENT_GATEWAY_TOKEN, or CONTENT_GATEWAY_CONSUMERS
+cp .env.example .env   # then set CURSEFORGE_API_KEY and CONTENT_GATEWAY_TOKEN (or CONTENT_GATEWAY_CONSUMERS)
 docker run --rm --env-file .env -p 127.0.0.1:5005:5005 content-gateway
 ```
 
@@ -77,12 +78,33 @@ The image is a static binary on a distroless base. Inside the container the gate
 
 ## Endpoints
 
-| Route             | Auth  | What it answers                                                                                                                                        |
-| ----------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `GET /v1/healthz` | none  | `{ status, version, commit, builtAt }`                                                                                                                 |
-| `GET /v1/budget`  | token | This minute's calls sent and withheld per pool, the 429 hold, and daily counts for the last 14 UTC days. Every count is a count of calls to CurseForge |
+| Route                                           | Auth  | What it answers                                                                                                                                                                                           |
+| ----------------------------------------------- | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /v1/healthz`                               | none  | `{ status, version, commit, builtAt }`                                                                                                                                                                    |
+| `GET /v1/budget`                                | token | This minute's calls sent and withheld per pool, the 429 hold, and daily counts for the last 14 UTC days: calls to CurseForge, answers given without one (`hits`), calls withheld, and 403 and 429 answers |
+| `GET /v1/curseforge/*`, `POST /v1/curseforge/*` | token | What `api.curseforge.com/v1/*` answers, see below                                                                                                                                                         |
 
 `source` in the budget says where its counts come from: `redis` for the stored ones, `memory` when no Redis is configured, and `unavailable` when Redis did not answer, in which case the minute is the gateway's own count and the days show only what is not written to Redis yet.
+
+### CurseForge
+
+`/v1/curseforge/<path>` sends the request to `https://api.curseforge.com/v1/<path>` with the same query string and body and the gateway's key, and answers with CurseForge's status, content type and body as they came. Every call that reaches CurseForge counts against the budget of the request's pool. A path is segments of letters, digits, `-` and `_`; anything else answers `400 INVALID_PATH`.
+
+These answers are kept and given again while they are fresh, marked `X-Cache: hit` (`miss` when CurseForge was asked). The order of query parameters does not matter. Requests for an answer that is being fetched wait for it and share it. A call that has started always finishes, is counted and is kept, also when the request that started it goes away.
+
+| Route (under `/v1/curseforge`)                                          | Fresh  | Not found (404) |
+| ----------------------------------------------------------------------- | ------ | --------------- |
+| `GET /mods/search`                                                      | 5 min  |                 |
+| `GET /categories`, `GET /minecraft/version`, `GET /minecraft/modloader` | 24 h   |                 |
+| `GET /mods/{id}`                                                        | 1 h    | 5 min           |
+| `GET /mods/{id}/files`                                                  | 10 min |                 |
+| `GET /mods/{id}/files/{fileId}`                                         | 10 min | 10 min          |
+| `GET /mods/{id}/files/{fileId}/download-url`                            | 1 h    | 10 min          |
+| `GET /mods/{id}/files/{fileId}/changelog`, `GET /mods/{id}/description` | 24 h   |                 |
+
+Every other route, and every `POST`, goes to CurseForge each time. Other statuses are never kept. `Cache-Control: no-cache` asks CurseForge again and keeps the new answer. A kept answer stays for 24 h after its fresh time and is given, marked `X-Cache: stale`, when the budget refuses the call, CurseForge holds the key off, answers 5xx or does not answer.
+
+Without a kept answer, a 429 from CurseForge answers `503 UPSTREAM_HOLD` like any held call, a CurseForge that does not answer within 10 s `504 UPSTREAM_TIMEOUT`, and one that cannot be reached `502 UPSTREAM_UNREACHABLE`.
 
 Errors answer `{ "code", "message" }`. A call the budget refuses answers `503` with `Retry-After`, plus `pool` and `retryAfterMs` in the body; `code` is `BUDGET_SPENT` when the minute's ceiling is reached and `UPSTREAM_HOLD` while CurseForge's 429 hold lasts. A request that needs more calls than a whole minute allows answers `413 REQUEST_TOO_LARGE` without `Retry-After`, since waiting would not help.
 

@@ -4,8 +4,10 @@ use axum::{Router, middleware, routing::get};
 
 use crate::{
     auth,
-    budget::{self, Budget, SystemClock},
+    budget::{self, Budget, Clock, SystemClock},
+    cache::AnswerCache,
     config::{Config, Consumer},
+    curseforge::{self, CURSEFORGE_API, Upstream},
     health,
     redis_store::RedisStore,
 };
@@ -13,31 +15,41 @@ use crate::{
 pub struct AppState {
     pub consumers: Vec<Consumer>,
     pub budget: Budget,
+    pub upstream: Upstream,
+    pub cache: AnswerCache,
+    pub clock: Arc<dyn Clock>,
 }
 
 impl AppState {
-    pub fn from_config(config: &Config, redis: Option<RedisStore>) -> Self {
+    pub fn from_config(config: &Config, redis: Option<RedisStore>) -> reqwest::Result<Self> {
         let pools = config.consumers.iter().flat_map(|consumer| {
             consumer
                 .pools
                 .iter()
                 .map(|pool| (consumer.name.as_str(), pool.as_str()))
         });
-        Self {
-            budget: Budget::new(
-                config.budget_per_minute,
-                pools,
-                Arc::new(SystemClock),
-                redis,
-            ),
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        Ok(Self {
+            budget: Budget::new(config.budget_per_minute, pools, clock.clone(), redis),
+            upstream: Upstream::new(
+                CURSEFORGE_API,
+                config.curseforge_api_key.clone(),
+                curseforge::TIMEOUT,
+            )?,
+            cache: AnswerCache::default(),
+            clock,
             consumers: config.consumers.clone(),
-        }
+        })
     }
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
     let authenticated = Router::new()
         .route("/v1/budget", get(budget::readout))
+        .route(
+            "/v1/curseforge/{*path}",
+            get(curseforge::passthrough).post(curseforge::passthrough),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,
@@ -62,6 +74,14 @@ pub(crate) fn test_state(consumers: Vec<Consumer>) -> Arc<AppState> {
         .collect();
     Arc::new(AppState {
         budget: Budget::new(300, pools, Arc::new(SystemClock), None),
+        upstream: Upstream::new(
+            "http://127.0.0.1:9",
+            crate::config::ApiKey::new("unused"),
+            curseforge::TIMEOUT,
+        )
+        .unwrap(),
+        cache: AnswerCache::default(),
+        clock: Arc::new(SystemClock),
         consumers,
     })
 }
