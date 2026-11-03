@@ -24,7 +24,6 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(1);
 pub struct RedisStore {
     connection: ConnectionManager,
     prefix: String,
-    keeps: &'static str,
     link: Mutex<Link>,
 }
 
@@ -53,15 +52,8 @@ impl RedisStore {
         Ok(Self {
             connection: ConnectionManager::new_lazy_with_config(Client::open(url)?, config)?,
             prefix: prefix.into(),
-            keeps: "the budget and the cache",
             link: Mutex::default(),
         })
-    }
-
-    /// Names what this store keeps, for its log lines.
-    #[must_use]
-    pub fn keeping(self, keeps: &'static str) -> Self {
-        Self { keeps, ..self }
     }
 
     pub fn key(&self, name: &str) -> String {
@@ -131,9 +123,9 @@ impl RedisStore {
         let before = std::mem::replace(&mut link.state, LinkState::Up);
         drop(link);
         match before {
-            LinkState::Untried => tracing::info!("Redis connected, keeping {}", self.keeps),
+            LinkState::Untried => tracing::info!("Redis connected"),
             LinkState::Down => {
-                tracing::info!("Redis answers again, keeping {} again", self.keeps)
+                tracing::info!("Redis answers again, the budget and the cache use it again")
             }
             LinkState::Up => {}
         }
@@ -146,8 +138,7 @@ impl RedisStore {
         drop(link);
         if before != LinkState::Down {
             tracing::warn!(
-                "Redis failed, memory keeps {} until it answers again: {reason}",
-                self.keeps
+                "Redis failed, the budget and the cache use memory until it answers again: {reason}"
             );
         }
     }

@@ -35,7 +35,6 @@ All configuration comes from environment variables.
 | `CONTENT_GATEWAY_CONSUMERS`         |             | Several consumers as JSON, see below. Set this or `CONTENT_GATEWAY_TOKEN`, not both                                                                 |
 | `CONTENT_GATEWAY_BUDGET_PER_MINUTE` | `300`       | Calls to CurseForge per minute over all consumers and pools                                                                                         |
 | `REDIS_URL`                         |             | Redis to keep the budget and the cache in across restarts, such as `redis://:password@127.0.0.1:6379/0`. Without it everything stays in memory      |
-| `CONTENT_GATEWAY_CACHE_REDIS_URL`   | `REDIS_URL` | A separate Redis for the cache, see below                                                                                                           |
 
 ### Consumers and pools
 
@@ -63,12 +62,7 @@ Two more variables are read at build time, not at runtime. `/v1/healthz` reports
 
 Redis is optional. With it, the minute's count, CurseForge's 429 hold, the daily counts and the cached answers survive a restart of the gateway. While Redis cannot be reached, the gateway keeps counting and caching in memory and writes the daily counts once Redis answers again; a request never waits more than a second on Redis. Without Redis everything stays in memory, which is correct for a single gateway process.
 
-Cached answers are read from memory first. Redis is asked only when memory has no entry (one `MGET` for all the ids of a batch), and new answers are written to it in the background, each until its stale time. They can take a few hundred MB, while the budget takes a few KB, and the two want different Redis settings:
-
-- the **budget** must not be evicted: a past day's counts are written on that day only, so under an eviction policy they are among the first keys to go. Keep it in a Redis with `noeviction` (`REDIS_URL`);
-- the **cache** should be: give it a Redis of its own with a memory limit and an eviction policy (`CONTENT_GATEWAY_CACHE_REDIS_URL`), for example `redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru`, so that a full cache drops old answers instead of refusing writes.
-
-Without `CONTENT_GATEWAY_CACHE_REDIS_URL` the cache shares `REDIS_URL` with the budget. That is fine while the Redis has room to spare; once a `noeviction` Redis is full it refuses every write, also those of other services that use it.
+Cached answers are read from memory first. Redis is asked only when memory has no entry (one `MGET` for all the ids of a batch), and new answers are written to it in the background, each until its stale time. They can take a few hundred MB, so give the gateway a Redis of its own with a memory limit and an eviction policy, for example `redis-server --maxmemory 512mb --maxmemory-policy allkeys-lru`. Do not point it at a Redis other services write to with `noeviction`: once that Redis is full, it refuses their writes too. Under `allkeys-lru` the budget's keys, which are written all the time, are the last to go.
 
 Every key starts with `content-gateway:`. TLS (`rediss://`) is not supported, keep Redis on the same machine or a private network.
 
