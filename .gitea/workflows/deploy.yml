@@ -44,13 +44,15 @@ jobs:
           echo "COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
           echo "BUILT_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
 
-      - name: Ensure the docker CLI
+      - name: Ensure the docker CLI with BuildKit
         shell: bash
         run: |
-          command -v docker >/dev/null 2>&1 && exit 0
-          if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=; fi
-          $SUDO apt-get update
-          $SUDO apt-get install -y --no-install-recommends docker.io
+          if ! command -v docker >/dev/null 2>&1; then
+            if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=; fi
+            $SUDO apt-get update
+            $SUDO apt-get install -y --no-install-recommends docker.io docker-buildx
+          fi
+          docker buildx version
 
       - name: Build the static binary
         shell: bash
@@ -71,7 +73,7 @@ jobs:
           curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | $SUDO bash
           $SUDO apt-get install -y infisical
 
-      - name: Log in to Infisical
+      - name: Write the runtime env from Infisical
         shell: bash
         env:
           INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
@@ -82,24 +84,33 @@ jobs:
             --client-id="$INFISICAL_CLIENT_ID" \
             --client-secret="$INFISICAL_CLIENT_SECRET" \
             --plain --silent)
-          echo "INFISICAL_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-
-      - name: Write the runtime env from Infisical
-        shell: bash
-        run: |
-          infisical export --projectId="$INFISICAL_PROJECT_ID" --env=prod --format=dotenv \
+          echo "::add-mask::$TOKEN"
+          INFISICAL_TOKEN="$TOKEN" infisical export \
+            --projectId="$INFISICAL_PROJECT_ID" --env=prod --format=dotenv \
             > "$DEPLOY_DIR/.env.new"
+          if ! grep -Eq "^CURSEFORGE_API_KEY=['\"]?[^'\"[:space:]]" "$DEPLOY_DIR/.env.new"; then
+            rm -f "$DEPLOY_DIR/.env.new"
+            echo "::error::The export of the prod environment holds no CURSEFORGE_API_KEY; the gateway cannot start from it. Check the project id and the machine identity's access to prod"
+            exit 1
+          fi
           chmod 600 "$DEPLOY_DIR/.env.new"
           chown --reference="$DEPLOY_DIR" "$DEPLOY_DIR/.env.new"
+          if [ -f "$DEPLOY_DIR/.env" ]; then
+            cp -p "$DEPLOY_DIR/.env" "$DEPLOY_DIR/.env.previous"
+          fi
           mv "$DEPLOY_DIR/.env.new" "$DEPLOY_DIR/.env"
 
-      - name: Install the binary, keeping the previous one for a rollback
+      - name: Install the binary, keeping the previous build for a rollback
         shell: bash
         run: |
           install -m 755 build/content-gateway "$DEPLOY_DIR/content-gateway.new"
           chown --reference="$DEPLOY_DIR" "$DEPLOY_DIR/content-gateway.new"
-          if [ -f "$DEPLOY_DIR/content-gateway" ]; then
+          running=$(bash .gitea/scripts/healthz.sh "$DEPLOY_DIR" 2>/dev/null || true)
+          if [ -f "$DEPLOY_DIR/content-gateway" ] && [ "${running#*\"commit\":\"$COMMIT\"}" = "$running" ]; then
             mv "$DEPLOY_DIR/content-gateway" "$DEPLOY_DIR/content-gateway.previous"
+            echo "ROTATED=true" >> "$GITHUB_ENV"
+          else
+            echo "The running build is already $COMMIT, content-gateway.previous stays the older build"
           fi
           mv "$DEPLOY_DIR/content-gateway.new" "$DEPLOY_DIR/content-gateway"
           touch "$DEPLOY_DIR/.restart-trigger"
@@ -108,15 +119,38 @@ jobs:
       - name: Wait for the new build to answer
         shell: bash
         run: |
-          port=$(sed -n 's/^CONTENT_GATEWAY_PORT=//p' "$DEPLOY_DIR/.env" | tr -d "\"'" | tail -1)
-          port=${port:-5005}
           for attempt in $(seq 1 30); do
-            if health=$(docker run --rm --network host curlimages/curl:8.16.0 -fsS "http://127.0.0.1:${port}/v1/healthz" 2>/dev/null) \
-              && [ "${health#*\"commit\":\"$COMMIT\"}" != "$health" ]; then
+            health=$(bash .gitea/scripts/healthz.sh "$DEPLOY_DIR" 2>/dev/null || true)
+            if [ "${health#*\"commit\":\"$COMMIT\"}" != "$health" ] && [ "${health#*\"builtAt\":\"$BUILT_AT\"}" != "$health" ]; then
               echo "$health"
               exit 0
             fi
             sleep 2
           done
-          echo "::error::The gateway did not answer /v1/healthz with commit $COMMIT within 60 s. Last answer: ${health:-none}"
+          echo "::error::The gateway did not answer /v1/healthz with commit $COMMIT built at $BUILT_AT within 60 s. Last answer: ${health:-none}"
+          exit 1
+
+      - name: Put the previous build back when the new one did not answer
+        if: failure()
+        shell: bash
+        run: |
+          if [ "${ROTATED:-}" != true ] || [ ! -f "$DEPLOY_DIR/content-gateway.previous" ]; then
+            echo "Nothing to roll back: the previous build was not replaced"
+            exit 0
+          fi
+          mv "$DEPLOY_DIR/content-gateway" "$DEPLOY_DIR/content-gateway.failed"
+          mv "$DEPLOY_DIR/content-gateway.previous" "$DEPLOY_DIR/content-gateway"
+          if [ -f "$DEPLOY_DIR/.env.previous" ]; then
+            cp -p "$DEPLOY_DIR/.env" "$DEPLOY_DIR/.env.failed"
+            mv "$DEPLOY_DIR/.env.previous" "$DEPLOY_DIR/.env"
+          fi
+          touch "$DEPLOY_DIR/.restart-trigger"
+          for attempt in $(seq 1 30); do
+            if health=$(bash .gitea/scripts/healthz.sh "$DEPLOY_DIR" 2>/dev/null); then
+              echo "::warning::Rolled back to the previous build, which answers: $health. The failed build is content-gateway.failed"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::Rolled back to the previous build, but it does not answer /v1/healthz either. The failed build is content-gateway.failed"
           exit 1
