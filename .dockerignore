@@ -1,8 +1,14 @@
 target
+build
 node_modules
+**/node_modules
+**/dist
+packages
+scripts
 .git
 .gitea
 .husky
+.changeset
 .claude
 .env
 .env.*
