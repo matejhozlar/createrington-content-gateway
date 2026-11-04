@@ -1,0 +1,21 @@
+# Rust
+/target
+/build
+
+# Node
+node_modules
+.pnpm-store
+*.log
+dist
+*.tsbuildinfo
+
+# Env
+.env
+.env.*
+!.env.example
+
+# Editors
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store

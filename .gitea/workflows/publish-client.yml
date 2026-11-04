@@ -1,0 +1,43 @@
+name: Publish client
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: publish-client
+  cancel-in-progress: false
+
+env:
+  HUSKY: "0"
+
+jobs:
+  publish:
+    runs-on: oracle
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup
+        uses: ./.gitea/actions/setup
+
+      - name: Refuse to publish with changesets left unconsumed
+        run: |
+          pending=$(find .changeset -name '*.md' ! -name README.md)
+          if [ -n "$pending" ]; then
+            echo "::error::These changesets were not turned into a version, run pnpm version-packages in the release PR:"
+            echo "$pending"
+            exit 1
+          fi
+
+      - name: Build
+        run: pnpm --filter @createrington/content-gateway-client build
+
+      - name: Publish the version the registry does not have yet
+        env:
+          NPM_PUBLISH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
+        run: |
+          registry=$(node -p "new URL(require('./packages/client/package.json').publishConfig.registry).host + new URL(require('./packages/client/package.json').publishConfig.registry).pathname")
+          echo "//${registry}:_authToken=${NPM_PUBLISH_TOKEN}" >> .npmrc
+          pnpm changeset publish --no-git-tag

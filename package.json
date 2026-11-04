@@ -1,0 +1,37 @@
+{
+  "name": "content-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "type": "module",
+  "packageManager": "pnpm@12.16.1",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "dev": "infisical run --env=dev -- cargo run",
+    "openapi": "node scripts/openapi.mjs && pnpm --filter @createrington/content-gateway-client generate",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "changeset": "changeset",
+    "changeset:check": "node scripts/check-client-changeset.mjs",
+    "version-packages": "changeset version",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "prepare": "husky",
+    "branch:done": "node scripts/finish-branch.mjs",
+    "post-release": "node scripts/post-release.mjs"
+  },
+  "devDependencies": {
+    "@changesets/cli": "^3.0.3",
+    "@infisical/cli": "^0.44.12",
+    "husky": "^9.1.7",
+    "lint-staged": "^17.6.0",
+    "prettier": "^3.9.10"
+  },
+  "lint-staged": {
+    "*.{ts,js,mjs,cjs,json,md,yml,yaml}": "prettier --write",
+    "*.rs": "rustfmt --edition 2024"
+  }
+}

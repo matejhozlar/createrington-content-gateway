@@ -1,0 +1,38 @@
+[package]
+name = "content-gateway"
+description = "Caching, budgeted gateway in front of the CurseForge and Modrinth APIs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "content-gateway"
+path = "src/main.rs"
+
+[dependencies]
+axum.workspace = true
+jiff.workspace = true
+moka.workspace = true
+redis.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+subtle.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+utoipa = { version = "6.0.0", default-features = false, features = ["macros"] }
+
+[dev-dependencies]
+http-body-util.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+tower.workspace = true
+
+[lints]
+workspace = true

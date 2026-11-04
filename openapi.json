@@ -1,0 +1,670 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "content-gateway",
+    "description": "A gateway in front of the CurseForge API that holds the API key, caches answers for every consumer, counts the calls made on the key and holds every consumer off after a 429. `/v1/curseforge/{path}` mirrors `api.curseforge.com/v1/{path}` and answers CurseForge's JSON as it came; the other routes are the gateway's own. Every route but `/v1/healthz` and `/v1/openapi.json` needs a consumer's bearer token.",
+    "license": {
+      "name": "MIT"
+    },
+    "version": "1"
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:5005",
+      "description": "The default listen address"
+    }
+  ],
+  "paths": {
+    "/v1/budget": {
+      "get": {
+        "tags": [
+          "gateway"
+        ],
+        "summary": "This minute's calls per pool, the 429 hold, and the daily counts of the last 14 UTC days.",
+        "operationId": "readout",
+        "responses": {
+          "200": {
+            "description": "The budget as it stands",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BudgetSnapshot"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/curseforge/{path}": {
+      "get": {
+        "tags": [
+          "curseforge"
+        ],
+        "summary": "What `GET api.curseforge.com/v1/{path}` answers, from the cache while it is fresh.",
+        "description": "The query string goes to CurseForge as it came, and the answer comes back with CurseForge's status, content type\nand body, marked `X-Cache`. The routes of the cache table are kept for their fresh time; every other route is\nasked each time. `Cache-Control: no-cache` asks CurseForge again and keeps the new answer. A kept answer that is\nno longer fresh is still given, marked `stale`, when the budget refuses the call or CurseForge fails.",
+        "operationId": "passthrough_get",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "description": "The path under `api.curseforge.com/v1/`, such as `mods/search` or `mods/238222/files`: segments of letters, digits, `-` and `_`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "mods/search"
+          },
+          {
+            "name": "X-Budget-Pool",
+            "in": "header",
+            "description": "The pool the call draws from. Required when the token has more than one pool",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "Cache-Control",
+            "in": "header",
+            "description": "`no-cache` asks CurseForge again instead of answering from the cache",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "CurseForge's answer, as it came",
+            "headers": {
+              "X-Cache": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`hit` from the cache, `miss` from CurseForge, `stale` an old answer given because CurseForge could not be asked"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`INVALID_PATH`, `POOL_REQUIRED` or `UNKNOWN_POOL`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "CurseForge could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The call was refused: `BUDGET_SPENT` this minute or `UPSTREAM_HOLD` after a 429 from CurseForge",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds until the next call can go out"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "CurseForge did not answer in time, `UPSTREAM_TIMEOUT`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other status CurseForge answered, with its body. Only the gateway's own answers lack `X-Cache`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "curseforge"
+        ],
+        "summary": "What `POST api.curseforge.com/v1/{path}` answers to this body.",
+        "description": "`POST mods` with only `{\"modIds\": [...]}`, `POST mods/files` with only `{\"fileIds\": [...]}`, and\n`POST fingerprints/432` or `POST fingerprints` with only `{\"fingerprints\": [...]}` are answered per id from the\ncache, and only the ids not kept are asked for, 100 per call. Every other body goes to CurseForge each time.",
+        "operationId": "passthrough_post",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "description": "The path under `api.curseforge.com/v1/`, such as `mods` or `fingerprints/432`: segments of letters, digits, `-` and `_`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "mods"
+          },
+          {
+            "name": "X-Budget-Pool",
+            "in": "header",
+            "description": "The pool the call draws from. Required when the token has more than one pool",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "Cache-Control",
+            "in": "header",
+            "description": "`no-cache` asks CurseForge again instead of answering from the cache",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The JSON body CurseForge expects at this path",
+          "content": {
+            "application/json": {
+              "schema": {}
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "CurseForge's answer, as it came, or one built from the kept rows of a batch",
+            "headers": {
+              "X-Cache": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`hit` when every id was kept, `miss` when CurseForge was asked, `stale` an old answer given because CurseForge could not be asked"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`INVALID_PATH`, `POOL_REQUIRED` or `UNKNOWN_POOL`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The batch needs more calls than a whole minute allows, `REQUEST_TOO_LARGE`; split it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "CurseForge could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The call was refused: `BUDGET_SPENT` this minute or `UPSTREAM_HOLD` after a 429 from CurseForge",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds until the next call can go out"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "CurseForge did not answer in time, `UPSTREAM_TIMEOUT`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other status CurseForge answered, with its body. Only the gateway's own answers lack `X-Cache`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/healthz": {
+      "get": {
+        "tags": [
+          "gateway"
+        ],
+        "summary": "Whether the gateway is up, and which build it is.",
+        "operationId": "healthz",
+        "responses": {
+          "200": {
+            "description": "The gateway is up",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/openapi.json": {
+      "get": {
+        "tags": [
+          "gateway"
+        ],
+        "summary": "This document.",
+        "operationId": "document",
+        "responses": {
+          "200": {
+            "description": "The OpenAPI document of every route",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiError": {
+        "type": "object",
+        "description": "The JSON error every route answers with: `{ code, message }`, plus `pool` and `retryAfterMs` on a refused call.",
+        "required": [
+          "code",
+          "message"
+        ],
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ErrorCode"
+          },
+          "message": {
+            "type": "string",
+            "description": "What happened, in one sentence for a log line."
+          },
+          "pool": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The pool the refused call would have drawn from, on a refused call and an unknown pool."
+          },
+          "retryAfterMs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "When the next call can go out, on a refused call. `Retry-After` carries the same in whole seconds.",
+            "minimum": 0
+          }
+        }
+      },
+      "BudgetSnapshot": {
+        "type": "object",
+        "description": "What `/v1/budget` answers: this minute over all pools and per pool, the 429 hold, and the last 14 UTC days.",
+        "required": [
+          "limitPerMinute",
+          "used",
+          "withheld",
+          "resetsAt",
+          "source",
+          "pools",
+          "days"
+        ],
+        "properties": {
+          "days": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DaySnapshot"
+            },
+            "description": "The last 14 UTC days, today first."
+          },
+          "heldUntil": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Until when CurseForge's 429 holds every call off, ISO 8601, or null while no hold is on."
+          },
+          "limitPerMinute": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Calls to CurseForge the minute allows over all pools.",
+            "minimum": 0
+          },
+          "pools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PoolSnapshot"
+            },
+            "description": "Every pool of every consumer, this minute."
+          },
+          "resetsAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When this minute's counts start over, ISO 8601."
+          },
+          "source": {
+            "$ref": "#/components/schemas/Source"
+          },
+          "used": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Calls admitted this minute.",
+            "minimum": 0
+          },
+          "withheld": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Calls refused this minute.",
+            "minimum": 0
+          }
+        }
+      },
+      "DayCounts": {
+        "type": "object",
+        "description": "What one pool did on one UTC day.",
+        "required": [
+          "calls",
+          "hits",
+          "withheld",
+          "forbidden",
+          "throttled"
+        ],
+        "properties": {
+          "calls": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Calls that reached CurseForge.",
+            "minimum": 0
+          },
+          "forbidden": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Calls CurseForge answered 403.",
+            "minimum": 0
+          },
+          "hits": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Requests answered without a call: from the cache, or by joining a call already in flight.",
+            "minimum": 0
+          },
+          "throttled": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Calls CurseForge answered 429.",
+            "minimum": 0
+          },
+          "withheld": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Calls the budget refused.",
+            "minimum": 0
+          }
+        }
+      },
+      "DayPoolSnapshot": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/DayCounts"
+          },
+          {
+            "type": "object",
+            "required": [
+              "consumer",
+              "pool"
+            ],
+            "properties": {
+              "consumer": {
+                "type": "string"
+              },
+              "pool": {
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "description": "One pool's counts on one UTC day."
+      },
+      "DaySnapshot": {
+        "type": "object",
+        "description": "One UTC day's counts for every pool.",
+        "required": [
+          "date",
+          "pools"
+        ],
+        "properties": {
+          "date": {
+            "type": "string",
+            "format": "date",
+            "description": "The UTC day, `YYYY-MM-DD`."
+          },
+          "pools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DayPoolSnapshot"
+            }
+          }
+        }
+      },
+      "ErrorCode": {
+        "type": "string",
+        "description": "What went wrong, for a consumer to branch on.",
+        "enum": [
+          "UNAUTHORIZED",
+          "POOL_REQUIRED",
+          "UNKNOWN_POOL",
+          "INVALID_PATH",
+          "UPSTREAM_TIMEOUT",
+          "UPSTREAM_UNREACHABLE",
+          "UPSTREAM_TOO_LARGE",
+          "UPSTREAM_UNREADABLE",
+          "BUDGET_SPENT",
+          "UPSTREAM_HOLD",
+          "REQUEST_TOO_LARGE"
+        ]
+      },
+      "Health": {
+        "type": "object",
+        "description": "What `/v1/healthz` answers: the running gateway's version and build.",
+        "required": [
+          "status",
+          "version"
+        ],
+        "properties": {
+          "builtAt": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the binary was built, ISO 8601 in UTC, when the build said."
+          },
+          "commit": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The commit the binary was built from, when the build said."
+          },
+          "status": {
+            "type": "string",
+            "description": "Always `ok` when the gateway answers at all.",
+            "example": "ok"
+          },
+          "version": {
+            "type": "string",
+            "description": "The gateway's version, as released.",
+            "example": "0.1.0"
+          }
+        }
+      },
+      "PoolSnapshot": {
+        "type": "object",
+        "description": "One pool's calls this minute.",
+        "required": [
+          "consumer",
+          "pool",
+          "used",
+          "withheld"
+        ],
+        "properties": {
+          "consumer": {
+            "type": "string"
+          },
+          "pool": {
+            "type": "string"
+          },
+          "used": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Calls admitted this minute.",
+            "minimum": 0
+          },
+          "withheld": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Calls refused this minute.",
+            "minimum": 0
+          }
+        }
+      },
+      "Source": {
+        "type": "string",
+        "description": "Where a readout's counts come from: `redis` when they are the stored ones, `memory` when no Redis is configured,\n`unavailable` when Redis did not answer, so the minute is this process's own count and the days hold only what\nis not written to Redis yet.",
+        "enum": [
+          "redis",
+          "memory",
+          "unavailable"
+        ]
+      }
+    },
+    "securitySchemes": {
+      "bearer": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "A consumer's token, from the gateway's configuration"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "gateway",
+      "description": "The gateway's own routes"
+    },
+    {
+      "name": "curseforge",
+      "description": "The CurseForge passthrough"
+    }
+  ]
+}
