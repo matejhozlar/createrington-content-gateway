@@ -80,7 +80,7 @@ The image is a static binary on a distroless base. Inside the container the gate
 
 ### As a host process
 
-The binary has no runtime dependencies, so it can run straight from a directory under systemd. `docker build --target binary --output type=local,dest=build .` writes the static binary to `build/content-gateway` without making an image (a native `cargo build --release` does the same on a machine with the toolchain). A unit for a directory `/opt/content-gateway` that holds the binary and a `.env` with the variables above:
+The binary has no runtime dependencies, so it can run straight from a directory under systemd. `docker build --target binary --output type=local,dest=build .` writes the static binary to `build/content-gateway` without making an image (a native `cargo build --release` does the same on a machine with the toolchain). A unit for a directory that holds the binary and a `.env` with the variables above, `/opt/content-gateway` here as an example:
 
 ```ini
 [Service]
@@ -92,7 +92,7 @@ RestartSec=5
 User=content-gateway
 ```
 
-This is how the gateway runs for Createrington: `.gitea/workflows/deploy.yml` builds the binary when a release merges into `main`, writes `.env` from Infisical, keeps the previous binary as `content-gateway.previous` for a rollback, touches `.restart-trigger` for a systemd path unit that restarts the service, and waits until `/v1/healthz` reports the deployed commit. The directory and the Infisical project come from the `DEPLOY_DIR` and `INFISICAL_PROJECT_ID` repository variables, the Infisical credentials from secrets.
+This is how the gateway runs for Createrington: `.gitea/workflows/deploy.yml` builds the binary when a release merges into `main`, writes `.env` from Infisical, keeps the previous binary and `.env` as `content-gateway.previous` and `.env.previous`, touches `.restart-trigger` for a systemd path unit that restarts the service, and waits until `/v1/healthz` reports the deployed commit and build time; when it does not, the previous build is put back and restarted. The directory and the Infisical project come from the `DEPLOY_DIR` and `INFISICAL_PROJECT_ID` repository variables, the Infisical credentials from secrets.
 
 ## Endpoints
 
