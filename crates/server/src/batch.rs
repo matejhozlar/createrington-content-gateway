@@ -86,7 +86,7 @@ struct MatchedFile {
 }
 
 #[derive(Deserialize)]
-struct Rows<'a> {
+struct DataRows<'a> {
     #[serde(borrow)]
     data: Vec<&'a RawValue>,
 }
@@ -197,6 +197,13 @@ struct Mine {
     finisher: Finisher,
 }
 
+/// The kept rows of a batch, and whether they came from the cache (`hit`), from CurseForge (`miss`) or are old
+/// answers given because CurseForge could not be asked (`stale`).
+pub struct Rows {
+    pub rows: Vec<(u64, Bytes)>,
+    pub cache: &'static str,
+}
+
 pub async fn answer(
     state: Arc<AppState>,
     pool: Pool,
@@ -210,6 +217,38 @@ pub async fn answer(
         .copied()
         .filter(|id| seen.insert(*id))
         .collect();
+    let Rows { rows, cache } = match rows(state, pool, batch, ids, forced).await {
+        Ok(rows) => rows,
+        Err(response) => return *response,
+    };
+    if batch.is_fingerprints() {
+        return curseforge::respond(&json(fingerprint_answer(&rows, &asked)), cache);
+    }
+    if rows.is_empty() {
+        let answer = Answer {
+            status: StatusCode::NOT_FOUND,
+            content_type: None,
+            body: Bytes::new(),
+        };
+        return curseforge::respond(&answer, cache);
+    }
+    let mut body =
+        Vec::with_capacity(rows.iter().map(|(_, row)| row.len() + 1).sum::<usize>() + 11);
+    body.extend_from_slice(b"{\"data\":[");
+    join(&mut body, rows.iter().map(|(_, row)| row.as_ref()));
+    body.extend_from_slice(b"]}");
+    curseforge::respond(&json(body), cache)
+}
+
+/// The rows of these ids (each once), from the cache while fresh, the rest asked for 100 per call. An id CurseForge
+/// does not know has no row. The error is the response to give when the rows could not be had.
+pub async fn rows(
+    state: Arc<AppState>,
+    pool: Pool,
+    batch: Batch,
+    ids: Vec<u64>,
+    forced: bool,
+) -> Result<Rows, Box<Response>> {
     let keys: Vec<String> = ids.iter().map(|id| batch.key(*id)).collect();
     let found = state.cache.lookup_many(&keys, state.clock.now_ms()).await;
     let now = state.clock.now_ms();
@@ -272,7 +311,7 @@ pub async fn answer(
                         stale = true;
                         entry
                     }
-                    _ => return curseforge::failed(failure, &pool),
+                    _ => return Err(Box::new(curseforge::failed(failure, &pool))),
                 }
             }
         };
@@ -284,30 +323,16 @@ pub async fn answer(
     if !called {
         state.budget.record_hit(&pool.consumer, &pool.name);
     }
-    let cache = if stale {
-        "stale"
-    } else if called {
-        "miss"
-    } else {
-        "hit"
-    };
-    if batch.is_fingerprints() {
-        return curseforge::respond(&json(fingerprint_answer(&rows, &asked)), cache);
-    }
-    if rows.is_empty() {
-        let answer = Answer {
-            status: StatusCode::NOT_FOUND,
-            content_type: None,
-            body: Bytes::new(),
-        };
-        return curseforge::respond(&answer, cache);
-    }
-    let mut body =
-        Vec::with_capacity(rows.iter().map(|(_, row)| row.len() + 1).sum::<usize>() + 11);
-    body.extend_from_slice(b"{\"data\":[");
-    join(&mut body, rows.iter().map(|(_, row)| row.as_ref()));
-    body.extend_from_slice(b"]}");
-    curseforge::respond(&json(body), cache)
+    Ok(Rows {
+        rows,
+        cache: if stale {
+            "stale"
+        } else if called {
+            "miss"
+        } else {
+            "hit"
+        },
+    })
 }
 
 fn json(body: Vec<u8>) -> Answer {
@@ -349,7 +374,7 @@ fn usable(entry: &Entry) -> bool {
     entry.answer.status == StatusCode::NOT_FOUND || entry.row.is_some()
 }
 
-fn failed_upstream(failure: &LoadFailure) -> bool {
+pub fn failed_upstream(failure: &LoadFailure) -> bool {
     match failure {
         LoadFailure::Answered(answer) => answer.status.is_server_error(),
         LoadFailure::Refused(_) | LoadFailure::Upstream(_) => true,
@@ -453,7 +478,7 @@ fn split(batch: Batch, answer: &Answer) -> Option<Vec<(u64, Bytes, Option<u64>)>
     if batch.is_fingerprints() {
         return split_matches(answer);
     }
-    let rows: Rows<'_> = serde_json::from_slice(&answer.body).ok()?;
+    let rows: DataRows<'_> = serde_json::from_slice(&answer.body).ok()?;
     rows.data
         .iter()
         .map(|row| {

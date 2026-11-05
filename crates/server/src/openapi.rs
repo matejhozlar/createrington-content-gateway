@@ -9,6 +9,8 @@ use crate::{
     curseforge,
     error::{ApiError, ErrorCode},
     health::{self, Health},
+    modrinth::{self, VersionFilesRequest},
+    resolve::{self, FileSource, ResolveRequest, Resolved, ResolvedFile},
 };
 
 /// The version of the API the document describes, which is the `/v1` of every route. The gateway's own version is
@@ -21,13 +23,14 @@ pub const API_VERSION: &str = "1";
     info(
         title = "content-gateway",
         version = API_VERSION,
-        description = "A gateway in front of the CurseForge API that holds the API key, caches answers for every consumer, counts the calls made on the key and holds every consumer off after a 429. `/v1/curseforge/{path}` mirrors `api.curseforge.com/v1/{path}` and answers CurseForge's JSON as it came; the other routes are the gateway's own. Every route but `/v1/healthz` and `/v1/openapi.json` needs a consumer's bearer token.",
+        description = "A gateway in front of the CurseForge and Modrinth APIs that holds the CurseForge key, caches answers for every consumer, counts the calls made on the key and holds every consumer off after a 429. `/v1/curseforge/{path}` mirrors `api.curseforge.com/v1/{path}` and `/v1/modrinth/version_file(s)` the SHA-1 lookups of `api.modrinth.com/v2`, answering their JSON as it came; `/v1/resolve` finds a download address per CurseForge file; the other routes are the gateway's own. Every route but `/v1/healthz` and `/v1/openapi.json` needs a consumer's bearer token.",
         license(name = "MIT"),
     ),
     servers((url = "http://127.0.0.1:5005", description = "The default listen address")),
     tags(
         (name = "gateway", description = "The gateway's own routes"),
         (name = "curseforge", description = "The CurseForge passthrough"),
+        (name = "modrinth", description = "The Modrinth SHA-1 lookups"),
     ),
     paths(
         health::healthz,
@@ -35,6 +38,9 @@ pub const API_VERSION: &str = "1";
         budget::readout,
         curseforge::passthrough_get,
         curseforge::passthrough_post,
+        modrinth::version_file,
+        modrinth::version_files,
+        resolve::resolve,
     ),
     components(schemas(
         Health,
@@ -44,6 +50,11 @@ pub const API_VERSION: &str = "1";
         DayPoolSnapshot,
         DayCounts,
         Source,
+        VersionFilesRequest,
+        ResolveRequest,
+        Resolved,
+        ResolvedFile,
+        FileSource,
         ApiError,
         ErrorCode,
     )),

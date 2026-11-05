@@ -17,6 +17,8 @@ pub enum ErrorCode {
     UnknownPool,
     InvalidPath,
     InvalidDays,
+    InvalidHash,
+    InvalidBody,
     UpstreamTimeout,
     UpstreamUnreachable,
     UpstreamTooLarge,
@@ -93,27 +95,45 @@ impl ApiError {
         )
     }
 
-    pub fn upstream(failure: UpstreamFailure) -> Self {
+    pub fn invalid_hash() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidHash,
+            "a SHA-1 is 40 hex digits",
+        )
+    }
+
+    pub fn invalid_body(expected: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidBody,
+            format!("the body must be {expected}"),
+        )
+    }
+
+    pub fn upstream(failure: UpstreamFailure, source: &str) -> Self {
         match failure {
             UpstreamFailure::Timeout => Self::new(
                 StatusCode::GATEWAY_TIMEOUT,
                 ErrorCode::UpstreamTimeout,
-                "CurseForge did not answer in time",
+                format!("{source} did not answer in time"),
             ),
             UpstreamFailure::Unreachable => Self::new(
                 StatusCode::BAD_GATEWAY,
                 ErrorCode::UpstreamUnreachable,
-                "CurseForge could not be reached",
+                format!("{source} could not be reached"),
             ),
             UpstreamFailure::TooLarge => Self::new(
                 StatusCode::BAD_GATEWAY,
                 ErrorCode::UpstreamTooLarge,
-                "CurseForge answered with more than the gateway keeps",
+                format!("{source} answered with more than the gateway keeps"),
             ),
             UpstreamFailure::Unreadable => Self::new(
                 StatusCode::BAD_GATEWAY,
                 ErrorCode::UpstreamUnreadable,
-                "CurseForge answered a batch with something other than a list of rows with ids",
+                format!(
+                    "{source} answered a batch with something other than rows the gateway can keep"
+                ),
             ),
         }
     }

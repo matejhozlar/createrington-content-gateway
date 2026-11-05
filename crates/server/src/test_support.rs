@@ -23,18 +23,22 @@ use crate::{
     cache::AnswerCache,
     config::{ApiKey, Consumer, Token},
     curseforge::Upstream,
+    modrinth::{self, Modrinth},
     redis_store::RedisStore,
+    resolve::{self, Cdn},
 };
 
 pub(crate) const NOV_3_2026_20H: u64 = 1_793_736_000_000;
 pub(crate) const TOKEN: &str = "app-token-0123456789abcdef0123456789";
 pub(crate) const KEY: &str = "test-curseforge-key";
+pub(crate) const USER_AGENT: &str = "test-gateway/0 (https://example.com)";
 
 #[derive(Debug, Clone)]
 pub(crate) struct Seen {
     pub(crate) method: String,
     pub(crate) uri: String,
     pub(crate) key: Option<String>,
+    pub(crate) user_agent: Option<String>,
     pub(crate) body: String,
 }
 
@@ -78,6 +82,10 @@ impl Mock {
                         .headers
                         .get("x-api-key")
                         .map(|value| value.to_str().unwrap().to_owned()),
+                    user_agent: parts
+                        .headers
+                        .get("user-agent")
+                        .map(|value| value.to_str().unwrap().to_owned()),
                     body: String::from_utf8(body.to_vec()).unwrap(),
                 };
                 recorded.lock().unwrap().push(seen.clone());
@@ -87,7 +95,12 @@ impl Mock {
                 for (name, value) in reply.headers {
                     response = response.header(name, value);
                 }
-                response.body(Body::from(reply.body)).unwrap()
+                let body = if seen.method == "HEAD" {
+                    Body::empty()
+                } else {
+                    Body::from(reply.body)
+                };
+                response.body(body).unwrap()
             }
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -121,15 +134,36 @@ pub(crate) fn gateway_on(
     timeout: Duration,
     redis: Option<Arc<RedisStore>>,
 ) -> Gateway {
+    gateway_with(mock, limit, timeout, redis, &["launcher"])
+}
+
+pub(crate) fn gateway_with_pools(mock: &Mock, pools: &[&str]) -> Gateway {
+    gateway_with(mock, 300, crate::curseforge::TIMEOUT, None, pools)
+}
+
+fn gateway_with(
+    mock: &Mock,
+    limit: u32,
+    timeout: Duration,
+    redis: Option<Arc<RedisStore>>,
+    pools: &[&str],
+) -> Gateway {
     let clock = TestClock::at(NOV_3_2026_20H);
     let consumers = vec![Consumer {
         name: "app".to_owned(),
         token: Token::new(TOKEN),
-        pools: vec!["launcher".to_owned()],
+        pools: pools.iter().map(|pool| (*pool).to_owned()).collect(),
     }];
     let state = Arc::new(AppState {
-        budget: Budget::new(limit, [("app", "launcher")], clock.clone(), redis.clone()),
+        budget: Budget::new(
+            limit,
+            pools.iter().map(|pool| ("app", *pool)),
+            clock.clone(),
+            redis.clone(),
+        ),
         upstream: Upstream::new(mock.base.clone(), ApiKey::new(KEY), timeout).unwrap(),
+        modrinth: Modrinth::new(mock.base.clone(), USER_AGENT, modrinth::TIMEOUT).unwrap(),
+        cdn: Cdn::new(mock.base.clone(), resolve::CDN_TIMEOUT).unwrap(),
         cache: AnswerCache::new(redis),
         clock: clock.clone(),
         consumers,

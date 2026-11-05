@@ -21,6 +21,7 @@ use crate::{
 };
 
 pub const CURSEFORGE_API: &str = "https://api.curseforge.com";
+pub const SOURCE: &str = "CurseForge";
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_ANSWER_BYTES: usize = 32 * 1024 * 1024;
 pub const MINUTE_MS: u64 = 60_000;
@@ -78,45 +79,61 @@ impl Upstream {
             request = request.header(CONTENT_TYPE, "application/json").body(body);
         }
 
-        let mut response = request.send().await.map_err(failure)?;
-        let status = response.status();
-        let content_type = response.headers().get(CONTENT_TYPE).cloned();
-        let retry_after = response
-            .headers()
-            .get(RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned);
-        let announced = response
-            .headers()
-            .get(CONTENT_LENGTH)
-            .and_then(|value| value.to_str().ok()?.parse::<usize>().ok());
-        if announced.is_some_and(|length| length > MAX_ANSWER_BYTES) {
-            return Err(UpstreamFailure::TooLarge);
-        }
-        let mut body = Vec::with_capacity(announced.unwrap_or(0));
-        while let Some(chunk) = response.chunk().await.map_err(failure)? {
-            if body.len() + chunk.len() > MAX_ANSWER_BYTES {
-                return Err(UpstreamFailure::TooLarge);
-            }
-            body.extend_from_slice(&chunk);
-        }
-        Ok((
-            Answer {
-                status,
-                content_type,
-                body: body.into(),
-            },
-            retry_after,
-        ))
+        let response = request
+            .send()
+            .await
+            .map_err(|error| failure(error, SOURCE))?;
+        read(response, SOURCE).await
     }
 }
 
-fn failure(error: reqwest::Error) -> UpstreamFailure {
+/// An upstream's answer with its `Retry-After`, read up to the size the gateway keeps.
+pub async fn read(
+    mut response: reqwest::Response,
+    source: &'static str,
+) -> Result<(Answer, Option<String>), UpstreamFailure> {
+    let status = response.status();
+    let content_type = response.headers().get(CONTENT_TYPE).cloned();
+    let retry_after = response
+        .headers()
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let announced = response
+        .headers()
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok()?.parse::<usize>().ok());
+    if announced.is_some_and(|length| length > MAX_ANSWER_BYTES) {
+        return Err(UpstreamFailure::TooLarge);
+    }
+    let mut body = Vec::with_capacity(announced.unwrap_or(0));
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| failure(error, source))?
+    {
+        if body.len() + chunk.len() > MAX_ANSWER_BYTES {
+            return Err(UpstreamFailure::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((
+        Answer {
+            status,
+            content_type,
+            body: body.into(),
+        },
+        retry_after,
+    ))
+}
+
+/// Why `source` gave no answer, from the error reqwest reported.
+pub fn failure(error: reqwest::Error, source: &'static str) -> UpstreamFailure {
     if error.is_timeout() {
-        tracing::warn!("CurseForge did not answer in time: {error}");
+        tracing::warn!("{source} did not answer in time: {error}");
         UpstreamFailure::Timeout
     } else {
-        tracing::warn!("CurseForge could not be reached: {error}");
+        tracing::warn!("{source} could not be reached: {error}");
         UpstreamFailure::Unreachable
     }
 }
@@ -196,7 +213,7 @@ fn cache_key(path: &str, query: Option<&str>) -> String {
     format!("{path}?{}", pairs.join("&"))
 }
 
-fn wants_fresh(headers: &HeaderMap) -> bool {
+pub fn wants_fresh(headers: &HeaderMap) -> bool {
     headers.get_all(CACHE_CONTROL).iter().any(|value| {
         value.to_str().is_ok_and(|value| {
             value
@@ -562,7 +579,7 @@ pub fn failed(failure: LoadFailure, pool: &Pool) -> Response {
     match failure {
         LoadFailure::Answered(answer) => respond(&answer, "miss"),
         LoadFailure::Refused(refusal) => ApiError::refused(refusal, &pool.name).into_response(),
-        LoadFailure::Upstream(failure) => ApiError::upstream(failure).into_response(),
+        LoadFailure::Upstream(failure) => ApiError::upstream(failure, SOURCE).into_response(),
     }
 }
 

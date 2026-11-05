@@ -7,8 +7,10 @@ pub mod config;
 pub mod curseforge;
 pub mod error;
 pub mod health;
+pub mod modrinth;
 pub mod openapi;
 pub mod redis_store;
+pub mod resolve;
 pub mod serve;
 #[cfg(test)]
 mod test_support;

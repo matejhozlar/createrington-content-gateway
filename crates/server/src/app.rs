@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use axum::{Router, middleware, routing::get};
+use axum::{
+    Router, middleware,
+    routing::{get, post},
+};
 
 use crate::{
     auth,
@@ -8,14 +11,19 @@ use crate::{
     cache::AnswerCache,
     config::{Config, Consumer},
     curseforge::{self, CURSEFORGE_API, Upstream},
-    health, openapi,
+    health,
+    modrinth::{self, MODRINTH_API, Modrinth},
+    openapi,
     redis_store::RedisStore,
+    resolve::{self, CURSEFORGE_CDN, Cdn},
 };
 
 pub struct AppState {
     pub consumers: Vec<Consumer>,
     pub budget: Budget,
     pub upstream: Upstream,
+    pub modrinth: Modrinth,
+    pub cdn: Cdn,
     pub cache: AnswerCache,
     pub clock: Arc<dyn Clock>,
 }
@@ -42,6 +50,8 @@ impl AppState {
                 config.curseforge_api_key.clone(),
                 curseforge::TIMEOUT,
             )?,
+            modrinth: Modrinth::new(MODRINTH_API, &config.modrinth_user_agent, modrinth::TIMEOUT)?,
+            cdn: Cdn::new(CURSEFORGE_CDN, resolve::CDN_TIMEOUT)?,
             cache: AnswerCache::new(redis),
             clock,
             consumers: config.consumers.clone(),
@@ -56,6 +66,12 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/curseforge/{*path}",
             get(curseforge::passthrough_get).post(curseforge::passthrough_post),
         )
+        .route(
+            "/v1/modrinth/version_file/{hash}",
+            get(modrinth::version_file),
+        )
+        .route("/v1/modrinth/version_files", post(modrinth::version_files))
+        .route("/v1/resolve", post(resolve::resolve))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,
@@ -87,6 +103,13 @@ pub(crate) fn test_state(consumers: Vec<Consumer>) -> Arc<AppState> {
             curseforge::TIMEOUT,
         )
         .unwrap(),
+        modrinth: Modrinth::new(
+            "http://127.0.0.1:9",
+            modrinth::DEFAULT_USER_AGENT,
+            modrinth::TIMEOUT,
+        )
+        .unwrap(),
+        cdn: Cdn::new("http://127.0.0.1:9", resolve::CDN_TIMEOUT).unwrap(),
         cache: AnswerCache::default(),
         clock: Arc::new(SystemClock),
         consumers,
