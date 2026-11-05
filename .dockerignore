@@ -9,6 +9,10 @@ scripts
 .gitea
 .husky
 .changeset
-.claude
 .env
 .env.*
+.vscode
+.idea
+.claude
+.cursor
+.DS_Store

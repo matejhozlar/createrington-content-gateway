@@ -63,8 +63,7 @@ pub fn sha1_query(query: Option<&str>) -> bool {
     }
 }
 
-/// Whether a `version_files` body asks for SHA-1 (or nothing), the lookup the gateway keeps per hash. Any other
-/// body goes to Modrinth as it came.
+/// Whether a `version_files` body asks for SHA-1 (or nothing), the lookup kept per hash.
 pub fn sha1_body(body: &[u8]) -> bool {
     #[derive(Deserialize)]
     struct Algorithm {
@@ -131,10 +130,7 @@ fn usable(entry: &Entry) -> bool {
     entry.answer.status == StatusCode::NOT_FOUND || entry.row.is_some()
 }
 
-/// Modrinth's version for each lowercase SHA-1, from the cache while fresh. The hashes not kept are asked for in one
-/// call per 100, drawn from the Modrinth budget of `pool` and joined with any call for the same hash already in
-/// flight. A hash Modrinth does not know is kept as such for 10 minutes, a found version for an hour. Kept answers
-/// past their fresh time are given when Modrinth fails.
+/// Modrinth's version for each lowercase SHA-1 from the cache while fresh, the rest asked for 100 per call.
 pub async fn lookup(
     state: &Arc<AppState>,
     pool: &Pool,

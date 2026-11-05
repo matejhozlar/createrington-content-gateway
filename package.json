@@ -3,6 +3,10 @@
   "version": "0.1.1",
   "private": true,
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/matejhozlar/createrington-content-gateway.git"
+  },
   "type": "module",
   "packageManager": "pnpm@12.16.1",
   "engines": {

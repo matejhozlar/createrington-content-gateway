@@ -26,7 +26,6 @@ const MODRINTH_USER_AGENT_ENV: &str = "MODRINTH_USER_AGENT";
 const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_PORT: u16 = 5005;
 const DEFAULT_BUDGET_PER_MINUTE: u32 = 300;
-/// Modrinth allows 300 requests a minute per address.
 const DEFAULT_MODRINTH_PER_MINUTE: u32 = 300;
 const MIN_TOKEN_LENGTH: usize = 32;
 const MAX_NAME_LENGTH: usize = 64;

@@ -1,7 +1,5 @@
 import { z } from "zod/v4";
 
-// CurseForge's vocabulary, from https://docs.curseforge.com/rest-api/
-
 /** Minecraft's game id, the `gameId` of searches and the `/fingerprints/432` route. */
 export const CURSEFORGE_MINECRAFT_GAME_ID = 432;
 
@@ -52,9 +50,6 @@ export const CurseForgeSortField = {
   releasedDate: 11,
   rating: 12,
 } as const;
-
-// The answers consumers read. Every object is loose: fields CurseForge adds
-// pass through, and a field a consumer does not read is left out here.
 
 export const curseforgeLogoSchema = z.looseObject({
   thumbnailUrl: z.string(),
@@ -107,12 +102,7 @@ export const curseforgeDependencySchema = z.looseObject({
   relationType: z.number(),
 });
 
-/**
- * A file as every file route describes it: `GET /mods/{id}/files`,
- * `GET /mods/{id}/files/{fileId}`, `POST /mods/files`, the `latestFiles` of
- * a project and the matches of a fingerprint lookup. Only the ids are
- * certain; a consumer that needs more from a route it knows extends this.
- */
+/** A file as every file route describes it; only the ids are certain. */
 export const curseforgeFileSchema = z.looseObject({
   id: z.number(),
   gameId: z.number().nullish(),

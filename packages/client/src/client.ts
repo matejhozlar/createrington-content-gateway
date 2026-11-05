@@ -11,18 +11,10 @@ import type {
   VersionFilter,
 } from "./gateway.js";
 
-/**
- * How long one request to the gateway may take. Above the 10 s the gateway
- * itself gives CurseForge, so a stalled call comes back as the gateway's 504
- * or a stale answer instead of this client's timeout.
- */
+/** How long one request to the gateway may take, above the 10 s the gateway gives an upstream. */
 export const DEFAULT_TIMEOUT_MS = 15_000;
 
-/**
- * How long `resolve()` may take unless its options say otherwise. The gateway
- * tries CurseForge (10 s), Modrinth (10 s) and the CDN (20 s) in a row, so at
- * worst it answers after 40 s, and this is set above that.
- */
+/** How long `resolve()` may take unless its options say otherwise, above the gateway's 40 s worst case. */
 export const RESOLVE_TIMEOUT_MS = 60_000;
 
 const CACHE_HEADER = "x-cache";
@@ -57,12 +49,7 @@ export type CurseForgeRequest = CurseForgeMethod & {
   pool?: string;
   /** Ask CurseForge again instead of answering from the cache (`Cache-Control: no-cache`). */
   fresh?: boolean;
-  /**
-   * How long to wait out the gateway's refusals, in milliseconds. A `503`
-   * whose `Retry-After` fits in what is left is slept out and the call is
-   * sent again; one that does not fit is thrown at once. For background
-   * callers; a request answering a user should leave it unset.
-   */
+  /** How long to wait out the gateway's refusals, in milliseconds, for background callers. */
   waitUpToMs?: number;
   signal?: AbortSignal;
 };
@@ -72,10 +59,7 @@ export type ModrinthRequest = CurseForgeRequest;
 
 /** What `resolve()` asks for. */
 export interface ResolveOptions {
-  /**
-   * Whether a file's built address on CurseForge's CDN may be checked and
-   * given when neither CurseForge nor Modrinth has a link. On unless false.
-   */
+  /** Whether the file's built CDN address may be checked when neither CurseForge nor Modrinth has a link. On unless false. */
   cdn?: boolean;
   /** The pool the CurseForge calls draw from instead of the client's. */
   pool?: string;
@@ -121,12 +105,7 @@ export interface PassthroughAnswer {
 
 export type CurseForgeAnswer = PassthroughAnswer;
 
-/**
- * An answer the gateway gave itself instead of passing one on: a refused call,
- * a missing token, an unknown pool, CurseForge not answering. `code` is `null`
- * when the answer was not the gateway's JSON error at all, such as a proxy's
- * HTML page, and `message` then carries what came.
- */
+/** An answer the gateway gave itself instead of passing one on; `code` is `null` when it was not the gateway's JSON error. */
 export class ContentGatewayError extends Error {
   readonly status: number;
   readonly code: ErrorCode | null;
@@ -208,13 +187,7 @@ export class ContentGateway {
     return body as BudgetSnapshot;
   }
 
-  /**
-   * Sends `api.curseforge.com/v1/<path>` through the gateway and answers what
-   * CurseForge answered, whatever its status. Only the gateway's own answers
-   * throw, as `ContentGatewayError`.
-   *
-   * @param path - The path under `/v1/`, such as `mods/search` or `mods/238222/files/4567`
-   */
+  /** Sends `api.curseforge.com/v1/<path>` through the gateway and answers what CurseForge answered, whatever its status. */
   async curseforge(
     path: string,
     request: CurseForgeRequest = {},
@@ -239,12 +212,7 @@ export class ContentGateway {
     });
   }
 
-  /**
-   * Sends `api.modrinth.com/v2/<path>` through the gateway and answers what
-   * Modrinth answered, whatever its status, like `curseforge()`.
-   *
-   * @param path - The path under `/v2/`, such as `search`, `project/sodium` or `version_file/<sha1>`
-   */
+  /** Sends `api.modrinth.com/v2/<path>` through the gateway and answers what Modrinth answered, whatever its status. */
   async modrinth(
     path: string,
     request: ModrinthRequest = {},
@@ -269,12 +237,7 @@ export class ContentGateway {
     });
   }
 
-  /**
-   * `GET /v1/modrinth/version_file/<sha1>`: the version Modrinth lists the
-   * file with this SHA-1 under, or a 404 when Modrinth does not know the hash.
-   * Parse the body with `modrinthVersionSchema`; `modrinthFileUrl` picks the
-   * file's own address.
-   */
+  /** `GET /v1/modrinth/version_file/<sha1>`: the version Modrinth lists the file under, or a 404. */
   async modrinthVersionFile(
     sha1: string,
     request: ModrinthRequest = {},
@@ -286,11 +249,7 @@ export class ContentGateway {
     });
   }
 
-  /**
-   * `POST /v1/modrinth/version_files`: the versions Modrinth lists these
-   * SHA-1s under, keyed by lowercase hash; a hash Modrinth does not know is
-   * left out. Parse the body with `modrinthVersionFilesSchema`.
-   */
+  /** `POST /v1/modrinth/version_files`: the versions Modrinth lists these SHA-1s under, keyed by lowercase hash. */
   async modrinthVersionFiles(
     hashes: readonly string[],
     request: ModrinthRequest = {},
@@ -302,13 +261,7 @@ export class ContentGateway {
     });
   }
 
-  /**
-   * `POST /v1/resolve`: a download address per CurseForge file id, from
-   * CurseForge's own link, else Modrinth's copy found by SHA-1, else the
-   * file's built address on CurseForge's CDN when it answers with the file's
-   * size. The gateway's refusals and CurseForge's failures throw as
-   * `ContentGatewayError`.
-   */
+  /** `POST /v1/resolve`: a download address per CurseForge file id. */
   async resolve(
     fileIds: readonly number[],
     options: ResolveOptions = {},
@@ -330,11 +283,7 @@ export class ContentGateway {
     return body as Resolved;
   }
 
-  /**
-   * `GET /v1/minecraft/versions`: the Minecraft versions Mojang lists, newest
-   * first, releases unless `type` says otherwise, and only the ones `loader`
-   * has builds for when given.
-   */
+  /** `GET /v1/minecraft/versions`: the Minecraft versions Mojang lists, newest first. */
   async minecraftVersions(
     options: MinecraftVersionsOptions = {},
   ): Promise<MinecraftVersions> {
@@ -362,10 +311,7 @@ export class ContentGateway {
     return body as MinecraftVersionDetails;
   }
 
-  /**
-   * `GET /v1/minecraft/loaders/<loader>/versions`: a loader's builds, newest
-   * first, narrowed to a Minecraft version when `minecraft` is given.
-   */
+  /** `GET /v1/minecraft/loaders/<loader>/versions`: a loader's builds, newest first. */
   async loaderVersions(
     loader: Loader,
     options: LoaderVersionsOptions = {},

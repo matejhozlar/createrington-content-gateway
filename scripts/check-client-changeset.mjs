@@ -1,6 +1,3 @@
-// Fails when the client package changed against the base branch without a
-// changeset or a version bump, so no change reaches consumers unversioned.
-// Usage: node scripts/check-client-changeset.mjs [origin/dev]
 import { git } from "./git.mjs";
 
 const base = process.argv[2] ?? "origin/dev";
