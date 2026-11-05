@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.1.2 (2026-11-05)
+
+- [add] Publish every release on GitHub: the `vX.Y.Z` tag builds static amd64 and arm64 binaries, `openapi.json` and a `SHA256SUMS` for the GitHub release, with notes taken from this changelog, and a multi-arch image at `ghcr.io/matejhozlar/createrington-content-gateway:<version>`, after checking that the tag matches `package.json` and `Cargo.toml`
+- [add] Add a Python client, `content-gateway-client` on PyPI (Python 3.11+, sync and async on httpx), covering the CurseForge and Modrinth passthroughs with the gateway's refusals raised as `ContentGatewayError`, `resolve`, the Minecraft and loader version lists, the budget and health, with its types generated from `openapi.json` and published by the release workflow when PyPI does not have its version yet
+- [chore] Prepare the repository for its public mirror: name the repository in the manifests, document every variable in `.env.example`, describe running with `cargo run`, present the Gitea deploy workflow as an example, and shorten the server's doc comments
+- [chore] Run CI on GitHub pull requests as well as Gitea, sharing composite actions under `.ci/actions`, with a read-only token, and check the Python client (generated types, ruff, mypy, pytest) in both
+
 ## v0.1.1 (2026-11-05)
 
 - [add] Add the Modrinth passthrough at `/v1/modrinth/*`, mirroring `api.modrinth.com/v2/*` like the CurseForge one (status, content type and body as they came, `X-Cache`, shared in-flight calls, stale answers when Modrinth fails, a 10 s timeout) with its own per-route cache table, per-hash caching for `GET /version_file/{sha1}` and `POST /version_files` (up to 1000 SHA-1 hashes, 100 per call, `400 INVALID_HASH` for a malformed one, other algorithms passed through as they came), and paths that accept every character Modrinth slugs allow
