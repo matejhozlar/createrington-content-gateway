@@ -103,6 +103,13 @@ interface SendOptions {
   signal?: AbortSignal | undefined;
 }
 
+/** What `budget()` asks for. */
+export interface BudgetOptions {
+  /** UTC days of daily counts to answer, today included, 1 up; 14 when left out, more than the gateway's `historyDays` answers the days kept. */
+  days?: number | undefined;
+  signal?: AbortSignal | undefined;
+}
+
 /** A consumer's connection to one gateway. */
 export class ContentGateway {
   private readonly baseUrl: string;
@@ -130,13 +137,14 @@ export class ContentGateway {
     return body as Health;
   }
 
-  /** `GET /v1/budget`: this minute's calls, the 429 hold and the daily counts. */
-  async budget(signal?: AbortSignal): Promise<BudgetSnapshot> {
+  /** `GET /v1/budget`: this minute's calls, the 429 hold and the daily counts of the last `days` UTC days. */
+  async budget(options: BudgetOptions = {}): Promise<BudgetSnapshot> {
     const { body } = await this.send({
       method: "GET",
       path: "/v1/budget",
+      query: options.days === undefined ? undefined : { days: options.days },
       authenticated: true,
-      signal,
+      signal: options.signal,
     });
     return body as BudgetSnapshot;
   }

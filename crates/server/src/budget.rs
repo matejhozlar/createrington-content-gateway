@@ -4,11 +4,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use axum::{Json, extract::State};
+use axum::{
+    Json,
+    extract::{Query, State, rejection::QueryRejection},
+};
 use jiff::{Timestamp, fmt::rfc2822};
 use redis::{Script, Value, aio::ConnectionManager};
-use serde::Serialize;
-use utoipa::ToSchema;
+use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, ToSchema};
 
 use crate::{app::AppState, error::ApiError, redis_store::RedisStore};
 
@@ -17,9 +20,14 @@ const DAY_MS: u64 = 24 * 60 * MINUTE_MS;
 const HOLD_WHEN_NOT_TOLD_MS: u64 = 30_000;
 const SHORTEST_HOLD_MS: u64 = 1_000;
 const LONGEST_HOLD_MS: u64 = 10 * MINUTE_MS;
-const DAYS_KEPT: u64 = 14;
 const MINUTE_KEY_TTL_MS: u64 = 2 * MINUTE_MS;
 const DAYS_TRIMMED: u64 = 31;
+/// Days of daily counts kept unless `CONTENT_GATEWAY_BUDGET_HISTORY_DAYS` says otherwise.
+pub const DEFAULT_HISTORY_DAYS: u32 = 90;
+/// The most days of daily counts that can be kept.
+pub const MAX_HISTORY_DAYS: u32 = 3660;
+/// Days `/v1/budget` answers when not asked for a number.
+pub const DEFAULT_SNAPSHOT_DAYS: u32 = 14;
 const HOLD_KEY: &str = "budget:held-until";
 const HTTP_FORBIDDEN: u16 = 403;
 const HTTP_TOO_MANY_REQUESTS: u16 = 429;
@@ -94,7 +102,7 @@ pub enum Refusal {
 /// One ceiling per minute covers all pools. A call is admitted before it goes
 /// upstream and recorded once CurseForge answered; a 429 holds every pool off
 /// for as long as its `Retry-After` asks (30 s without one, 1 s to 10 min).
-/// Daily counts per pool are kept for the last 14 UTC days.
+/// Daily counts per pool are kept for a configured number of UTC days.
 ///
 /// With Redis, the minute's counts, the hold and the daily counts live there
 /// and survive a restart: admitting is one atomic script, which also stores a
@@ -105,6 +113,7 @@ pub enum Refusal {
 /// for a single gateway process.
 pub struct Budget {
     limit_per_minute: u32,
+    history_days: u32,
     pools: Vec<PoolKey>,
     clock: Arc<dyn Clock>,
     memory: Arc<Mutex<Counts>>,
@@ -163,12 +172,14 @@ pub enum Source {
     Unavailable,
 }
 
-/// What `/v1/budget` answers: this minute over all pools and per pool, the 429 hold, and the last 14 UTC days.
+/// What `/v1/budget` answers: this minute over all pools and per pool, the 429 hold, and the last UTC days.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BudgetSnapshot {
     /// Calls to CurseForge the minute allows over all pools.
     pub limit_per_minute: u32,
+    /// UTC days of daily counts the gateway keeps, the most `days` can cover.
+    pub history_days: u32,
     /// Calls admitted this minute.
     pub used: u32,
     /// Calls refused this minute.
@@ -182,8 +193,17 @@ pub struct BudgetSnapshot {
     pub source: Source,
     /// Every pool of every consumer, this minute.
     pub pools: Vec<PoolSnapshot>,
-    /// The last 14 UTC days, today first.
+    /// The UTC days asked for, today first; a day without a single count is left out.
     pub days: Vec<DaySnapshot>,
+}
+
+/// The query of `/v1/budget`.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct HistoryQuery {
+    /// UTC days to answer, today included, 1 up; 14 when left out, and more than the days kept answers the days kept.
+    #[param(minimum = 1)]
+    pub days: Option<u32>,
 }
 
 /// One pool's calls this minute.
@@ -234,6 +254,7 @@ impl Budget {
     {
         Self {
             limit_per_minute,
+            history_days: DEFAULT_HISTORY_DAYS,
             pools: pools
                 .into_iter()
                 .map(|(consumer, pool)| (consumer.into(), pool.into()))
@@ -250,6 +271,12 @@ impl Budget {
                 })
             }),
         }
+    }
+
+    /// Keeps `days` UTC days of daily counts instead of the default, 1 up.
+    pub fn keeping_days(mut self, days: u32) -> Self {
+        self.history_days = days.max(1);
+        self
     }
 
     /// Reserves `calls` upstream calls for one request, all or none. Zero calls (everything cached) always passes.
@@ -269,7 +296,7 @@ impl Budget {
             None => self.admit_in_memory(&key, calls, now),
         };
         if verdict.is_err() {
-            self.lock(now).day(now, key).withheld += u64::from(calls);
+            self.lock(now).day(now, key, self.history_days).withheld += u64::from(calls);
             self.write_days_soon();
         }
         verdict
@@ -287,7 +314,7 @@ impl Budget {
         let key = self.key(consumer, pool);
         let hold = {
             let mut state = self.lock(now);
-            let day = state.day(now, key);
+            let day = state.day(now, key, self.history_days);
             day.calls += 1;
             match status {
                 Some(HTTP_FORBIDDEN) => {
@@ -320,7 +347,7 @@ impl Budget {
     pub fn record_hit(&self, consumer: &str, pool: &str) {
         let now = self.clock.now_ms();
         let key = self.key(consumer, pool);
-        self.lock(now).day(now, key).hits += 1;
+        self.lock(now).day(now, key, self.history_days).hits += 1;
         self.write_days_soon();
     }
 
@@ -330,15 +357,23 @@ impl Budget {
         let Some(redis) = &self.redis else {
             return;
         };
-        let lost = redis.write_days(&self.memory, &*self.clock, true).await;
+        let lost = redis
+            .write_days(&self.memory, &*self.clock, self.history_days, true)
+            .await;
         if lost > 0 {
             tracing::warn!("Redis did not take the last daily counts, {lost} of them are lost");
         }
     }
 
+    /// The budget with the last 14 UTC days, at most the days kept.
     pub async fn snapshot(&self) -> BudgetSnapshot {
+        self.history(DEFAULT_SNAPSHOT_DAYS).await
+    }
+
+    /// The budget with the last `days` UTC days, today included, at most the days kept.
+    pub async fn history(&self, days: u32) -> BudgetSnapshot {
         let now = self.clock.now_ms();
-        let dates: Vec<String> = (0..DAYS_KEPT)
+        let dates: Vec<String> = (0..u64::from(days.clamp(1, self.history_days)))
             .map(|days_ago| utc_date(now.saturating_sub(days_ago * DAY_MS)))
             .collect();
         let _writing = match &self.redis {
@@ -431,6 +466,7 @@ impl Budget {
 
         BudgetSnapshot {
             limit_per_minute: self.limit_per_minute,
+            history_days: self.history_days,
             used,
             withheld,
             resets_at: iso(((now / MINUTE_MS) + 1) * MINUTE_MS),
@@ -549,8 +585,11 @@ impl Budget {
     fn write_days_soon(&self) {
         if let Some(redis) = &self.redis {
             let (redis, memory, clock) = (redis.clone(), self.memory.clone(), self.clock.clone());
+            let history_days = self.history_days;
             tokio::spawn(async move {
-                redis.write_days(&memory, &*clock, false).await;
+                redis
+                    .write_days(&memory, &*clock, history_days, false)
+                    .await;
             });
         }
     }
@@ -583,6 +622,7 @@ impl Shared {
         &self,
         memory: &Mutex<Counts>,
         clock: &dyn Clock,
+        history_days: u32,
         even_if_paused: bool,
     ) -> u64 {
         let _writing = self.writing_days.lock().await;
@@ -616,14 +656,20 @@ impl Shared {
         }
         let now = clock.now_ms();
         let today = utc_date(now);
-        let trim = self
+        let trimmed_on = self
             .trimmed_on
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            != Some(&today);
+            .clone();
+        let trim = trimmed_on.as_ref() != Some(&today);
         if trim {
-            let gone: Vec<String> = (DAYS_KEPT..DAYS_KEPT + DAYS_TRIMMED)
+            let kept = u64::from(history_days);
+            let reach = if trimmed_on.is_none() {
+                u64::from(MAX_HISTORY_DAYS)
+            } else {
+                DAYS_TRIMMED
+            };
+            let gone: Vec<String> = (kept..kept + reach)
                 .map(|days_ago| {
                     self.store
                         .key(&day_key(&utc_date(now.saturating_sub(days_ago * DAY_MS))))
@@ -673,10 +719,10 @@ impl Shared {
 }
 
 impl Counts {
-    fn day(&mut self, now: u64, key: PoolKey) -> &mut DayCounts {
+    fn day(&mut self, now: u64, key: PoolKey, history_days: u32) -> &mut DayCounts {
         let date = utc_date(now);
         if !self.days.contains_key(&date) {
-            let oldest = utc_date(now.saturating_sub((DAYS_KEPT - 1) * DAY_MS));
+            let oldest = utc_date(now.saturating_sub((u64::from(history_days) - 1) * DAY_MS));
             self.days.retain(|kept, _| *kept >= oldest);
         }
         self.days.entry(date).or_default().entry(key).or_default()
@@ -719,19 +765,28 @@ impl DayCounts {
     }
 }
 
-/// This minute's calls per pool, the 429 hold, and the daily counts of the last 14 UTC days.
+/// This minute's calls per pool, the 429 hold, and the daily counts of the last UTC days.
 #[utoipa::path(
     get,
     path = "/v1/budget",
     tag = "gateway",
     security(("bearer" = [])),
+    params(HistoryQuery),
     responses(
         (status = 200, description = "The budget as it stands", body = BudgetSnapshot),
+        (status = 400, description = "`days` is not a whole number from 1 up", body = ApiError),
         (status = 401, description = "No valid consumer token", body = ApiError),
     )
 )]
-pub async fn readout(State(state): State<Arc<AppState>>) -> Json<BudgetSnapshot> {
-    Json(state.budget.snapshot().await)
+pub async fn readout(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<HistoryQuery>, QueryRejection>,
+) -> Result<Json<BudgetSnapshot>, ApiError> {
+    let days = match query {
+        Ok(Query(HistoryQuery { days: Some(0) })) | Err(_) => return Err(ApiError::invalid_days()),
+        Ok(Query(HistoryQuery { days })) => days.unwrap_or(DEFAULT_SNAPSHOT_DAYS),
+    };
+    Ok(Json(state.budget.history(days).await))
 }
 
 fn pool_snapshot(key: &PoolKey, counts: MinuteCounts) -> PoolSnapshot {
@@ -880,16 +935,21 @@ mod tests {
 
     impl Backends {
         fn new(limit: u32, clock: &Arc<TestClock>) -> Self {
+            Self::keeping_days(limit, clock, DEFAULT_HISTORY_DAYS)
+        }
+
+        fn keeping_days(limit: u32, clock: &Arc<TestClock>, days: u32) -> Self {
             let mut budgets = vec![(
                 Source::Memory,
-                Budget::new(limit, POOLS, clock.clone(), None),
+                Budget::new(limit, POOLS, clock.clone(), None).keeping_days(days),
             )];
             let redis = test_redis_url().map(|url| (url, unique_prefix()));
             if let Some((url, prefix)) = &redis {
                 let store = RedisStore::open(url, prefix.clone()).unwrap();
                 budgets.push((
                     Source::Redis,
-                    Budget::new(limit, POOLS, clock.clone(), Some(Arc::new(store))),
+                    Budget::new(limit, POOLS, clock.clone(), Some(Arc::new(store)))
+                        .keeping_days(days),
                 ));
             }
             Self { redis, budgets }
@@ -1128,10 +1188,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn keeps_fourteen_days() {
+    async fn answers_fourteen_days_unless_asked_for_more_up_to_the_days_kept() {
         let clock = TestClock::at(NOV_3_2026_20H);
-        let backends = Backends::new(300, &clock);
-        for _ in 0..20 {
+        let backends = Backends::keeping_days(300, &clock, 20);
+        for _ in 0..25 {
             clock.advance(DAY_MS);
             for (_, budget) in &backends.budgets {
                 budget.record("app", "app", Some(200), None).await;
@@ -1139,11 +1199,33 @@ mod tests {
         }
         for (source, budget) in &backends.budgets {
             let snapshot = budget.snapshot().await;
+            assert_eq!(snapshot.history_days, 20, "{source:?}");
             assert_eq!(snapshot.days.len(), 14, "{source:?}");
-            assert_eq!(snapshot.days[0].date, "2026-11-23", "{source:?}");
-            assert_eq!(snapshot.days[13].date, "2026-11-10", "{source:?}");
+            assert_eq!(snapshot.days[0].date, "2026-11-28", "{source:?}");
+            assert_eq!(snapshot.days[13].date, "2026-11-15", "{source:?}");
+
+            let history = budget.history(90).await;
+            assert_eq!(history.days.len(), 20, "{source:?}");
+            assert_eq!(history.days[19].date, "2026-11-09", "{source:?}");
+
+            assert_eq!(budget.history(0).await.days.len(), 1, "{source:?}");
+            assert_eq!(budget.history(3).await.days.len(), 3, "{source:?}");
         }
         backends.forget().await;
+    }
+
+    #[tokio::test]
+    async fn keeps_the_configured_days_in_memory() {
+        let clock = TestClock::at(NOV_3_2026_20H);
+        let budget = Budget::new(300, POOLS, clock.clone(), None).keeping_days(3);
+        for _ in 0..5 {
+            budget.record("app", "app", Some(200), None).await;
+            clock.advance(DAY_MS);
+        }
+        let history = budget.history(90).await;
+        assert_eq!(history.history_days, 3);
+        let dates: Vec<&str> = history.days.iter().map(|day| day.date.as_str()).collect();
+        assert_eq!(dates, ["2026-11-07", "2026-11-06"]);
     }
 
     #[tokio::test]
@@ -1289,7 +1371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn daily_counts_never_expire_and_days_past_the_fourteen_are_deleted() {
+    async fn daily_counts_never_expire_and_days_past_the_kept_are_deleted() {
         let Some(url) = test_redis_url() else {
             eprintln!("{TEST_REDIS_ENV} is not set, skipped");
             return;
@@ -1297,7 +1379,7 @@ mod tests {
         let prefix = unique_prefix();
         let clock = TestClock::at(NOV_3_2026_20H);
         let store = Arc::new(RedisStore::open(&url, prefix.clone()).unwrap());
-        let budget = Budget::new(300, POOLS, clock.clone(), Some(store.clone()));
+        let budget = Budget::new(300, POOLS, clock.clone(), Some(store.clone())).keeping_days(14);
         for _ in 0..20 {
             budget.record("app", "app", Some(200), None).await;
             budget.write_days_at_exit().await;
@@ -1328,6 +1410,48 @@ mod tests {
             .await;
         assert_eq!(ttl, Some(-1));
         forget(&url, &prefix).await;
+    }
+
+    #[tokio::test]
+    async fn days_past_a_lowered_history_are_deleted_on_the_first_write() {
+        let Some(url) = test_redis_url() else {
+            eprintln!("{TEST_REDIS_ENV} is not set, skipped");
+            return;
+        };
+        let prefix = unique_prefix();
+        let clock = TestClock::at(NOV_3_2026_20H);
+        let store = Arc::new(RedisStore::open(&url, prefix.clone()).unwrap());
+        let long = Budget::new(300, POOLS, clock.clone(), Some(store.clone())).keeping_days(90);
+        for _ in 0..80 {
+            long.record("app", "app", Some(200), None).await;
+            long.write_days_at_exit().await;
+            clock.advance(DAY_MS);
+        }
+        assert_eq!(day_keys(&store).await.len(), 80);
+
+        let short = Budget::new(300, POOLS, clock.clone(), Some(store.clone())).keeping_days(14);
+        short.record("app", "app", Some(200), None).await;
+        short.write_days_at_exit().await;
+        let days = day_keys(&store).await;
+        assert_eq!(days.len(), 14, "{days:?}");
+        assert!(days[0].ends_with("2027-01-09"), "{days:?}");
+        assert_eq!(short.history(90).await.days.len(), 14);
+        forget(&url, &prefix).await;
+    }
+
+    async fn day_keys(store: &RedisStore) -> Vec<String> {
+        let pattern = store.key("budget:day:*");
+        let mut days = store
+            .run(|mut connection| async move {
+                redis::cmd("KEYS")
+                    .arg(pattern)
+                    .query_async::<Vec<String>>(&mut connection)
+                    .await
+            })
+            .await
+            .unwrap();
+        days.sort();
+        days
     }
 
     #[tokio::test]

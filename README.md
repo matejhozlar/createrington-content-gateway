@@ -25,16 +25,17 @@ curl http://127.0.0.1:5005/v1/healthz
 
 All configuration comes from environment variables.
 
-| Variable                            | Default     | Meaning                                                                                                                                             |
-| ----------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `CURSEFORGE_API_KEY`                |             | Required. The [CurseForge API key](https://console.curseforge.com/) every call to CurseForge is made with                                           |
-| `CONTENT_GATEWAY_HOST`              | `127.0.0.1` | IP address to listen on                                                                                                                             |
-| `CONTENT_GATEWAY_PORT`              | `5005`      | Port to listen on                                                                                                                                   |
-| `CONTENT_GATEWAY_LOG`               | `info`      | Log filter, in [`tracing-subscriber` `EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax |
-| `CONTENT_GATEWAY_TOKEN`             |             | The token of a single consumer named `default` with one pool named `default`                                                                        |
-| `CONTENT_GATEWAY_CONSUMERS`         |             | Several consumers as JSON, see below. Set this or `CONTENT_GATEWAY_TOKEN`, not both                                                                 |
-| `CONTENT_GATEWAY_BUDGET_PER_MINUTE` | `300`       | Calls to CurseForge per minute over all consumers and pools                                                                                         |
-| `REDIS_URL`                         |             | Redis to keep the budget and the cache in across restarts, such as `redis://:password@127.0.0.1:6379/0`. Without it everything stays in memory      |
+| Variable                              | Default     | Meaning                                                                                                                                             |
+| ------------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CURSEFORGE_API_KEY`                  |             | Required. The [CurseForge API key](https://console.curseforge.com/) every call to CurseForge is made with                                           |
+| `CONTENT_GATEWAY_HOST`                | `127.0.0.1` | IP address to listen on                                                                                                                             |
+| `CONTENT_GATEWAY_PORT`                | `5005`      | Port to listen on                                                                                                                                   |
+| `CONTENT_GATEWAY_LOG`                 | `info`      | Log filter, in [`tracing-subscriber` `EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax |
+| `CONTENT_GATEWAY_TOKEN`               |             | The token of a single consumer named `default` with one pool named `default`                                                                        |
+| `CONTENT_GATEWAY_CONSUMERS`           |             | Several consumers as JSON, see below. Set this or `CONTENT_GATEWAY_TOKEN`, not both                                                                 |
+| `CONTENT_GATEWAY_BUDGET_PER_MINUTE`   | `300`       | Calls to CurseForge per minute over all consumers and pools                                                                                         |
+| `CONTENT_GATEWAY_BUDGET_HISTORY_DAYS` | `90`        | UTC days of daily counts `/v1/budget` keeps, 1 to 3660. A day takes a few hundred bytes per pool                                                    |
+| `REDIS_URL`                           |             | Redis to keep the budget and the cache in across restarts, such as `redis://:password@127.0.0.1:6379/0`. Without it everything stays in memory      |
 
 ### Consumers and pools
 
@@ -62,7 +63,7 @@ Two more variables are read at build time, not at runtime. `/v1/healthz` reports
 
 Redis is optional. With it, the minute's count, CurseForge's 429 hold, the daily counts and the cached answers survive a restart of the gateway. While Redis cannot be reached, the gateway keeps counting and caching in memory and writes the daily counts once Redis answers again; a request never waits more than a second on Redis. Without Redis everything stays in memory, which is correct for a single gateway process.
 
-Cached answers are read from memory first. Redis is asked only when memory has no entry (one `MGET` for all the ids of a batch), and new answers are written to it in the background, each until its stale time. They can take a few hundred MB, so give the gateway a Redis of its own with a memory limit and `volatile-lru`, for example `redis-server --maxmemory 1gb --maxmemory-policy volatile-lru`. That policy only evicts keys with an expiry: cached answers have one, so a full Redis drops the least used of them instead of refusing writes, while the daily counts have none and are never evicted (the gateway deletes days older than the 14 it keeps). The minute's count and the 429 hold expire too, but every call touches them, so they are the last to go. Do not use `allkeys-lru`, which can evict the daily counts, and do not share a `noeviction` Redis with other services: once it is full of answers, it refuses their writes too.
+Cached answers are read from memory first. Redis is asked only when memory has no entry (one `MGET` for all the ids of a batch), and new answers are written to it in the background, each until its stale time. They can take a few hundred MB, so give the gateway a Redis of its own with a memory limit and `volatile-lru`, for example `redis-server --maxmemory 1gb --maxmemory-policy volatile-lru`. That policy only evicts keys with an expiry: cached answers have one, so a full Redis drops the least used of them instead of refusing writes, while the daily counts have none and are never evicted (the gateway deletes days older than the `CONTENT_GATEWAY_BUDGET_HISTORY_DAYS` it keeps). The minute's count and the 429 hold expire too, but every call touches them, so they are the last to go. Do not use `allkeys-lru`, which can evict the daily counts, and do not share a `noeviction` Redis with other services: once it is full of answers, it refuses their writes too.
 
 Every key starts with `content-gateway:`. TLS (`rediss://`) is not supported, keep Redis on the same machine or a private network.
 
@@ -96,12 +97,12 @@ This is how the gateway runs for Createrington: `.gitea/workflows/deploy.yml` bu
 
 ## Endpoints
 
-| Route                                           | Auth  | What it answers                                                                                                                                                                                           |
-| ----------------------------------------------- | ----- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /v1/healthz`                               | none  | `{ status, version, commit, builtAt }`                                                                                                                                                                    |
-| `GET /v1/openapi.json`                          | none  | The OpenAPI document of these routes, the same as `openapi.json` in this repository                                                                                                                       |
-| `GET /v1/budget`                                | token | This minute's calls sent and withheld per pool, the 429 hold, and daily counts for the last 14 UTC days: calls to CurseForge, answers given without one (`hits`), calls withheld, and 403 and 429 answers |
-| `GET /v1/curseforge/*`, `POST /v1/curseforge/*` | token | What `api.curseforge.com/v1/*` answers, see below                                                                                                                                                         |
+| Route                                           | Auth  | What it answers                                                                                                                                                                                                                                                                          |
+| ----------------------------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /v1/healthz`                               | none  | `{ status, version, commit, builtAt }`                                                                                                                                                                                                                                                   |
+| `GET /v1/openapi.json`                          | none  | The OpenAPI document of these routes, the same as `openapi.json` in this repository                                                                                                                                                                                                      |
+| `GET /v1/budget?days=14`                        | token | This minute's calls sent and withheld per pool, the 429 hold, and daily counts for the last `days` UTC days (14 when left out, more than the `historyDays` kept answers the days kept): calls to CurseForge, answers given without one (`hits`), calls withheld, and 403 and 429 answers |
+| `GET /v1/curseforge/*`, `POST /v1/curseforge/*` | token | What `api.curseforge.com/v1/*` answers, see below                                                                                                                                                                                                                                        |
 
 `source` in the budget says where its counts come from: `redis` for the stored ones, `memory` when no Redis is configured, and `unavailable` when Redis did not answer, in which case the minute is the gateway's own count and the days show only what is not written to Redis yet.
 
