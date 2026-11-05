@@ -7,17 +7,27 @@ use std::{
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
+use crate::{
+    budget::{DEFAULT_HISTORY_DAYS, MAX_HISTORY_DAYS},
+    modrinth,
+};
+
 const HOST_ENV: &str = "CONTENT_GATEWAY_HOST";
 const PORT_ENV: &str = "CONTENT_GATEWAY_PORT";
 const LOG_ENV: &str = "CONTENT_GATEWAY_LOG";
 const CONSUMERS_ENV: &str = "CONTENT_GATEWAY_CONSUMERS";
 const TOKEN_ENV: &str = "CONTENT_GATEWAY_TOKEN";
 const BUDGET_ENV: &str = "CONTENT_GATEWAY_BUDGET_PER_MINUTE";
+const MODRINTH_BUDGET_ENV: &str = "CONTENT_GATEWAY_MODRINTH_PER_MINUTE";
+const HISTORY_DAYS_ENV: &str = "CONTENT_GATEWAY_BUDGET_HISTORY_DAYS";
 const REDIS_ENV: &str = "REDIS_URL";
 const API_KEY_ENV: &str = "CURSEFORGE_API_KEY";
+const MODRINTH_USER_AGENT_ENV: &str = "MODRINTH_USER_AGENT";
 const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_PORT: u16 = 5005;
 const DEFAULT_BUDGET_PER_MINUTE: u32 = 300;
+/// Modrinth allows 300 requests a minute per address.
+const DEFAULT_MODRINTH_PER_MINUTE: u32 = 300;
 const MIN_TOKEN_LENGTH: usize = 32;
 const MAX_NAME_LENGTH: usize = 64;
 pub const DEFAULT_LOG: &str = "info";
@@ -29,8 +39,11 @@ pub struct Config {
     pub listen: SocketAddr,
     pub consumers: Vec<Consumer>,
     pub budget_per_minute: u32,
+    pub modrinth_per_minute: u32,
+    pub budget_history_days: u32,
     pub redis_url: Option<RedisUrl>,
     pub curseforge_api_key: ApiKey,
+    pub modrinth_user_agent: String,
 }
 
 /// A process allowed to call the gateway, and the budget pools it may draw from.
@@ -113,10 +126,16 @@ pub enum ConfigError {
     },
     #[error("{name} must be a whole number of calls per minute from 1 up, got {value:?}")]
     Budget { name: &'static str, value: String },
+    #[error("{name} must be a whole number of days from 1 to {MAX_HISTORY_DAYS}, got {value:?}")]
+    HistoryDays { name: &'static str, value: String },
     #[error(
         "{name} must be a URL such as redis://:password@127.0.0.1:6379/0 (rediss:// is not supported)"
     )]
     RedisUrl { name: &'static str },
+    #[error(
+        "{name} must be a User-Agent of printable ASCII, such as my-app/1.0 (https://example.com), got {value:?}"
+    )]
+    UserAgent { name: &'static str, value: String },
     #[error("set {API_KEY_ENV} to the CurseForge API key the gateway calls CurseForge with")]
     NoApiKey,
     #[error("set {CONSUMERS_ENV} or {TOKEN_ENV} so that something can call the gateway")]
@@ -209,6 +228,32 @@ impl Config {
             None => DEFAULT_BUDGET_PER_MINUTE,
         };
 
+        let modrinth_per_minute = match lookup(MODRINTH_BUDGET_ENV) {
+            Some(value) => match value.parse::<u32>() {
+                Ok(budget) if budget != 0 => budget,
+                _ => {
+                    return Err(ConfigError::Budget {
+                        name: MODRINTH_BUDGET_ENV,
+                        value,
+                    });
+                }
+            },
+            None => DEFAULT_MODRINTH_PER_MINUTE,
+        };
+
+        let budget_history_days = match lookup(HISTORY_DAYS_ENV) {
+            Some(value) => match value.parse::<u32>() {
+                Ok(days) if (1..=MAX_HISTORY_DAYS).contains(&days) => days,
+                _ => {
+                    return Err(ConfigError::HistoryDays {
+                        name: HISTORY_DAYS_ENV,
+                        value,
+                    });
+                }
+            },
+            None => DEFAULT_HISTORY_DAYS,
+        };
+
         let redis_url = match lookup(REDIS_ENV) {
             Some(value) => match redis::Client::open(value.as_str()) {
                 Ok(_) => Some(RedisUrl(value)),
@@ -233,12 +278,30 @@ impl Config {
             .map(|key| ApiKey(key.trim().to_owned()))
             .ok_or(ConfigError::NoApiKey)?;
 
+        let modrinth_user_agent = match lookup(MODRINTH_USER_AGENT_ENV) {
+            Some(value) => {
+                let agent = value.trim().to_owned();
+                if agent.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+                    agent
+                } else {
+                    return Err(ConfigError::UserAgent {
+                        name: MODRINTH_USER_AGENT_ENV,
+                        value,
+                    });
+                }
+            }
+            None => modrinth::DEFAULT_USER_AGENT.to_owned(),
+        };
+
         Ok(Self {
             listen: SocketAddr::new(host, port),
             consumers,
             budget_per_minute,
+            modrinth_per_minute,
+            budget_history_days,
             redis_url,
             curseforge_api_key,
+            modrinth_user_agent,
         })
     }
 }
@@ -417,6 +480,68 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn allows_modrinth_300_calls_a_minute_unless_told_otherwise() {
+        assert_eq!(config_with_token(&[]).unwrap().modrinth_per_minute, 300);
+        assert_eq!(
+            config_with_token(&[(MODRINTH_BUDGET_ENV, "100")])
+                .unwrap()
+                .modrinth_per_minute,
+            100
+        );
+        assert_eq!(
+            config_with_token(&[(MODRINTH_BUDGET_ENV, "0")]),
+            Err(ConfigError::Budget {
+                name: MODRINTH_BUDGET_ENV,
+                value: "0".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn keeps_ninety_days_of_counts_unless_told_otherwise() {
+        assert_eq!(config_with_token(&[]).unwrap().budget_history_days, 90);
+        assert_eq!(
+            config_with_token(&[(HISTORY_DAYS_ENV, "365")])
+                .unwrap()
+                .budget_history_days,
+            365
+        );
+        for value in ["0", "-1", "3661", "forever"] {
+            assert_eq!(
+                config_with_token(&[(HISTORY_DAYS_ENV, value)]),
+                Err(ConfigError::HistoryDays {
+                    name: HISTORY_DAYS_ENV,
+                    value: value.to_owned(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn says_who_it_is_to_modrinth_unless_told_what_to_say() {
+        assert_eq!(
+            config_with_token(&[]).unwrap().modrinth_user_agent,
+            modrinth::DEFAULT_USER_AGENT
+        );
+        assert_eq!(
+            config_with_token(&[(
+                MODRINTH_USER_AGENT_ENV,
+                " my-app/1.0 (https://example.com) "
+            )])
+            .unwrap()
+            .modrinth_user_agent,
+            "my-app/1.0 (https://example.com)"
+        );
+        assert_eq!(
+            config_with_token(&[(MODRINTH_USER_AGENT_ENV, "my-app/1.0\nX: y")]),
+            Err(ConfigError::UserAgent {
+                name: MODRINTH_USER_AGENT_ENV,
+                value: "my-app/1.0\nX: y".to_owned(),
+            })
+        );
     }
 
     #[test]

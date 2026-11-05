@@ -1,4 +1,15 @@
-import type { ApiError, BudgetSnapshot, ErrorCode, Health } from "./gateway.js";
+import type {
+  ApiError,
+  BudgetSnapshot,
+  ErrorCode,
+  Health,
+  Loader,
+  LoaderVersions,
+  MinecraftVersionDetails,
+  MinecraftVersions,
+  Resolved,
+  VersionFilter,
+} from "./gateway.js";
 
 /**
  * How long one request to the gateway may take. Above the 10 s the gateway
@@ -6,6 +17,13 @@ import type { ApiError, BudgetSnapshot, ErrorCode, Health } from "./gateway.js";
  * or a stale answer instead of this client's timeout.
  */
 export const DEFAULT_TIMEOUT_MS = 15_000;
+
+/**
+ * How long `resolve()` may take unless its options say otherwise. The gateway
+ * tries CurseForge (10 s), Modrinth (10 s) and the CDN (20 s) in a row, so at
+ * worst it answers after 40 s, and this is set above that.
+ */
+export const RESOLVE_TIMEOUT_MS = 60_000;
 
 const CACHE_HEADER = "x-cache";
 const POOL_HEADER = "x-budget-pool";
@@ -49,11 +67,49 @@ export type CurseForgeRequest = CurseForgeMethod & {
   signal?: AbortSignal;
 };
 
+/** A Modrinth call's options, as `CurseForgeRequest`: the calls draw from the pool's Modrinth budget. */
+export type ModrinthRequest = CurseForgeRequest;
+
+/** What `resolve()` asks for. */
+export interface ResolveOptions {
+  /**
+   * Whether a file's built address on CurseForge's CDN may be checked and
+   * given when neither CurseForge nor Modrinth has a link. On unless false.
+   */
+  cdn?: boolean;
+  /** The pool the CurseForge calls draw from instead of the client's. */
+  pool?: string;
+  /** Ask every source again instead of answering from the cache. */
+  fresh?: boolean;
+  /** As on `CurseForgeRequest`. */
+  waitUpToMs?: number;
+  /** How long the call may take, in milliseconds. `RESOLVE_TIMEOUT_MS` when unset, longer than the client's own timeout. */
+  timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+/** What `minecraftVersions()` asks for. */
+export interface MinecraftVersionsOptions {
+  /** `release` (the default), `snapshot` or `all`. */
+  type?: VersionFilter;
+  /** Only the versions this loader has at least one build for. */
+  loader?: Loader;
+  signal?: AbortSignal;
+}
+
+/** What `loaderVersions()` asks for. */
+export interface LoaderVersionsOptions {
+  /** Only the builds for this Minecraft version, such as `1.21.1`. */
+  minecraft?: string;
+  signal?: AbortSignal;
+}
+
 /** How the gateway answered a passthrough call, from `X-Cache`. */
 export type CacheStatus = (typeof CACHE_STATUSES)[number];
 
-export interface CurseForgeAnswer {
-  /** CurseForge's status, as it came. */
+/** What an upstream (CurseForge or Modrinth) answered through the gateway. */
+export interface PassthroughAnswer {
+  /** The upstream's status, as it came. */
   status: number;
   /** Whether `status` is 2xx. */
   ok: boolean;
@@ -62,6 +118,8 @@ export interface CurseForgeAnswer {
   body: unknown;
   headers: Headers;
 }
+
+export type CurseForgeAnswer = PassthroughAnswer;
 
 /**
  * An answer the gateway gave itself instead of passing one on: a refused call,
@@ -100,6 +158,14 @@ interface SendOptions {
   pool?: string | undefined;
   fresh?: boolean | undefined;
   waitUpToMs?: number | undefined;
+  timeoutMs?: number | undefined;
+  signal?: AbortSignal | undefined;
+}
+
+/** What `budget()` asks for. */
+export interface BudgetOptions {
+  /** UTC days of daily counts to answer, today included, 1 up; 14 when left out, more than the gateway's `historyDays` answers the days kept. */
+  days?: number | undefined;
   signal?: AbortSignal | undefined;
 }
 
@@ -130,13 +196,14 @@ export class ContentGateway {
     return body as Health;
   }
 
-  /** `GET /v1/budget`: this minute's calls, the 429 hold and the daily counts. */
-  async budget(signal?: AbortSignal): Promise<BudgetSnapshot> {
+  /** `GET /v1/budget`: this minute's calls, the 429 hold and the daily counts of the last `days` UTC days. */
+  async budget(options: BudgetOptions = {}): Promise<BudgetSnapshot> {
     const { body } = await this.send({
       method: "GET",
       path: "/v1/budget",
+      query: options.days === undefined ? undefined : { days: options.days },
       authenticated: true,
-      signal,
+      signal: options.signal,
     });
     return body as BudgetSnapshot;
   }
@@ -159,7 +226,7 @@ export class ContentGateway {
         `a GET to ${path} cannot carry a body; leave method unset or make it POST`,
       );
     }
-    const { response, body } = await this.send({
+    return this.passthrough({
       method,
       path: `/v1/curseforge/${path.replace(/^\/+/, "")}`,
       query: request.query,
@@ -170,12 +237,157 @@ export class ContentGateway {
       waitUpToMs: request.waitUpToMs,
       signal: request.signal,
     });
+  }
+
+  /**
+   * Sends `api.modrinth.com/v2/<path>` through the gateway and answers what
+   * Modrinth answered, whatever its status, like `curseforge()`.
+   *
+   * @param path - The path under `/v2/`, such as `search`, `project/sodium` or `version_file/<sha1>`
+   */
+  async modrinth(
+    path: string,
+    request: ModrinthRequest = {},
+  ): Promise<PassthroughAnswer> {
+    const method =
+      request.method ?? (request.body === undefined ? "GET" : "POST");
+    if (method === "GET" && request.body !== undefined) {
+      throw new TypeError(
+        `a GET to ${path} cannot carry a body; leave method unset or make it POST`,
+      );
+    }
+    return this.passthrough({
+      method,
+      path: `/v1/modrinth/${path.replace(/^\/+/, "")}`,
+      query: request.query,
+      body: request.body,
+      authenticated: true,
+      pool: request.pool,
+      fresh: request.fresh,
+      waitUpToMs: request.waitUpToMs,
+      signal: request.signal,
+    });
+  }
+
+  /**
+   * `GET /v1/modrinth/version_file/<sha1>`: the version Modrinth lists the
+   * file with this SHA-1 under, or a 404 when Modrinth does not know the hash.
+   * Parse the body with `modrinthVersionSchema`; `modrinthFileUrl` picks the
+   * file's own address.
+   */
+  async modrinthVersionFile(
+    sha1: string,
+    request: ModrinthRequest = {},
+  ): Promise<PassthroughAnswer> {
+    return this.modrinth(`version_file/${encodeURIComponent(sha1)}`, {
+      ...request,
+      method: "GET",
+      body: undefined,
+    });
+  }
+
+  /**
+   * `POST /v1/modrinth/version_files`: the versions Modrinth lists these
+   * SHA-1s under, keyed by lowercase hash; a hash Modrinth does not know is
+   * left out. Parse the body with `modrinthVersionFilesSchema`.
+   */
+  async modrinthVersionFiles(
+    hashes: readonly string[],
+    request: ModrinthRequest = {},
+  ): Promise<PassthroughAnswer> {
+    return this.modrinth("version_files", {
+      ...request,
+      method: "POST",
+      body: { hashes, algorithm: "sha1" },
+    });
+  }
+
+  /**
+   * `POST /v1/resolve`: a download address per CurseForge file id, from
+   * CurseForge's own link, else Modrinth's copy found by SHA-1, else the
+   * file's built address on CurseForge's CDN when it answers with the file's
+   * size. The gateway's refusals and CurseForge's failures throw as
+   * `ContentGatewayError`.
+   */
+  async resolve(
+    fileIds: readonly number[],
+    options: ResolveOptions = {},
+  ): Promise<Resolved> {
+    const { body } = await this.send({
+      method: "POST",
+      path: "/v1/resolve",
+      body: {
+        fileIds,
+        ...(options.cdn === undefined ? {} : { cdn: options.cdn }),
+      },
+      authenticated: true,
+      pool: options.pool,
+      fresh: options.fresh,
+      waitUpToMs: options.waitUpToMs,
+      timeoutMs: options.timeoutMs ?? RESOLVE_TIMEOUT_MS,
+      signal: options.signal,
+    });
+    return body as Resolved;
+  }
+
+  /**
+   * `GET /v1/minecraft/versions`: the Minecraft versions Mojang lists, newest
+   * first, releases unless `type` says otherwise, and only the ones `loader`
+   * has builds for when given.
+   */
+  async minecraftVersions(
+    options: MinecraftVersionsOptions = {},
+  ): Promise<MinecraftVersions> {
+    const { body } = await this.send({
+      method: "GET",
+      path: "/v1/minecraft/versions",
+      query: { type: options.type, loader: options.loader },
+      authenticated: true,
+      signal: options.signal,
+    });
+    return body as MinecraftVersions;
+  }
+
+  /** `GET /v1/minecraft/versions/<id>`: one version with the Java major it needs. Throws `UNKNOWN_VERSION` as a `ContentGatewayError`. */
+  async minecraftVersion(
+    id: string,
+    signal?: AbortSignal,
+  ): Promise<MinecraftVersionDetails> {
+    const { body } = await this.send({
+      method: "GET",
+      path: `/v1/minecraft/versions/${encodeURIComponent(id)}`,
+      authenticated: true,
+      signal,
+    });
+    return body as MinecraftVersionDetails;
+  }
+
+  /**
+   * `GET /v1/minecraft/loaders/<loader>/versions`: a loader's builds, newest
+   * first, narrowed to a Minecraft version when `minecraft` is given.
+   */
+  async loaderVersions(
+    loader: Loader,
+    options: LoaderVersionsOptions = {},
+  ): Promise<LoaderVersions> {
+    const { body } = await this.send({
+      method: "GET",
+      path: `/v1/minecraft/loaders/${loader}/versions`,
+      query: { minecraft: options.minecraft },
+      authenticated: true,
+      signal: options.signal,
+    });
+    return body as LoaderVersions;
+  }
+
+  private async passthrough(options: SendOptions): Promise<PassthroughAnswer> {
+    const { response, body } = await this.send(options);
     const cache = response.headers.get(CACHE_HEADER);
     if (!isCacheStatus(cache)) {
       throw new ContentGatewayError(
         response.status,
         null,
-        `the answer to ${method} ${path} did not come through the gateway: no X-Cache header`,
+        `the answer to ${options.method} ${options.path} did not come through the gateway: no X-Cache header`,
       );
     }
     return {
@@ -208,7 +420,10 @@ export class ContentGateway {
         method: options.method,
         headers,
         body,
-        signal: attemptSignal(this.timeoutMs, options.signal),
+        signal: attemptSignal(
+          options.timeoutMs ?? this.timeoutMs,
+          options.signal,
+        ),
       });
       const answer = await readBody(response);
       if (response.headers.has(CACHE_HEADER) || response.ok) {

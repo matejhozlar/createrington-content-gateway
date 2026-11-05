@@ -6,7 +6,7 @@ use axum::{
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::{budget::Refusal, curseforge::UpstreamFailure};
+use crate::{budget::Refusal, upstream::UpstreamFailure};
 
 /// What went wrong, for a consumer to branch on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
@@ -16,6 +16,12 @@ pub enum ErrorCode {
     PoolRequired,
     UnknownPool,
     InvalidPath,
+    InvalidDays,
+    InvalidHash,
+    InvalidBody,
+    InvalidQuery,
+    UnknownVersion,
+    UnknownLoader,
     UpstreamTimeout,
     UpstreamUnreachable,
     UpstreamTooLarge,
@@ -84,27 +90,77 @@ impl ApiError {
         )
     }
 
-    pub fn upstream(failure: UpstreamFailure) -> Self {
+    pub fn invalid_days() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidDays,
+            "days must be a whole number of UTC days from 1 up",
+        )
+    }
+
+    pub fn invalid_hash() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidHash,
+            "a SHA-1 is 40 hex digits",
+        )
+    }
+
+    pub fn invalid_body(expected: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidBody,
+            format!("the body must be {expected}"),
+        )
+    }
+
+    pub fn invalid_query(expected: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidQuery,
+            format!("the query must be {expected}"),
+        )
+    }
+
+    pub fn unknown_version(id: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::UnknownVersion,
+            format!("Mojang lists no Minecraft version {id:?}"),
+        )
+    }
+
+    pub fn unknown_loader() -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::UnknownLoader,
+            "the loaders are neoforge, forge and fabric",
+        )
+    }
+
+    pub fn upstream(failure: UpstreamFailure, source: &str) -> Self {
         match failure {
             UpstreamFailure::Timeout => Self::new(
                 StatusCode::GATEWAY_TIMEOUT,
                 ErrorCode::UpstreamTimeout,
-                "CurseForge did not answer in time",
+                format!("{source} did not answer in time"),
             ),
             UpstreamFailure::Unreachable => Self::new(
                 StatusCode::BAD_GATEWAY,
                 ErrorCode::UpstreamUnreachable,
-                "CurseForge could not be reached",
+                format!("{source} could not be reached"),
             ),
             UpstreamFailure::TooLarge => Self::new(
                 StatusCode::BAD_GATEWAY,
                 ErrorCode::UpstreamTooLarge,
-                "CurseForge answered with more than the gateway keeps",
+                format!("{source} answered with more than the gateway keeps"),
             ),
             UpstreamFailure::Unreadable => Self::new(
                 StatusCode::BAD_GATEWAY,
                 ErrorCode::UpstreamUnreadable,
-                "CurseForge answered a batch with something other than a list of rows with ids",
+                format!(
+                    "{source} answered a batch with something other than rows the gateway can keep"
+                ),
             ),
         }
     }

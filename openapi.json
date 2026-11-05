@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "content-gateway",
-    "description": "A gateway in front of the CurseForge API that holds the API key, caches answers for every consumer, counts the calls made on the key and holds every consumer off after a 429. `/v1/curseforge/{path}` mirrors `api.curseforge.com/v1/{path}` and answers CurseForge's JSON as it came; the other routes are the gateway's own. Every route but `/v1/healthz` and `/v1/openapi.json` needs a consumer's bearer token.",
+    "description": "A gateway in front of the CurseForge and Modrinth APIs that holds the CurseForge key, caches answers for every consumer, counts the calls made on the key and holds every consumer off after a 429. `/v1/curseforge/{path}` mirrors `api.curseforge.com/v1/{path}` and `/v1/modrinth/{path}` mirrors `api.modrinth.com/v2/{path}`, answering their JSON as it came; `/v1/resolve` finds a download address per CurseForge file; `/v1/minecraft/*` lists Minecraft and mod loader versions from Mojang, NeoForge, Forge and Fabric; the other routes are the gateway's own. Every route but `/v1/healthz` and `/v1/openapi.json` needs a consumer's bearer token.",
     "license": {
       "name": "MIT"
     },
@@ -20,8 +20,21 @@
         "tags": [
           "gateway"
         ],
-        "summary": "This minute's calls per pool, the 429 hold, and the daily counts of the last 14 UTC days.",
+        "summary": "Each upstream's calls this minute per pool, its 429 hold, and its daily counts of the last UTC days.",
         "operationId": "readout",
+        "parameters": [
+          {
+            "name": "days",
+            "in": "query",
+            "description": "UTC days to answer, today included, 1 up; 14 when left out, and more than the days kept answers the days kept.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 1
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "The budget as it stands",
@@ -29,6 +42,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/BudgetSnapshot"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`days` is not a whole number from 1 up",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
                 }
               }
             }
@@ -58,7 +81,7 @@
         ],
         "summary": "What `GET api.curseforge.com/v1/{path}` answers, from the cache while it is fresh.",
         "description": "The query string goes to CurseForge as it came, and the answer comes back with CurseForge's status, content type\nand body, marked `X-Cache`. The routes of the cache table are kept for their fresh time; every other route is\nasked each time. `Cache-Control: no-cache` asks CurseForge again and keeps the new answer. A kept answer that is\nno longer fresh is still given, marked `stale`, when the budget refuses the call or CurseForge fails.",
-        "operationId": "passthrough_get",
+        "operationId": "curseforge_get",
         "parameters": [
           {
             "name": "path",
@@ -188,7 +211,7 @@
         ],
         "summary": "What `POST api.curseforge.com/v1/{path}` answers to this body.",
         "description": "`POST mods` with only `{\"modIds\": [...]}`, `POST mods/files` with only `{\"fileIds\": [...]}`, and\n`POST fingerprints/432` or `POST fingerprints` with only `{\"fingerprints\": [...]}` are answered per id from the\ncache, and only the ids not kept are asked for, 100 per call. Every other body goes to CurseForge each time.",
-        "operationId": "passthrough_post",
+        "operationId": "curseforge_post",
         "parameters": [
           {
             "name": "path",
@@ -353,6 +376,541 @@
         }
       }
     },
+    "/v1/minecraft/loaders/{loader}/versions": {
+      "get": {
+        "tags": [
+          "minecraft"
+        ],
+        "summary": "A loader's builds, newest first: NeoForge from its Maven, Forge's promoted builds (the recommended and the\nlatest per Minecraft version, which is what pickers show), Fabric's loaders from its meta. `minecraft` keeps\nonly the builds for that version; for Fabric, whose loader is not tied to one, that means all of them when\nFabric supports the version and none otherwise. Each list is kept for an hour.",
+        "operationId": "loader_versions",
+        "parameters": [
+          {
+            "name": "loader",
+            "in": "path",
+            "description": "`neoforge`, `forge` or `fabric`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "neoforge"
+          },
+          {
+            "name": "minecraft",
+            "in": "query",
+            "description": "Only the builds for this Minecraft version, such as `1.21.1`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The builds",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoaderVersions"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such loader, `UNKNOWN_LOADER`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The loader's source could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The source did not answer in time, `UPSTREAM_TIMEOUT`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/minecraft/versions": {
+      "get": {
+        "tags": [
+          "minecraft"
+        ],
+        "summary": "The Minecraft versions Mojang lists, releases unless asked otherwise, newest first.",
+        "description": "`loader` keeps only the versions that loader has builds for, which is what a server or pack picker offers.\nMojang's manifest is kept for an hour and the old copy answers when Mojang fails.",
+        "operationId": "minecraft_versions",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "query",
+            "description": "`release` (the default), `snapshot` (snapshots only) or `all` (every kind, old betas and alphas included).",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/VersionFilter"
+            }
+          },
+          {
+            "name": "loader",
+            "in": "query",
+            "description": "Only the versions this loader has at least one build for.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Loader"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The versions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MinecraftVersions"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`INVALID_QUERY`: an unknown `type` or `loader`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Mojang or the loader's source could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The source did not answer in time, `UPSTREAM_TIMEOUT`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/minecraft/versions/{id}": {
+      "get": {
+        "tags": [
+          "minecraft"
+        ],
+        "summary": "One Minecraft version with the Java it needs, from Mojang's own document of the version, kept a day.",
+        "operationId": "minecraft_version",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The version as Mojang names it",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "1.21.1"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MinecraftVersionDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Mojang lists no such version, `UNKNOWN_VERSION`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Mojang could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Mojang did not answer in time, `UPSTREAM_TIMEOUT`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/modrinth/{path}": {
+      "get": {
+        "tags": [
+          "modrinth"
+        ],
+        "summary": "What `GET api.modrinth.com/v2/{path}` answers, from the cache while it is fresh.",
+        "description": "The query string goes to Modrinth as it came, and the answer comes back with Modrinth's status, content type and\nbody, marked `X-Cache`. The routes of the cache table are kept for their fresh time; every other route is asked\neach time. `version_file/{sha1}` is kept per hash and shared with `POST version_files`. `Cache-Control: no-cache`\nasks Modrinth again. Modrinth needs no key but limits calls per address, so every call counts against the\nModrinth budget of the request's pool, and a 429 holds every pool off.",
+        "operationId": "modrinth_get",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "description": "The path under `api.modrinth.com/v2/`, such as `search`, `project/sodium` or `version_file/{sha1}`: segments of letters, digits, `-` and `_`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "search"
+          },
+          {
+            "name": "X-Budget-Pool",
+            "in": "header",
+            "description": "The pool the call draws from. Required when the token has more than one pool",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "Cache-Control",
+            "in": "header",
+            "description": "`no-cache` asks Modrinth again instead of answering from the cache",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Modrinth's answer, as it came",
+            "headers": {
+              "X-Cache": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`hit` from the cache, `miss` from Modrinth, `stale` an old answer given because Modrinth could not be asked"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`INVALID_PATH`, `INVALID_HASH`, `POOL_REQUIRED` or `UNKNOWN_POOL`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Modrinth could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The call was refused: `BUDGET_SPENT` this minute or `UPSTREAM_HOLD` after a 429 from Modrinth",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds until the next call can go out"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Modrinth did not answer in time, `UPSTREAM_TIMEOUT`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other status Modrinth answered, with its body. Only the gateway's own answers lack `X-Cache`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "modrinth"
+        ],
+        "summary": "What `POST api.modrinth.com/v2/{path}` answers to this body.",
+        "description": "`POST version_files` with `{\"hashes\": [...], \"algorithm\": \"sha1\"}` is answered per hash from the cache, keyed by\nlowercase hash with unknown hashes left out as Modrinth does, and only the hashes not kept are asked for, 100 per\ncall, at most 1000 hashes. Every other body goes to Modrinth each time.",
+        "operationId": "modrinth_post",
+        "parameters": [
+          {
+            "name": "path",
+            "in": "path",
+            "description": "The path under `api.modrinth.com/v2/`, such as `version_files` or `version_files/update`: segments of letters, digits, `-` and `_`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "version_files"
+          },
+          {
+            "name": "X-Budget-Pool",
+            "in": "header",
+            "description": "The pool the call draws from. Required when the token has more than one pool",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "Cache-Control",
+            "in": "header",
+            "description": "`no-cache` asks Modrinth again instead of answering from the cache",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The JSON body Modrinth expects at this path; this shape for `version_files`",
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VersionFilesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Modrinth's answer, as it came, or the versions found keyed by hash for `version_files`",
+            "headers": {
+              "X-Cache": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`hit` when every hash was kept, `miss` when Modrinth was asked, `stale` an old answer given because Modrinth could not be asked"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`INVALID_PATH`, `INVALID_BODY` (no hashes, more than 1000, or another algorithm), `INVALID_HASH`, `POOL_REQUIRED` or `UNKNOWN_POOL`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The hashes need more calls than a whole minute allows, `REQUEST_TOO_LARGE`; split them",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Modrinth could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The call was refused: `BUDGET_SPENT` this minute or `UPSTREAM_HOLD` after a 429 from Modrinth",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds until the next call can go out"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Modrinth did not answer in time, `UPSTREAM_TIMEOUT`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other status Modrinth answered, with its body. Only the gateway's own answers lack `X-Cache`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/openapi.json": {
       "get": {
         "tags": [
@@ -370,6 +928,139 @@
             }
           }
         }
+      }
+    },
+    "/v1/resolve": {
+      "post": {
+        "tags": [
+          "gateway"
+        ],
+        "summary": "A download address for each CurseForge file: CurseForge's own link, else Modrinth's copy of the file found by\nits SHA-1, else the file's built address on CurseForge's CDN when a HEAD answers 200 with the file's size.",
+        "description": "The files are read from the cache like `POST /v1/curseforge/mods/files`, and the CurseForge calls for the ones\nnot kept count against the budget. Modrinth answers and CDN verdicts are kept for an hour, misses for 10\nminutes. No bytes pass through the gateway: the consumer downloads from the address given. A null `source` with\n`retry` false means no source has the file; `retry` true means a source could not be asked this time. At worst\na call takes 40 s: 10 s for CurseForge, 10 s for Modrinth and 20 s for the CDN checks.",
+        "operationId": "resolve",
+        "parameters": [
+          {
+            "name": "X-Budget-Pool",
+            "in": "header",
+            "description": "The pool the CurseForge calls draw from. Required when the token has more than one pool",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "Cache-Control",
+            "in": "header",
+            "description": "`no-cache` asks every source again instead of answering from the cache",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "An address per file, in the order asked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Resolved"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`INVALID_BODY`, `POOL_REQUIRED` or `UNKNOWN_POOL`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The files need more CurseForge calls than a whole minute allows, `REQUEST_TOO_LARGE`; split them",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "CurseForge could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The CurseForge call was refused: `BUDGET_SPENT` this minute or `UPSTREAM_HOLD` after a 429",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds until the next call can go out"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "CurseForge did not answer in time, `UPSTREAM_TIMEOUT`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
       }
     }
   },
@@ -410,64 +1101,30 @@
       },
       "BudgetSnapshot": {
         "type": "object",
-        "description": "What `/v1/budget` answers: this minute over all pools and per pool, the 429 hold, and the last 14 UTC days.",
+        "description": "What `/v1/budget` answers: one budget per upstream, under one history and one source.",
         "required": [
-          "limitPerMinute",
-          "used",
-          "withheld",
-          "resetsAt",
+          "historyDays",
           "source",
-          "pools",
-          "days"
+          "curseforge",
+          "modrinth"
         ],
         "properties": {
-          "days": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/DaySnapshot"
-            },
-            "description": "The last 14 UTC days, today first."
+          "curseforge": {
+            "$ref": "#/components/schemas/UpstreamBudget",
+            "description": "The budget of calls on the CurseForge key."
           },
-          "heldUntil": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "format": "date-time",
-            "description": "Until when CurseForge's 429 holds every call off, ISO 8601, or null while no hold is on."
-          },
-          "limitPerMinute": {
+          "historyDays": {
             "type": "integer",
             "format": "int32",
-            "description": "Calls to CurseForge the minute allows over all pools.",
+            "description": "UTC days of daily counts the gateway keeps, the most `days` can cover.",
             "minimum": 0
           },
-          "pools": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/PoolSnapshot"
-            },
-            "description": "Every pool of every consumer, this minute."
-          },
-          "resetsAt": {
-            "type": "string",
-            "format": "date-time",
-            "description": "When this minute's counts start over, ISO 8601."
+          "modrinth": {
+            "$ref": "#/components/schemas/UpstreamBudget",
+            "description": "The budget of calls to Modrinth, which rate-limits the gateway's address."
           },
           "source": {
             "$ref": "#/components/schemas/Source"
-          },
-          "used": {
-            "type": "integer",
-            "format": "int32",
-            "description": "Calls admitted this minute.",
-            "minimum": 0
-          },
-          "withheld": {
-            "type": "integer",
-            "format": "int32",
-            "description": "Calls refused this minute.",
-            "minimum": 0
           }
         }
       },
@@ -566,6 +1223,12 @@
           "POOL_REQUIRED",
           "UNKNOWN_POOL",
           "INVALID_PATH",
+          "INVALID_DAYS",
+          "INVALID_HASH",
+          "INVALID_BODY",
+          "INVALID_QUERY",
+          "UNKNOWN_VERSION",
+          "UNKNOWN_LOADER",
           "UPSTREAM_TIMEOUT",
           "UPSTREAM_UNREACHABLE",
           "UPSTREAM_TOO_LARGE",
@@ -573,6 +1236,15 @@
           "BUDGET_SPENT",
           "UPSTREAM_HOLD",
           "REQUEST_TOO_LARGE"
+        ]
+      },
+      "FileSource": {
+        "type": "string",
+        "description": "Where a file's download address comes from.",
+        "enum": [
+          "curseforge",
+          "modrinth",
+          "curseforge-cdn"
         ]
       },
       "Health": {
@@ -609,6 +1281,159 @@
           }
         }
       },
+      "Latest": {
+        "type": "object",
+        "description": "The newest release and snapshot Mojang names, whatever the filter.",
+        "required": [
+          "release",
+          "snapshot"
+        ],
+        "properties": {
+          "release": {
+            "type": "string"
+          },
+          "snapshot": {
+            "type": "string"
+          }
+        }
+      },
+      "Loader": {
+        "type": "string",
+        "description": "The mod loaders whose versions the gateway lists.",
+        "enum": [
+          "neoforge",
+          "forge",
+          "fabric"
+        ]
+      },
+      "LoaderVersion": {
+        "type": "object",
+        "description": "One build of a loader.",
+        "required": [
+          "version",
+          "stable",
+          "recommended"
+        ],
+        "properties": {
+          "minecraft": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Minecraft version the build is for; null for Fabric, whose loader works with every version it supports."
+          },
+          "recommended": {
+            "type": "boolean",
+            "description": "True for the build its maintainers recommend for the Minecraft version, where they say."
+          },
+          "stable": {
+            "type": "boolean",
+            "description": "False for a beta or pre-release build."
+          },
+          "version": {
+            "type": "string",
+            "description": "Such as `21.1.57` (NeoForge), `52.0.1` (Forge) or `0.16.5` (Fabric)."
+          }
+        }
+      },
+      "LoaderVersions": {
+        "type": "object",
+        "description": "What `GET /v1/minecraft/loaders/{loader}/versions` answers.",
+        "required": [
+          "loader",
+          "versions"
+        ],
+        "properties": {
+          "loader": {
+            "$ref": "#/components/schemas/Loader"
+          },
+          "minecraft": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Minecraft version the list was narrowed to, or null for every build."
+          },
+          "versions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LoaderVersion"
+            },
+            "description": "Newest first."
+          }
+        }
+      },
+      "MinecraftVersion": {
+        "type": "object",
+        "description": "One Minecraft version as Mojang's manifest lists it.",
+        "required": [
+          "id",
+          "type",
+          "releaseTime"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Such as `1.21.1` or `24w33a`."
+          },
+          "releaseTime": {
+            "type": "string",
+            "description": "ISO 8601."
+          },
+          "type": {
+            "$ref": "#/components/schemas/VersionType"
+          }
+        }
+      },
+      "MinecraftVersionDetails": {
+        "type": "object",
+        "description": "What `GET /v1/minecraft/versions/{id}` answers: the version and the Java it needs.",
+        "required": [
+          "id",
+          "type",
+          "releaseTime"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "javaMajor": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The major version of the Java the version runs on, such as 21, or null when Mojang does not say.",
+            "minimum": 0
+          },
+          "releaseTime": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/VersionType"
+          }
+        }
+      },
+      "MinecraftVersions": {
+        "type": "object",
+        "description": "What `GET /v1/minecraft/versions` answers.",
+        "required": [
+          "latest",
+          "versions"
+        ],
+        "properties": {
+          "latest": {
+            "$ref": "#/components/schemas/Latest"
+          },
+          "versions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MinecraftVersion"
+            },
+            "description": "Newest first, as Mojang lists them."
+          }
+        }
+      },
       "PoolSnapshot": {
         "type": "object",
         "description": "One pool's calls this minute.",
@@ -639,6 +1464,109 @@
           }
         }
       },
+      "ResolveRequest": {
+        "type": "object",
+        "description": "The body of `POST /v1/resolve`.",
+        "required": [
+          "fileIds"
+        ],
+        "properties": {
+          "cdn": {
+            "type": "boolean",
+            "description": "Whether a file's built address on CurseForge's CDN may be checked and given when neither CurseForge nor\nModrinth has a link. On unless set to false.",
+            "default": true
+          },
+          "fileIds": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            },
+            "description": "CurseForge file ids, up to 1000.",
+            "example": [
+              4567890,
+              4567891
+            ]
+          }
+        }
+      },
+      "Resolved": {
+        "type": "object",
+        "description": "What `POST /v1/resolve` answers.",
+        "required": [
+          "files"
+        ],
+        "properties": {
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResolvedFile"
+            },
+            "description": "One entry per file id asked for, in the order asked, each id once."
+          }
+        }
+      },
+      "ResolvedFile": {
+        "type": "object",
+        "description": "What `POST /v1/resolve` answers for each file asked for.",
+        "required": [
+          "fileId",
+          "retry"
+        ],
+        "properties": {
+          "fileId": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "fileName": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The file's name as CurseForge lists it, null when CurseForge does not know the file."
+          },
+          "retry": {
+            "type": "boolean",
+            "description": "True when a source could not be asked for the file, so that a null `source` is worth asking again later\nrather than remembering."
+          },
+          "sha1": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The file's SHA-1 as CurseForge lists it, null when CurseForge does not know the file."
+          },
+          "size": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The file's size in bytes as CurseForge lists it, null when CurseForge does not know the file.",
+            "minimum": 0
+          },
+          "source": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FileSource",
+                "description": "Where `url` comes from, or null when no source has the file."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The address to download the file from, or null when no source has it."
+          }
+        }
+      },
       "Source": {
         "type": "string",
         "description": "Where a readout's counts come from: `redis` when they are the stored ones, `memory` when no Redis is configured,\n`unavailable` when Redis did not answer, so the minute is this process's own count and the days hold only what\nis not written to Redis yet.",
@@ -646,6 +1574,108 @@
           "redis",
           "memory",
           "unavailable"
+        ]
+      },
+      "UpstreamBudget": {
+        "type": "object",
+        "description": "One upstream's budget: this minute over all pools and per pool, the 429 hold, and the last UTC days.",
+        "required": [
+          "limitPerMinute",
+          "used",
+          "withheld",
+          "resetsAt",
+          "pools",
+          "days"
+        ],
+        "properties": {
+          "days": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DaySnapshot"
+            },
+            "description": "The UTC days asked for, today first; a day without a single count is left out."
+          },
+          "heldUntil": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "Until when the upstream's 429 holds every call off, ISO 8601, or null while no hold is on."
+          },
+          "limitPerMinute": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Calls the minute allows over all pools.",
+            "minimum": 0
+          },
+          "pools": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PoolSnapshot"
+            },
+            "description": "Every pool of every consumer, this minute."
+          },
+          "resetsAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "When this minute's counts start over, ISO 8601."
+          },
+          "used": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Calls admitted this minute.",
+            "minimum": 0
+          },
+          "withheld": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Calls refused this minute.",
+            "minimum": 0
+          }
+        }
+      },
+      "VersionFilesRequest": {
+        "type": "object",
+        "description": "The body of `POST /v1/modrinth/version_files`.",
+        "required": [
+          "hashes"
+        ],
+        "properties": {
+          "algorithm": {
+            "type": "string",
+            "description": "Only `sha1` is supported.",
+            "example": "sha1"
+          },
+          "hashes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "SHA-1 hashes of the wanted files, 40 hex digits each, up to 1000.",
+            "example": [
+              "3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e"
+            ]
+          }
+        }
+      },
+      "VersionFilter": {
+        "type": "string",
+        "description": "Which versions `GET /v1/minecraft/versions` lists.",
+        "enum": [
+          "release",
+          "snapshot",
+          "all"
+        ]
+      },
+      "VersionType": {
+        "type": "string",
+        "description": "Mojang's kinds of versions.",
+        "enum": [
+          "release",
+          "snapshot",
+          "old_beta",
+          "old_alpha"
         ]
       }
     },
@@ -665,6 +1695,14 @@
     {
       "name": "curseforge",
       "description": "The CurseForge passthrough"
+    },
+    {
+      "name": "modrinth",
+      "description": "The Modrinth passthrough"
+    },
+    {
+      "name": "minecraft",
+      "description": "Minecraft and mod loader version lists"
     }
   ]
 }

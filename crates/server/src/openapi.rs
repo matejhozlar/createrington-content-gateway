@@ -5,10 +5,19 @@ use utoipa::{
 };
 
 use crate::{
-    budget::{self, BudgetSnapshot, DayCounts, DayPoolSnapshot, DaySnapshot, PoolSnapshot, Source},
+    budget::{
+        self, BudgetSnapshot, DayCounts, DayPoolSnapshot, DaySnapshot, PoolSnapshot, Source,
+        UpstreamBudget,
+    },
     curseforge,
     error::{ApiError, ErrorCode},
     health::{self, Health},
+    modrinth::{self, VersionFilesRequest},
+    resolve::{self, FileSource, ResolveRequest, Resolved, ResolvedFile},
+    versions::{
+        self, Latest, Loader, LoaderVersion, LoaderVersions, MinecraftVersion,
+        MinecraftVersionDetails, MinecraftVersions, VersionFilter, VersionType,
+    },
 };
 
 /// The version of the API the document describes, which is the `/v1` of every route. The gateway's own version is
@@ -21,13 +30,15 @@ pub const API_VERSION: &str = "1";
     info(
         title = "content-gateway",
         version = API_VERSION,
-        description = "A gateway in front of the CurseForge API that holds the API key, caches answers for every consumer, counts the calls made on the key and holds every consumer off after a 429. `/v1/curseforge/{path}` mirrors `api.curseforge.com/v1/{path}` and answers CurseForge's JSON as it came; the other routes are the gateway's own. Every route but `/v1/healthz` and `/v1/openapi.json` needs a consumer's bearer token.",
+        description = "A gateway in front of the CurseForge and Modrinth APIs that holds the CurseForge key, caches answers for every consumer, counts the calls made on the key and holds every consumer off after a 429. `/v1/curseforge/{path}` mirrors `api.curseforge.com/v1/{path}` and `/v1/modrinth/{path}` mirrors `api.modrinth.com/v2/{path}`, answering their JSON as it came; `/v1/resolve` finds a download address per CurseForge file; `/v1/minecraft/*` lists Minecraft and mod loader versions from Mojang, NeoForge, Forge and Fabric; the other routes are the gateway's own. Every route but `/v1/healthz` and `/v1/openapi.json` needs a consumer's bearer token.",
         license(name = "MIT"),
     ),
     servers((url = "http://127.0.0.1:5005", description = "The default listen address")),
     tags(
         (name = "gateway", description = "The gateway's own routes"),
         (name = "curseforge", description = "The CurseForge passthrough"),
+        (name = "modrinth", description = "The Modrinth passthrough"),
+        (name = "minecraft", description = "Minecraft and mod loader version lists"),
     ),
     paths(
         health::healthz,
@@ -35,15 +46,36 @@ pub const API_VERSION: &str = "1";
         budget::readout,
         curseforge::passthrough_get,
         curseforge::passthrough_post,
+        modrinth::passthrough_get,
+        modrinth::passthrough_post,
+        resolve::resolve,
+        versions::minecraft_versions,
+        versions::minecraft_version,
+        versions::loader_versions,
     ),
     components(schemas(
         Health,
         BudgetSnapshot,
+        UpstreamBudget,
         PoolSnapshot,
         DaySnapshot,
         DayPoolSnapshot,
         DayCounts,
         Source,
+        VersionFilesRequest,
+        ResolveRequest,
+        Resolved,
+        ResolvedFile,
+        FileSource,
+        MinecraftVersions,
+        Latest,
+        MinecraftVersion,
+        MinecraftVersionDetails,
+        LoaderVersions,
+        LoaderVersion,
+        Loader,
+        VersionType,
+        VersionFilter,
         ApiError,
         ErrorCode,
     )),

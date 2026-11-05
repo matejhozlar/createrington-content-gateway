@@ -22,19 +22,25 @@ use crate::{
     budget::{Budget, TestClock},
     cache::AnswerCache,
     config::{ApiKey, Consumer, Token},
-    curseforge::Upstream,
+    curseforge, modrinth,
     redis_store::RedisStore,
+    resolve::{self, Cdn},
+    upstream::{Source, Upstream},
+    versions::{self, Meta},
 };
 
 pub(crate) const NOV_3_2026_20H: u64 = 1_793_736_000_000;
 pub(crate) const TOKEN: &str = "app-token-0123456789abcdef0123456789";
 pub(crate) const KEY: &str = "test-curseforge-key";
+pub(crate) const USER_AGENT: &str = "test-gateway/0 (https://example.com)";
 
 #[derive(Debug, Clone)]
 pub(crate) struct Seen {
+    pub(crate) base: String,
     pub(crate) method: String,
     pub(crate) uri: String,
     pub(crate) key: Option<String>,
+    pub(crate) user_agent: Option<String>,
     pub(crate) body: String,
 }
 
@@ -66,17 +72,26 @@ impl Mock {
         let answer = Arc::new(answer);
         let calls = Arc::new(AtomicUsize::new(0));
         let recorded = seen.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let served = base.clone();
         let mock = Router::new().fallback(move |request: Request<Body>| {
             let (recorded, answer, calls) = (recorded.clone(), answer.clone(), calls.clone());
+            let base = served.clone();
             async move {
                 let (parts, body) = request.into_parts();
                 let body = body.collect().await.unwrap().to_bytes();
                 let seen = Seen {
+                    base,
                     method: parts.method.to_string(),
                     uri: parts.uri.to_string(),
                     key: parts
                         .headers
                         .get("x-api-key")
+                        .map(|value| value.to_str().unwrap().to_owned()),
+                    user_agent: parts
+                        .headers
+                        .get("user-agent")
                         .map(|value| value.to_str().unwrap().to_owned()),
                     body: String::from_utf8(body.to_vec()).unwrap(),
                 };
@@ -87,11 +102,14 @@ impl Mock {
                 for (name, value) in reply.headers {
                     response = response.header(name, value);
                 }
-                response.body(Body::from(reply.body)).unwrap()
+                let body = if seen.method == "HEAD" {
+                    Body::empty()
+                } else {
+                    Body::from(reply.body)
+                };
+                response.body(body).unwrap()
             }
         });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
         Self { base, seen }
     }
@@ -121,15 +139,62 @@ pub(crate) fn gateway_on(
     timeout: Duration,
     redis: Option<Arc<RedisStore>>,
 ) -> Gateway {
+    gateway_with(mock, limit, timeout, redis, &["launcher"])
+}
+
+fn gateway_with(
+    mock: &Mock,
+    limit: u32,
+    timeout: Duration,
+    redis: Option<Arc<RedisStore>>,
+    pools: &[&str],
+) -> Gateway {
     let clock = TestClock::at(NOV_3_2026_20H);
     let consumers = vec![Consumer {
         name: "app".to_owned(),
         token: Token::new(TOKEN),
-        pools: vec!["launcher".to_owned()],
+        pools: pools.iter().map(|pool| (*pool).to_owned()).collect(),
     }];
     let state = Arc::new(AppState {
-        budget: Budget::new(limit, [("app", "launcher")], clock.clone(), redis.clone()),
-        upstream: Upstream::new(mock.base.clone(), ApiKey::new(KEY), timeout).unwrap(),
+        budget: Budget::new(
+            limit,
+            pools.iter().map(|pool| ("app", *pool)),
+            clock.clone(),
+            redis.clone(),
+        ),
+        modrinth_budget: Budget::new(
+            limit,
+            pools.iter().map(|pool| ("app", *pool)),
+            clock.clone(),
+            redis.clone(),
+        )
+        .named("modrinth", "Modrinth"),
+        upstream: Upstream::new(
+            Source::CurseForge,
+            format!("{}/v1", mock.base),
+            Some(ApiKey::new(KEY)),
+            curseforge::USER_AGENT,
+            timeout,
+        )
+        .unwrap(),
+        modrinth: Upstream::new(
+            Source::Modrinth,
+            format!("{}/v2", mock.base),
+            None,
+            USER_AGENT,
+            modrinth::TIMEOUT,
+        )
+        .unwrap(),
+        cdn: Cdn::new(mock.base.clone(), resolve::CDN_TIMEOUT).unwrap(),
+        meta: Meta::new(
+            mock.base.clone(),
+            mock.base.clone(),
+            mock.base.clone(),
+            mock.base.clone(),
+            USER_AGENT,
+            versions::TIMEOUT,
+        )
+        .unwrap(),
         cache: AnswerCache::new(redis),
         clock: clock.clone(),
         consumers,

@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ContentGateway, ContentGatewayError } from "../src/index.js";
+import {
+  ContentGateway,
+  ContentGatewayError,
+  DEFAULT_TIMEOUT_MS,
+  RESOLVE_TIMEOUT_MS,
+} from "../src/index.js";
 import { FakeGateway, json } from "./gateway.js";
 
 const TOKEN = "app-token-0123456789abcdef0123456789";
@@ -40,21 +45,28 @@ describe("the gateway's own routes", () => {
   });
 
   it("reads the budget with the token and the pool", async () => {
+    const upstream = {
+      limitPerMinute: 300,
+      used: 2,
+      withheld: 0,
+      resetsAt: "2026-11-03T20:01:00Z",
+      heldUntil: null,
+      pools: [],
+      days: [],
+    };
     gateway.reply(
       json(200, {
-        limitPerMinute: 300,
-        used: 2,
-        withheld: 0,
-        resetsAt: "2026-11-03T20:01:00Z",
-        heldUntil: null,
+        historyDays: 90,
         source: "redis",
-        pools: [],
-        days: [],
+        curseforge: upstream,
+        modrinth: { ...upstream, used: 0 },
       }),
     );
-    const budget = await client({ pool: "launcher" }).budget();
-    expect(budget.used).toBe(2);
-    expect(gateway.seen[0]?.url).toBe("/v1/budget");
+    const budget = await client({ pool: "launcher" }).budget({ days: 30 });
+    expect(budget.curseforge.used).toBe(2);
+    expect(budget.modrinth.used).toBe(0);
+    expect(budget.historyDays).toBe(90);
+    expect(gateway.seen[0]?.url).toBe("/v1/budget?days=30");
     expect(gateway.seen[0]?.headers.authorization).toBe(`Bearer ${TOKEN}`);
     expect(gateway.seen[0]?.headers["x-budget-pool"]).toBe("launcher");
   });
@@ -118,6 +130,157 @@ describe("the CurseForge passthrough", () => {
     expect(seen?.headers["content-type"]).toBe("application/json");
     expect(seen?.body).toBe('{"modIds":[1,2]}');
     expect(seen?.headers["x-budget-pool"]).toBe("app");
+  });
+
+  it("sends Modrinth calls through with the pool and looks files up by hash", async () => {
+    gateway.reply(json(200, { hits: [], total_hits: 0 }, "hit"));
+    const search = await client({ pool: "launcher" }).modrinth("/search", {
+      query: { query: "sodium", limit: 20 },
+    });
+    expect(search.cache).toBe("hit");
+    expect(gateway.seen[0]?.method).toBe("GET");
+    expect(gateway.seen[0]?.url).toBe(
+      "/v1/modrinth/search?query=sodium&limit=20",
+    );
+    expect(gateway.seen[0]?.headers["x-budget-pool"]).toBe("launcher");
+
+    gateway.reply(json(200, { id: "v", files: [] }, "miss"));
+    const one = await client({ pool: "launcher" }).modrinthVersionFile(
+      "3E1DD9FB5EA2F0DD4FFCC2B1A7D0BB1A1A9D6A8E",
+      { fresh: true, pool: "app" },
+    );
+    expect(one.cache).toBe("miss");
+    expect(one.body).toEqual({ id: "v", files: [] });
+    expect(gateway.seen[1]?.url).toBe(
+      "/v1/modrinth/version_file/3E1DD9FB5EA2F0DD4FFCC2B1A7D0BB1A1A9D6A8E",
+    );
+    expect(gateway.seen[1]?.headers["cache-control"]).toBe("no-cache");
+    expect(gateway.seen[1]?.headers["x-budget-pool"]).toBe("app");
+
+    gateway.reply(json(404, "", "hit"));
+    const none = await client().modrinthVersionFile("abc");
+    expect(none.status).toBe(404);
+    expect(none.ok).toBe(false);
+
+    gateway.reply(json(200, {}, "hit"));
+    await client().modrinthVersionFiles(["abc", "def"]);
+    expect(gateway.seen[3]?.method).toBe("POST");
+    expect(gateway.seen[3]?.url).toBe("/v1/modrinth/version_files");
+    expect(gateway.seen[3]?.body).toBe(
+      '{"hashes":["abc","def"],"algorithm":"sha1"}',
+    );
+  });
+
+  it("resolves files with the pool and without the CDN when asked", async () => {
+    gateway.reply(
+      json(200, {
+        files: [
+          {
+            fileId: 1,
+            source: "curseforge-cdn",
+            url: "https://mediafilez.forgecdn.net/files/0/1/a.jar",
+            sha1: "abc",
+            fileName: "a.jar",
+            size: 10,
+            retry: false,
+          },
+        ],
+      }),
+    );
+    const resolved = await client({ pool: "launcher" }).resolve([1, 1], {
+      cdn: false,
+      pool: "app",
+    });
+    expect(resolved.files[0]?.source).toBe("curseforge-cdn");
+    expect(gateway.seen[0]?.url).toBe("/v1/resolve");
+    expect(gateway.seen[0]?.body).toBe('{"fileIds":[1,1],"cdn":false}');
+    expect(gateway.seen[0]?.headers["x-budget-pool"]).toBe("app");
+
+    gateway.reply(
+      json(503, {
+        code: "BUDGET_SPENT",
+        message: "spent",
+        pool: "app",
+        retryAfterMs: 1000,
+      }),
+    );
+    const error = (await client()
+      .resolve([2])
+      .catch((error: unknown) => error)) as ContentGatewayError;
+    expect(error).toBeInstanceOf(ContentGatewayError);
+    expect(error.code).toBe("BUDGET_SPENT");
+  });
+
+  it("gives resolve longer than the gateway's three sources in a row", async () => {
+    const gatewayWorstCaseMs = 10_000 + 10_000 + 20_000;
+    expect(RESOLVE_TIMEOUT_MS).toBeGreaterThan(gatewayWorstCaseMs);
+    expect(DEFAULT_TIMEOUT_MS).toBeGreaterThan(10_000);
+
+    gateway.reply({ ...json(200, { files: [] }), delayMs: 50 });
+    const error = (await client({ timeoutMs: 10 })
+      .resolve([1], { timeoutMs: 10 })
+      .catch((error: unknown) => error)) as Error;
+    expect(error.name).toBe("TimeoutError");
+  });
+
+  it("lists Minecraft and loader versions", async () => {
+    gateway.reply(
+      json(200, {
+        latest: { release: "1.21.1", snapshot: "24w33a" },
+        versions: [
+          {
+            id: "1.21.1",
+            type: "release",
+            releaseTime: "2024-08-08T00:00:00Z",
+          },
+        ],
+      }),
+    );
+    const versions = await client().minecraftVersions({ loader: "neoforge" });
+    expect(versions.versions[0]?.id).toBe("1.21.1");
+    expect(gateway.seen[0]?.url).toBe("/v1/minecraft/versions?loader=neoforge");
+
+    gateway.reply(
+      json(200, {
+        id: "1.21.1",
+        type: "release",
+        releaseTime: "2024-08-08T00:00:00Z",
+        javaMajor: 21,
+      }),
+    );
+    const version = await client().minecraftVersion("1.21.1");
+    expect(version.javaMajor).toBe(21);
+    expect(gateway.seen[1]?.url).toBe("/v1/minecraft/versions/1.21.1");
+
+    gateway.reply(
+      json(200, {
+        loader: "neoforge",
+        minecraft: "1.21.1",
+        versions: [
+          {
+            version: "21.1.72",
+            minecraft: "1.21.1",
+            stable: true,
+            recommended: false,
+          },
+        ],
+      }),
+    );
+    const builds = await client().loaderVersions("neoforge", {
+      minecraft: "1.21.1",
+    });
+    expect(builds.versions[0]?.version).toBe("21.1.72");
+    expect(gateway.seen[2]?.url).toBe(
+      "/v1/minecraft/loaders/neoforge/versions?minecraft=1.21.1",
+    );
+
+    gateway.reply(
+      json(404, { code: "UNKNOWN_VERSION", message: "no such version" }),
+    );
+    const error = (await client()
+      .minecraftVersion("1.99")
+      .catch((error: unknown) => error)) as ContentGatewayError;
+    expect(error.code).toBe("UNKNOWN_VERSION");
   });
 
   it("refuses a GET with a body before sending anything", async () => {

@@ -1,5 +1,13 @@
 # @createrington/content-gateway-client
 
+## 0.2.0
+
+### Minor Changes
+
+- ab889dd: `budget()` takes `{ days, signal }` and asks `/v1/budget?days=` for up to the gateway's `historyDays` of daily counts, which the snapshot now reports; `INVALID_DAYS` is a new error code. The bare `budget(signal)` form is gone.
+- 33e193f: `minecraftVersions({ type, loader })`, `minecraftVersion(id)` and `loaderVersions(loader, { minecraft })` read the gateway's Minecraft and mod loader version lists under `/v1/minecraft/*`, typed as `MinecraftVersions`, `MinecraftVersionDetails` and `LoaderVersions`. New error codes `INVALID_QUERY`, `UNKNOWN_VERSION` and `UNKNOWN_LOADER`.
+- 190c230: `modrinth(path, request)` sends any Modrinth call through the gateway like `curseforge()`, with `modrinthVersionFile(sha1)` and `modrinthVersionFiles(hashes)` for the SHA-1 lookups and loose schemas (`modrinthProjectSchema`, `modrinthSearchSchema`, `modrinthVersionSchema`, `modrinthVersionFilesSchema`, `modrinthTagSchema`, `modrinthGameVersionSchema`) plus `modrinthFileUrl` to read the answers; `resolve(fileIds, options)` reads `POST /v1/resolve`, typed as `Resolved`. `budget()` now answers one `UpstreamBudget` for CurseForge and one for Modrinth under `curseforge` and `modrinth`, which replaces the flat shape of 0.1.0. `CurseForgeAnswer` is now an alias of `PassthroughAnswer`. New error codes `INVALID_HASH` and `INVALID_BODY`.
+
 ## 0.1.0
 
 ### Minor Changes
