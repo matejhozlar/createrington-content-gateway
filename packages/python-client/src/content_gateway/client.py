@@ -556,14 +556,19 @@ def modrinth_file_url(version: Mapping[str, Any], sha1: str) -> str | None:
     """The `https://cdn.modrinth.com` address of the file with this SHA-1 in a Modrinth version, or `None`; other files of the version and other hosts never count."""
     wanted = sha1.lower()
     for file in version.get("files") or ():
-        hashes = file.get("hashes") or {}
-        found = hashes.get("sha1")
+        if not isinstance(file, Mapping):
+            continue
+        hashes = file.get("hashes")
+        found = hashes.get("sha1") if isinstance(hashes, Mapping) else None
         if not isinstance(found, str) or found.lower() != wanted:
             continue
         url = file.get("url")
         if not isinstance(url, str):
             continue
-        parts = urlsplit(url)
+        try:
+            parts = urlsplit(url)
+        except ValueError:
+            continue
         if parts.scheme == "https" and parts.hostname == MODRINTH_CDN_HOST:
             return url
     return None

@@ -274,12 +274,20 @@ def test_modrinth_file_url_picks_the_matching_file_on_the_cdn() -> None:
             {"hashes": {"sha1": "bbb"}, "url": "https://example.com/b.jar"},
             {"hashes": {"sha1": "ccc"}, "url": "http://cdn.modrinth.com/c.jar"},
             {"hashes": {}, "url": "https://cdn.modrinth.com/d.jar"},
+            {"hashes": {"sha1": "eee"}, "url": "https://[broken/e.jar"},
+            {"hashes": {"sha1": "fff"}, "url": "https://[broken/f.jar"},
+            {"hashes": {"sha1": "fff"}, "url": "https://cdn.modrinth.com/f.jar"},
+            "not a file",
+            {"hashes": "not hashes", "url": "https://cdn.modrinth.com/g.jar"},
         ]
     }
     assert modrinth_file_url(version, "aaa") == "https://cdn.modrinth.com/data/x/a.jar"
     assert modrinth_file_url(version, "bbb") is None
     assert modrinth_file_url(version, "ccc") is None
     assert modrinth_file_url(version, "ddd") is None
+    assert modrinth_file_url(version, "eee") is None
+    assert modrinth_file_url(version, "fff") == "https://cdn.modrinth.com/f.jar"
+    assert modrinth_file_url(version, "ggg") is None
     assert modrinth_file_url({}, "aaa") is None
 
 
