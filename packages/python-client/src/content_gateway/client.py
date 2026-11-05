@@ -25,10 +25,10 @@ from .generated import (
 )
 
 DEFAULT_TIMEOUT = 15.0
-"""How long one request to the gateway may take, in seconds, above the 10 s it gives an upstream."""
+"""How long each phase of a request to the gateway may take (connecting, a read, a write), in seconds, above the 10 s it gives an upstream."""
 
 RESOLVE_TIMEOUT = 60.0
-"""How long `resolve()` may take unless told otherwise, above the gateway's 40 s worst case."""
+"""The same for `resolve()` unless told otherwise, above the gateway's 40 s worst case."""
 
 MODRINTH_CDN_HOST = "cdn.modrinth.com"
 """The host every Modrinth download address is on."""

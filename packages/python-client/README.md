@@ -60,7 +60,7 @@ The call is sent again after each refusal that fits in what is left of `wait_up_
 
 ### Timeouts and connections
 
-Every request is abandoned after `timeout` seconds, 15 by default. The gateway gives CurseForge 10 s before it answers `504` or a stale answer, so keep the client's timeout above that: a stalled call then comes back as the gateway's answer instead of an `httpx.TimeoutException` here. The client keeps connections to the gateway open between calls; pass your own `httpx.Client` or `httpx.AsyncClient` as `client` to change that or to test (an `httpx.MockTransport` makes a fake gateway).
+`timeout`, 15 s by default, is httpx's limit on each phase of a request (connecting, waiting for a read, a write), not on the whole call; the gateway answers in one body, so a call ends within it in practice. The gateway gives CurseForge 10 s before it answers `504` or a stale answer, so keep the client's timeout above that: a stalled call then comes back as the gateway's answer instead of an `httpx.TimeoutException` here. The client keeps connections to the gateway open between calls; pass your own `httpx.Client` or `httpx.AsyncClient` as `client` to change that or to test (an `httpx.MockTransport` makes a fake gateway).
 
 ## Development
 
