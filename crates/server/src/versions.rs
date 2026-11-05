@@ -29,12 +29,10 @@ const FORGE_PATH: &str = "/net/minecraftforge/forge/promotions_slim.json";
 const FABRIC_LOADER_PATH: &str = "/v2/versions/loader";
 const FABRIC_GAME_PATH: &str = "/v2/versions/game";
 const LIST_FRESH_MS: u64 = HOUR_MS;
-/// Minecraft 26.1 was the first version named after its year; NeoForge's builds for it start with the year too.
 const FIRST_YEAR_VERSION: u32 = 26;
 const DETAILS_FRESH_MS: u64 = DAY_MS;
 
-/// The clients that read the public version lists: Mojang's manifest, NeoForge's Maven, Forge's promotions and
-/// Fabric's meta. None needs a key or a budget.
+/// The clients that read the public version lists, which need no key and no budget.
 pub struct Meta {
     client: reqwest::Client,
     mojang: String,
@@ -260,8 +258,6 @@ fn failed(failure: UpstreamFailure, name: &'static str) -> Response {
     ApiError::upstream(failure, name).into_response()
 }
 
-/// A document from one of the sources, from the cache while fresh, fetched once for everyone asking, and the old
-/// copy when the source fails.
 async fn document(
     state: &Arc<AppState>,
     key: &str,
@@ -342,8 +338,6 @@ async fn neoforge(state: &Arc<AppState>) -> Result<Vec<LoaderVersion>, UpstreamF
         .collect())
 }
 
-/// The Minecraft version a NeoForge build is for. Up to Minecraft 1.21, NeoForge `X.Y.Z` is for `1.X.Y` (`1.X`
-/// when `Y` is 0). From Minecraft's year-based names on, NeoForge `Y.D.H.B` is for `Y.D.H` (`Y.D` when `H` is 0).
 fn neoforge_minecraft(version: &str) -> Option<String> {
     let mut parts = version.split(['.', '-']);
     let first: u32 = parts.next()?.parse().ok()?;
@@ -434,7 +428,6 @@ fn source_name(loader: Loader) -> &'static str {
     }
 }
 
-/// The Minecraft versions `loader` has at least one build for.
 async fn supported(
     state: &Arc<AppState>,
     loader: Loader,

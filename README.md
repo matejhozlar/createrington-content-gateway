@@ -2,9 +2,7 @@
 
 A small HTTP service that sits between your own services and the [CurseForge](https://docs.curseforge.com/rest-api/) and [Modrinth](https://docs.modrinth.com/api/) APIs. It holds the CurseForge API key so your services do not have to, shares one cache between all of them, counts every call made on the key, and holds every caller off when CurseForge answers 429.
 
-> **Status:** early. Consumers, tokens, the call budget, the CurseForge passthrough with its cache, the OpenAPI document and the TypeScript client exist. The rest is being built in the open; the plan lives in [Createrington/app#1692](https://gitea.matejhoz.com/Createrington/app/issues/1692).
-
-## What it will do
+## What it does
 
 - **Pass CurseForge through.** `/v1/curseforge/*` mirrors `api.curseforge.com/v1/*`: same paths, same JSON, with the gateway's key.
 - **Cache once for everyone.** Answers are cached per route, list requests (`/mods`, `/mods/files`, fingerprints) are cached per id, and identical requests in flight share one upstream call.
@@ -97,7 +95,7 @@ RestartSec=5
 User=content-gateway
 ```
 
-This is how the gateway runs for Createrington: `.gitea/workflows/deploy.yml` builds the binary when a release merges into `main`, writes `.env` from Infisical, keeps the previous binary and `.env` as `content-gateway.previous` and `.env.previous`, touches `.restart-trigger` for a systemd path unit that restarts the service, and waits until `/v1/healthz` reports the deployed commit and build time; when it does not, the previous build is put back and restarted. The directory and the Infisical project come from the `DEPLOY_DIR` and `INFISICAL_PROJECT_ID` repository variables, the Infisical credentials from secrets.
+`.gitea/workflows/deploy.yml` is an example of that deploy for Gitea Actions: it builds the binary when a release merges into `main`, writes `.env` from [Infisical](https://infisical.com/), keeps the previous binary and `.env` as `content-gateway.previous` and `.env.previous`, touches `.restart-trigger` for a systemd path unit that restarts the service, and waits until `/v1/healthz` reports the deployed commit and build time; when it does not, the previous build is put back and restarted. The directory and the Infisical project come from the `DEPLOY_DIR` and `INFISICAL_PROJECT_ID` repository variables, the Infisical credentials from secrets.
 
 ## Endpoints
 
@@ -171,7 +169,7 @@ A null `source` with `retry` false means no source has the file and the consumer
 
 ### Minecraft and loader versions
 
-These routes replace the version lists every consumer used to fetch and cache itself. The sources need no key: Mojang's `version_manifest_v2.json`, NeoForge's Maven, Forge's `promotions_slim.json` and Fabric's meta. Each document is kept for an hour (a version's own document a day), fetched once for everyone asking, and the old copy keeps answering for a day after that when its source fails, so a short outage does not empty a picker. They draw from no budget.
+These routes serve the version lists so that no consumer fetches and caches them itself. The sources need no key: Mojang's `version_manifest_v2.json`, NeoForge's Maven, Forge's `promotions_slim.json` and Fabric's meta. Each document is kept for an hour (a version's own document a day), fetched once for everyone asking, and the old copy keeps answering for a day after that when its source fails, so a short outage does not empty a picker. They draw from no budget.
 
 - `GET /v1/minecraft/versions?type=release&loader=neoforge`: the versions Mojang lists, newest first, with `latest.release` and `latest.snapshot`. `type` is `release` (the default), `snapshot` or `all`. `loader` keeps only the versions that loader has at least one build for, which is what a server or pack picker should offer.
 - `GET /v1/minecraft/versions/{id}`: one version with `javaMajor`, the Java it runs on, from Mojang's document of the version; `404 UNKNOWN_VERSION` for an id Mojang does not list.
@@ -188,7 +186,8 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 pnpm install        # Prettier, the pre-commit hook, the Infisical CLI and the client's dependencies
-pnpm dev            # cargo run with the env injected from Infisical (maintainers)
+cargo run           # the gateway on 127.0.0.1:5005 with the variables exported in the shell
+pnpm dev            # the same with the env injected from Infisical, for the maintainers
 pnpm openapi        # rewrite openapi.json and the client's generated types after a route or type changed
 pnpm test           # the client's tests; pnpm typecheck and pnpm build likewise
 pnpm format:check

@@ -15,12 +15,7 @@ const PAUSE_AFTER_FAILURE: Duration = Duration::from_secs(5);
 const RECONNECT_RETRIES: usize = 2;
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(1);
 
-/// The connection to Redis, which keeps the gateway's state across restarts.
-///
-/// It connects on first use and reconnects by itself. A command that fails or
-/// takes longer than a second makes the store skip Redis for five seconds, so
-/// callers fall back to memory without waiting on it. Losing Redis and getting
-/// it back are each logged once. Every key starts with the store's prefix.
+/// The connection to Redis, skipped for five seconds after a failure or a slow answer so callers fall back to memory.
 pub struct RedisStore {
     connection: ConnectionManager,
     prefix: String,
@@ -60,8 +55,7 @@ impl RedisStore {
         format!("{}:{name}", self.prefix)
     }
 
-    /// Runs one operation, or answers `None` without trying while Redis is skipped. A failure or a slow answer is
-    /// `None` too and makes the store skip Redis for a while.
+    /// Runs one operation, or answers `None` without trying while Redis is skipped.
     pub async fn run<T, F, Fut>(&self, operation: F) -> Option<T>
     where
         F: FnOnce(ConnectionManager) -> Fut,

@@ -62,7 +62,7 @@ Every request is abandoned after `timeoutMs`, 15 s by default. The gateway gives
 
 ### Schemas
 
-The `curseforge*Schema` objects describe what consumers read of CurseForge's answers, seeded from the Createrington app: project, file, category, Minecraft version, mod loader, fingerprint matches. They are loose, so a field CurseForge adds passes through and a field nobody reads is simply not listed. `curseforgeData(row)`, `curseforgeList(row)` and `curseforgePage(row)` wrap a row schema in the `{ data }`, `{ data: [] }` and `{ data: [], pagination }` shapes CurseForge answers. The constants (`CURSEFORGE_MINECRAFT_GAME_ID`, `CurseForgeModLoaderType`, `CurseForgeRelationType`, ...) are CurseForge's vocabulary.
+The `curseforge*Schema` objects describe what consumers read of CurseForge's answers: project, file, category, Minecraft version, mod loader, fingerprint matches. They are loose, so a field CurseForge adds passes through and a field nobody reads is simply not listed. `curseforgeData(row)`, `curseforgeList(row)` and `curseforgePage(row)` wrap a row schema in the `{ data }`, `{ data: [] }` and `{ data: [], pagination }` shapes CurseForge answers. The constants (`CURSEFORGE_MINECRAFT_GAME_ID`, `CurseForgeModLoaderType`, `CurseForgeRelationType`, ...) are CurseForge's vocabulary.
 
 A consumer that needs more of a file than its ids extends the file schema for the route it knows: `curseforgeFileSchema.extend({ fileName: z.string() })`.
 

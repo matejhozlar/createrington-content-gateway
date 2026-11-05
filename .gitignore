@@ -14,8 +14,10 @@ dist
 .env.*
 !.env.example
 
-# Editors
+# Editors and tools
 .vscode/*
 !.vscode/extensions.json
 .idea
+.claude
+.cursor
 .DS_Store

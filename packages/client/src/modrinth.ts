@@ -3,9 +3,6 @@ import { z } from "zod/v4";
 /** The host every Modrinth download address is on; an address elsewhere is not Modrinth's copy of a file. */
 export const MODRINTH_CDN_HOST = "cdn.modrinth.com";
 
-// The answers consumers read, as https://docs.modrinth.com/api/ describes
-// them. Every object is loose: fields Modrinth adds pass through.
-
 export const modrinthHashesSchema = z.looseObject({
   sha1: z.string().nullish(),
   sha512: z.string().nullish(),
@@ -123,11 +120,7 @@ export type ModrinthSearch = z.infer<typeof modrinthSearchSchema>;
 export type ModrinthTag = z.infer<typeof modrinthTagSchema>;
 export type ModrinthGameVersion = z.infer<typeof modrinthGameVersionSchema>;
 
-/**
- * The address of Modrinth's own copy of the file with this SHA-1 in a version,
- * or `null`: only the file whose own hash matches counts, never another file
- * of the same version, and only an address on Modrinth's CDN.
- */
+/** The `https://cdn.modrinth.com` address of the file with this SHA-1 in a version, or `null`; other files of the version and other hosts never count. */
 export function modrinthFileUrl(
   version: ModrinthVersion,
   sha1: string,
@@ -141,7 +134,7 @@ export function modrinthFileUrl(
         return file.url;
       }
     } catch {
-      // not an address at all
+      continue;
     }
   }
   return null;

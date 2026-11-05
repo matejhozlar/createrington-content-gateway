@@ -1,5 +1,3 @@
-// Writes src/generated/openapi.ts from the gateway's openapi.json, or with
-// --check only says whether the checked-in file is what it would write.
 import { readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import openapiTS, { astToString } from "openapi-typescript";

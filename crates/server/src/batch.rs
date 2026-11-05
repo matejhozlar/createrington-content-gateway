@@ -23,9 +23,7 @@ use crate::passthrough::{HOUR_MS, MINUTE_MS};
 
 pub const IDS_PER_CALL: usize = 100;
 
-/// A batch route of CurseForge whose answer is made of rows per id: `POST /mods`, `POST /mods/files`, and
-/// `POST /fingerprints` with or without Minecraft's game id, where an id is a fingerprint and its rows are the files
-/// that have it.
+/// A CurseForge batch route answered per id: `POST /mods`, `POST /mods/files` and `POST /fingerprints`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Batch {
     Mods,
@@ -198,8 +196,7 @@ struct Mine {
     finisher: Finisher,
 }
 
-/// The kept rows of a batch, and whether they came from the cache (`hit`), from CurseForge (`miss`) or are old
-/// answers given because CurseForge could not be asked (`stale`).
+/// The kept rows of a batch and whether they were a `hit`, a `miss` or `stale`.
 pub struct Rows {
     pub rows: Vec<(u64, Bytes)>,
     pub cache: &'static str,
@@ -241,8 +238,7 @@ pub async fn answer(
     passthrough::respond(&json(body), cache)
 }
 
-/// The rows of these ids (each once), from the cache while fresh, the rest asked for 100 per call. An id CurseForge
-/// does not know has no row. The error is the response to give when the rows could not be had.
+/// The rows of these ids from the cache while fresh, the rest asked for 100 per call.
 pub async fn rows(
     state: Arc<AppState>,
     pool: Pool,

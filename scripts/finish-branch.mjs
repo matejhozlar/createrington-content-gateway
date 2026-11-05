@@ -1,7 +1,3 @@
-// Back to dev once a branch is merged: checks it out, brings it up to date, and
-// deletes the branch you were on. Refuses when tracked files have uncommitted
-// changes (untracked files are left alone). Pass --force to delete a branch git
-// does not see as merged (a squash merge, for instance).
 import {
   checkout,
   fail,

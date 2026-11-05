@@ -20,8 +20,7 @@ use crate::{
     },
 };
 
-/// The version of the API the document describes, which is the `/v1` of every route. The gateway's own version is
-/// what `/v1/healthz` reports.
+/// The version of the API the document describes, the `1` of `/v1`.
 pub const API_VERSION: &str = "1";
 
 /// The OpenAPI document of the gateway's routes, served at `/v1/openapi.json` and checked in as `openapi.json`.

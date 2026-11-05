@@ -1,5 +1,3 @@
-// Shared by the branch scripts: a git runner, and the step that brings a local
-// branch up to date with origin.
 import { execFileSync } from "node:child_process";
 
 export function git(args) {
@@ -35,9 +33,6 @@ export function checkout(branch) {
   }
 }
 
-// Fast-forwards the checked out branch to origin. When the branch holds commits
-// that were never pushed a fast-forward is not possible, so origin is merged
-// into it and the commits stay local. Expects a fetch to have run.
 export function update(branch) {
   const remote = `origin/${branch}`;
   const unpushed = Number(git(["rev-list", "--count", `${remote}..${branch}`]));

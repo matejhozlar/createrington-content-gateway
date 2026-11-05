@@ -40,9 +40,7 @@ pub const fn fresh(found_ms: u64, not_found_ms: Option<u64>) -> Option<Freshness
     })
 }
 
-/// A path segment `source` may be asked for: letters, digits, `-` and `_`, plus for Modrinth the other characters
-/// its slugs may hold (`.`, `+`, `!`, `(`, `)`, `~`, `'`, `,`, `@`, `$`). Never `.` or `..` alone, nor anything that
-/// could change the request, such as `/`, `%`, `?` or `#`.
+/// Whether `segment` may be sent to `source`: letters, digits, `-`, `_` and for Modrinth its slug characters.
 pub fn valid_segment(source: Source, segment: &str) -> bool {
     let slug_byte = |byte: u8| source == Source::Modrinth && b".+!()~',@$".contains(&byte);
     !segment.is_empty()
@@ -87,8 +85,7 @@ pub struct Request {
     pub body: Bytes,
 }
 
-/// What `{method} {path}` of `source` answers, from the cache while it is fresh, as the CurseForge and Modrinth
-/// passthroughs do.
+/// What `{method} {path}` of `source` answers, from the cache while it is fresh.
 pub async fn passthrough(state: Arc<AppState>, source: Source, request: Request) -> Response {
     let Request {
         path,
