@@ -17,6 +17,7 @@ use crate::{
     redis_store::RedisStore,
     resolve::{self, CURSEFORGE_CDN, Cdn},
     upstream::{Source, Upstream},
+    versions::{self, FABRIC_META, FORGE_FILES, MOJANG_META, Meta, NEOFORGE_MAVEN},
 };
 
 pub struct AppState {
@@ -28,6 +29,7 @@ pub struct AppState {
     pub upstream: Upstream,
     pub modrinth: Upstream,
     pub cdn: Cdn,
+    pub meta: Meta,
     pub cache: AnswerCache,
     pub clock: Arc<dyn Clock>,
 }
@@ -87,6 +89,14 @@ impl AppState {
                 modrinth::TIMEOUT,
             )?,
             cdn: Cdn::new(CURSEFORGE_CDN, resolve::CDN_TIMEOUT)?,
+            meta: Meta::new(
+                MOJANG_META,
+                NEOFORGE_MAVEN,
+                FORGE_FILES,
+                FABRIC_META,
+                &config.modrinth_user_agent,
+                versions::TIMEOUT,
+            )?,
             cache: AnswerCache::new(redis),
             clock,
             consumers: config.consumers.clone(),
@@ -106,6 +116,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(modrinth::passthrough_get).post(modrinth::passthrough_post),
         )
         .route("/v1/resolve", post(resolve::resolve))
+        .route("/v1/minecraft/versions", get(versions::minecraft_versions))
+        .route(
+            "/v1/minecraft/versions/{id}",
+            get(versions::minecraft_version),
+        )
+        .route(
+            "/v1/minecraft/loaders/{loader}/versions",
+            get(versions::loader_versions),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,
@@ -149,6 +168,15 @@ pub(crate) fn test_state(consumers: Vec<Consumer>) -> Arc<AppState> {
         )
         .unwrap(),
         cdn: Cdn::new("http://127.0.0.1:9", resolve::CDN_TIMEOUT).unwrap(),
+        meta: Meta::new(
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9",
+            "http://127.0.0.1:9",
+            modrinth::DEFAULT_USER_AGENT,
+            versions::TIMEOUT,
+        )
+        .unwrap(),
         cache: AnswerCache::default(),
         clock: Arc::new(SystemClock),
         consumers,

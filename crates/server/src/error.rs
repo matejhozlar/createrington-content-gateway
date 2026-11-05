@@ -19,6 +19,9 @@ pub enum ErrorCode {
     InvalidDays,
     InvalidHash,
     InvalidBody,
+    InvalidQuery,
+    UnknownVersion,
+    UnknownLoader,
     UpstreamTimeout,
     UpstreamUnreachable,
     UpstreamTooLarge,
@@ -108,6 +111,30 @@ impl ApiError {
             StatusCode::BAD_REQUEST,
             ErrorCode::InvalidBody,
             format!("the body must be {expected}"),
+        )
+    }
+
+    pub fn invalid_query(expected: &str) -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidQuery,
+            format!("the query must be {expected}"),
+        )
+    }
+
+    pub fn unknown_version(id: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::UnknownVersion,
+            format!("Mojang lists no Minecraft version {id:?}"),
+        )
+    }
+
+    pub fn unknown_loader() -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::UnknownLoader,
+            "the loaders are neoforge, forge and fabric",
         )
     }
 

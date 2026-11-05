@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "content-gateway",
-    "description": "A gateway in front of the CurseForge and Modrinth APIs that holds the CurseForge key, caches answers for every consumer, counts the calls made on the key and holds every consumer off after a 429. `/v1/curseforge/{path}` mirrors `api.curseforge.com/v1/{path}` and `/v1/modrinth/{path}` mirrors `api.modrinth.com/v2/{path}`, answering their JSON as it came; `/v1/resolve` finds a download address per CurseForge file; the other routes are the gateway's own. Every route but `/v1/healthz` and `/v1/openapi.json` needs a consumer's bearer token.",
+    "description": "A gateway in front of the CurseForge and Modrinth APIs that holds the CurseForge key, caches answers for every consumer, counts the calls made on the key and holds every consumer off after a 429. `/v1/curseforge/{path}` mirrors `api.curseforge.com/v1/{path}` and `/v1/modrinth/{path}` mirrors `api.modrinth.com/v2/{path}`, answering their JSON as it came; `/v1/resolve` finds a download address per CurseForge file; `/v1/minecraft/*` lists Minecraft and mod loader versions from Mojang, NeoForge, Forge and Fabric; the other routes are the gateway's own. Every route but `/v1/healthz` and `/v1/openapi.json` needs a consumer's bearer token.",
     "license": {
       "name": "MIT"
     },
@@ -374,6 +374,258 @@
             }
           }
         }
+      }
+    },
+    "/v1/minecraft/loaders/{loader}/versions": {
+      "get": {
+        "tags": [
+          "minecraft"
+        ],
+        "summary": "A loader's builds, newest first: NeoForge from its Maven, Forge's promoted builds (the recommended and the\nlatest per Minecraft version, which is what pickers show), Fabric's loaders from its meta. `minecraft` keeps\nonly the builds for that version; for Fabric, whose loader is not tied to one, that means all of them when\nFabric supports the version and none otherwise. Each list is kept for an hour.",
+        "operationId": "loader_versions",
+        "parameters": [
+          {
+            "name": "loader",
+            "in": "path",
+            "description": "`neoforge`, `forge` or `fabric`",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "neoforge"
+          },
+          {
+            "name": "minecraft",
+            "in": "query",
+            "description": "Only the builds for this Minecraft version, such as `1.21.1`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The builds",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoaderVersions"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such loader, `UNKNOWN_LOADER`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The loader's source could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The source did not answer in time, `UPSTREAM_TIMEOUT`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/minecraft/versions": {
+      "get": {
+        "tags": [
+          "minecraft"
+        ],
+        "summary": "The Minecraft versions Mojang lists, releases unless asked otherwise, newest first.",
+        "description": "`loader` keeps only the versions that loader has builds for, which is what a server or pack picker offers.\nMojang's manifest is kept for an hour and the old copy answers when Mojang fails.",
+        "operationId": "minecraft_versions",
+        "parameters": [
+          {
+            "name": "type",
+            "in": "query",
+            "description": "`release` (the default), `snapshot` (snapshots only) or `all` (every kind, old betas and alphas included).",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/VersionFilter"
+            }
+          },
+          {
+            "name": "loader",
+            "in": "query",
+            "description": "Only the versions this loader has at least one build for.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Loader"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The versions",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MinecraftVersions"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`INVALID_QUERY`: an unknown `type` or `loader`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Mojang or the loader's source could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "The source did not answer in time, `UPSTREAM_TIMEOUT`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/minecraft/versions/{id}": {
+      "get": {
+        "tags": [
+          "minecraft"
+        ],
+        "summary": "One Minecraft version with the Java it needs, from Mojang's own document of the version, kept a day.",
+        "operationId": "minecraft_version",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The version as Mojang names it",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "1.21.1"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The version",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MinecraftVersionDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Mojang lists no such version, `UNKNOWN_VERSION`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Mojang could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Mojang did not answer in time, `UPSTREAM_TIMEOUT`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
       }
     },
     "/v1/modrinth/{path}": {
@@ -974,6 +1226,9 @@
           "INVALID_DAYS",
           "INVALID_HASH",
           "INVALID_BODY",
+          "INVALID_QUERY",
+          "UNKNOWN_VERSION",
+          "UNKNOWN_LOADER",
           "UPSTREAM_TIMEOUT",
           "UPSTREAM_UNREACHABLE",
           "UPSTREAM_TOO_LARGE",
@@ -1023,6 +1278,159 @@
             "type": "string",
             "description": "The gateway's version, as released.",
             "example": "0.1.0"
+          }
+        }
+      },
+      "Latest": {
+        "type": "object",
+        "description": "The newest release and snapshot Mojang names, whatever the filter.",
+        "required": [
+          "release",
+          "snapshot"
+        ],
+        "properties": {
+          "release": {
+            "type": "string"
+          },
+          "snapshot": {
+            "type": "string"
+          }
+        }
+      },
+      "Loader": {
+        "type": "string",
+        "description": "The mod loaders whose versions the gateway lists.",
+        "enum": [
+          "neoforge",
+          "forge",
+          "fabric"
+        ]
+      },
+      "LoaderVersion": {
+        "type": "object",
+        "description": "One build of a loader.",
+        "required": [
+          "version",
+          "stable",
+          "recommended"
+        ],
+        "properties": {
+          "minecraft": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Minecraft version the build is for; null for Fabric, whose loader works with every version it supports."
+          },
+          "recommended": {
+            "type": "boolean",
+            "description": "True for the build its maintainers recommend for the Minecraft version, where they say."
+          },
+          "stable": {
+            "type": "boolean",
+            "description": "False for a beta or pre-release build."
+          },
+          "version": {
+            "type": "string",
+            "description": "Such as `21.1.57` (NeoForge), `52.0.1` (Forge) or `0.16.5` (Fabric)."
+          }
+        }
+      },
+      "LoaderVersions": {
+        "type": "object",
+        "description": "What `GET /v1/minecraft/loaders/{loader}/versions` answers.",
+        "required": [
+          "loader",
+          "versions"
+        ],
+        "properties": {
+          "loader": {
+            "$ref": "#/components/schemas/Loader"
+          },
+          "minecraft": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The Minecraft version the list was narrowed to, or null for every build."
+          },
+          "versions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LoaderVersion"
+            },
+            "description": "Newest first."
+          }
+        }
+      },
+      "MinecraftVersion": {
+        "type": "object",
+        "description": "One Minecraft version as Mojang's manifest lists it.",
+        "required": [
+          "id",
+          "type",
+          "releaseTime"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Such as `1.21.1` or `24w33a`."
+          },
+          "releaseTime": {
+            "type": "string",
+            "description": "ISO 8601."
+          },
+          "type": {
+            "$ref": "#/components/schemas/VersionType"
+          }
+        }
+      },
+      "MinecraftVersionDetails": {
+        "type": "object",
+        "description": "What `GET /v1/minecraft/versions/{id}` answers: the version and the Java it needs.",
+        "required": [
+          "id",
+          "type",
+          "releaseTime"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "javaMajor": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The major version of the Java the version runs on, such as 21, or null when Mojang does not say.",
+            "minimum": 0
+          },
+          "releaseTime": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/VersionType"
+          }
+        }
+      },
+      "MinecraftVersions": {
+        "type": "object",
+        "description": "What `GET /v1/minecraft/versions` answers.",
+        "required": [
+          "latest",
+          "versions"
+        ],
+        "properties": {
+          "latest": {
+            "$ref": "#/components/schemas/Latest"
+          },
+          "versions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MinecraftVersion"
+            },
+            "description": "Newest first, as Mojang lists them."
           }
         }
       },
@@ -1250,6 +1658,25 @@
             ]
           }
         }
+      },
+      "VersionFilter": {
+        "type": "string",
+        "description": "Which versions `GET /v1/minecraft/versions` lists.",
+        "enum": [
+          "release",
+          "snapshot",
+          "all"
+        ]
+      },
+      "VersionType": {
+        "type": "string",
+        "description": "Mojang's kinds of versions.",
+        "enum": [
+          "release",
+          "snapshot",
+          "old_beta",
+          "old_alpha"
+        ]
       }
     },
     "securitySchemes": {
@@ -1272,6 +1699,10 @@
     {
       "name": "modrinth",
       "description": "The Modrinth passthrough"
+    },
+    {
+      "name": "minecraft",
+      "description": "Minecraft and mod loader version lists"
     }
   ]
 }
