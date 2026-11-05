@@ -42,7 +42,6 @@
     "zod": "^4.6.7"
   },
   "publishConfig": {
-    "registry": "https://gitea.matejhoz.com/api/packages/createrington/npm/",
     "access": "public"
   },
   "engines": {
