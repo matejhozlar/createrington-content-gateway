@@ -14,7 +14,18 @@ if (!clientChanged) {
   process.exit(0);
 }
 
-const hasChangeset = changed.some(
+const added = git([
+  "log",
+  "--diff-filter=A",
+  "--name-only",
+  "--format=",
+  `${base}..HEAD`,
+  "--",
+  ".changeset",
+])
+  .split("\n")
+  .filter(Boolean);
+const hasChangeset = [...changed, ...added].some(
   (file) =>
     file.startsWith(".changeset/") &&
     file.endsWith(".md") &&
