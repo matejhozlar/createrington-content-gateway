@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "content-gateway",
-    "description": "A gateway in front of the CurseForge API that holds the API key, caches answers for every consumer, counts the calls made on the key and holds every consumer off after a 429. `/v1/curseforge/{path}` mirrors `api.curseforge.com/v1/{path}` and answers CurseForge's JSON as it came; the other routes are the gateway's own. Every route but `/v1/healthz` and `/v1/openapi.json` needs a consumer's bearer token.",
+    "description": "A gateway in front of the CurseForge and Modrinth APIs that holds the CurseForge key, caches answers for every consumer, counts the calls made on the key and holds every consumer off after a 429. `/v1/curseforge/{path}` mirrors `api.curseforge.com/v1/{path}` and `/v1/modrinth/version_file(s)` the SHA-1 lookups of `api.modrinth.com/v2`, answering their JSON as it came; `/v1/resolve` finds a download address per CurseForge file; the other routes are the gateway's own. Every route but `/v1/healthz` and `/v1/openapi.json` needs a consumer's bearer token.",
     "license": {
       "name": "MIT"
     },
@@ -376,6 +376,217 @@
         }
       }
     },
+    "/v1/modrinth/version_file/{hash}": {
+      "get": {
+        "tags": [
+          "modrinth"
+        ],
+        "summary": "The Modrinth version of the file with this SHA-1, as `GET api.modrinth.com/v2/version_file/{hash}` answers it.",
+        "description": "Kept for an hour once found and for 10 minutes when Modrinth does not know the hash. `Cache-Control: no-cache`\nasks Modrinth again. Modrinth calls do not count against the CurseForge budget.",
+        "operationId": "version_file",
+        "parameters": [
+          {
+            "name": "hash",
+            "in": "path",
+            "description": "The file's SHA-1, 40 hex digits",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e"
+          },
+          {
+            "name": "Cache-Control",
+            "in": "header",
+            "description": "`no-cache` asks Modrinth again instead of answering from the cache",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The version Modrinth lists the file under, as Modrinth sent it",
+            "headers": {
+              "X-Cache": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`hit` from the cache, `miss` from Modrinth, `stale` an old answer given because Modrinth could not be asked"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`INVALID_HASH`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Modrinth does not know the hash",
+            "headers": {
+              "X-Cache": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "As on 200"
+              }
+            }
+          },
+          "502": {
+            "description": "Modrinth could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Modrinth did not answer in time, `UPSTREAM_TIMEOUT`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other status Modrinth answered, with its body. Only the gateway's own answers lack `X-Cache`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
+    "/v1/modrinth/version_files": {
+      "post": {
+        "tags": [
+          "modrinth"
+        ],
+        "summary": "The Modrinth versions of the files with these SHA-1s, keyed by hash, as `POST api.modrinth.com/v2/version_files`\nanswers them: a hash Modrinth does not know is left out.",
+        "description": "Answered per hash from the cache; only the hashes not kept are asked for, 100 per call, at most 1000 hashes.",
+        "operationId": "version_files",
+        "parameters": [
+          {
+            "name": "Cache-Control",
+            "in": "header",
+            "description": "`no-cache` asks Modrinth again instead of answering from the cache",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VersionFilesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The versions found, keyed by lowercase hash, each as Modrinth sent it",
+            "headers": {
+              "X-Cache": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`hit` when every hash was kept, `miss` when Modrinth was asked, `stale` an old answer given because Modrinth could not be asked"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "`INVALID_BODY` (no hashes, more than 1000, or another algorithm) or `INVALID_HASH`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Modrinth could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Modrinth did not answer in time, `UPSTREAM_TIMEOUT`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Any other status Modrinth answered, with its body. Only the gateway's own answers lack `X-Cache`"
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
+      }
+    },
     "/v1/openapi.json": {
       "get": {
         "tags": [
@@ -393,6 +604,139 @@
             }
           }
         }
+      }
+    },
+    "/v1/resolve": {
+      "post": {
+        "tags": [
+          "gateway"
+        ],
+        "summary": "A download address for each CurseForge file: CurseForge's own link, else Modrinth's copy of the file found by\nits SHA-1, else the file's built address on CurseForge's CDN when a HEAD answers 200 with the file's size.",
+        "description": "The files are read from the cache like `POST /v1/curseforge/mods/files`, and the CurseForge calls for the ones\nnot kept count against the budget. Modrinth answers and CDN verdicts are kept for an hour, misses for 10\nminutes. No bytes pass through the gateway: the consumer downloads from the address given. A null `source` with\n`retry` false means no source has the file; `retry` true means a source could not be asked this time. At worst\na call takes 40 s: 10 s for CurseForge, 10 s for Modrinth and 20 s for the CDN checks.",
+        "operationId": "resolve",
+        "parameters": [
+          {
+            "name": "X-Budget-Pool",
+            "in": "header",
+            "description": "The pool the CurseForge calls draw from. Required when the token has more than one pool",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "Cache-Control",
+            "in": "header",
+            "description": "`no-cache` asks every source again instead of answering from the cache",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResolveRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "An address per file, in the order asked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Resolved"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`INVALID_BODY`, `POOL_REQUIRED` or `UNKNOWN_POOL`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The files need more CurseForge calls than a whole minute allows, `REQUEST_TOO_LARGE`; split them",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "CurseForge could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The CurseForge call was refused: `BUDGET_SPENT` this minute or `UPSTREAM_HOLD` after a 429",
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer",
+                  "format": "int64",
+                  "minimum": 0
+                },
+                "description": "Seconds until the next call can go out"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "CurseForge did not answer in time, `UPSTREAM_TIMEOUT`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
       }
     }
   },
@@ -597,6 +941,8 @@
           "UNKNOWN_POOL",
           "INVALID_PATH",
           "INVALID_DAYS",
+          "INVALID_HASH",
+          "INVALID_BODY",
           "UPSTREAM_TIMEOUT",
           "UPSTREAM_UNREACHABLE",
           "UPSTREAM_TOO_LARGE",
@@ -604,6 +950,15 @@
           "BUDGET_SPENT",
           "UPSTREAM_HOLD",
           "REQUEST_TOO_LARGE"
+        ]
+      },
+      "FileSource": {
+        "type": "string",
+        "description": "Where a file's download address comes from.",
+        "enum": [
+          "curseforge",
+          "modrinth",
+          "curseforge-cdn"
         ]
       },
       "Health": {
@@ -670,6 +1025,109 @@
           }
         }
       },
+      "ResolveRequest": {
+        "type": "object",
+        "description": "The body of `POST /v1/resolve`.",
+        "required": [
+          "fileIds"
+        ],
+        "properties": {
+          "cdn": {
+            "type": "boolean",
+            "description": "Whether a file's built address on CurseForge's CDN may be checked and given when neither CurseForge nor\nModrinth has a link. On unless set to false.",
+            "default": true
+          },
+          "fileIds": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            },
+            "description": "CurseForge file ids, up to 1000.",
+            "example": [
+              4567890,
+              4567891
+            ]
+          }
+        }
+      },
+      "Resolved": {
+        "type": "object",
+        "description": "What `POST /v1/resolve` answers.",
+        "required": [
+          "files"
+        ],
+        "properties": {
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ResolvedFile"
+            },
+            "description": "One entry per file id asked for, in the order asked, each id once."
+          }
+        }
+      },
+      "ResolvedFile": {
+        "type": "object",
+        "description": "What `POST /v1/resolve` answers for each file asked for.",
+        "required": [
+          "fileId",
+          "retry"
+        ],
+        "properties": {
+          "fileId": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "fileName": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The file's name as CurseForge lists it, null when CurseForge does not know the file."
+          },
+          "retry": {
+            "type": "boolean",
+            "description": "True when a source could not be asked for the file, so that a null `source` is worth asking again later\nrather than remembering."
+          },
+          "sha1": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The file's SHA-1 as CurseForge lists it, null when CurseForge does not know the file."
+          },
+          "size": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The file's size in bytes as CurseForge lists it, null when CurseForge does not know the file.",
+            "minimum": 0
+          },
+          "source": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/FileSource",
+                "description": "Where `url` comes from, or null when no source has the file."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The address to download the file from, or null when no source has it."
+          }
+        }
+      },
       "Source": {
         "type": "string",
         "description": "Where a readout's counts come from: `redis` when they are the stored ones, `memory` when no Redis is configured,\n`unavailable` when Redis did not answer, so the minute is this process's own count and the days hold only what\nis not written to Redis yet.",
@@ -678,6 +1136,30 @@
           "memory",
           "unavailable"
         ]
+      },
+      "VersionFilesRequest": {
+        "type": "object",
+        "description": "The body of `POST /v1/modrinth/version_files`.",
+        "required": [
+          "hashes"
+        ],
+        "properties": {
+          "algorithm": {
+            "type": "string",
+            "description": "Only `sha1` is supported.",
+            "example": "sha1"
+          },
+          "hashes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "SHA-1 hashes of the wanted files, 40 hex digits each, up to 1000.",
+            "example": [
+              "3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e"
+            ]
+          }
+        }
       }
     },
     "securitySchemes": {
@@ -696,6 +1178,10 @@
     {
       "name": "curseforge",
       "description": "The CurseForge passthrough"
+    },
+    {
+      "name": "modrinth",
+      "description": "The Modrinth SHA-1 lookups"
     }
   ]
 }

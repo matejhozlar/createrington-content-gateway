@@ -2,12 +2,16 @@ export {
   ContentGateway,
   ContentGatewayError,
   DEFAULT_TIMEOUT_MS,
+  RESOLVE_TIMEOUT_MS,
   type CacheStatus,
   type ContentGatewayOptions,
   type CurseForgeAnswer,
   type CurseForgeMethod,
   type CurseForgeRequest,
+  type ModrinthRequest,
+  type PassthroughAnswer,
   type Query,
+  type ResolveOptions,
 } from "./client.js";
 export type {
   ApiError,
@@ -17,9 +21,15 @@ export type {
   DayPoolSnapshot,
   DaySnapshot,
   ErrorCode,
+  FileSource,
   Health,
   PoolSnapshot,
+  ResolveRequest,
+  Resolved,
+  ResolvedFile,
+  VersionFilesRequest,
   components,
   paths,
 } from "./gateway.js";
 export * from "./curseforge.js";
+export * from "./modrinth.js";

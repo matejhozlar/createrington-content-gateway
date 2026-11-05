@@ -7,7 +7,10 @@ use std::{
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
-use crate::budget::{DEFAULT_HISTORY_DAYS, MAX_HISTORY_DAYS};
+use crate::{
+    budget::{DEFAULT_HISTORY_DAYS, MAX_HISTORY_DAYS},
+    modrinth,
+};
 
 const HOST_ENV: &str = "CONTENT_GATEWAY_HOST";
 const PORT_ENV: &str = "CONTENT_GATEWAY_PORT";
@@ -18,6 +21,7 @@ const BUDGET_ENV: &str = "CONTENT_GATEWAY_BUDGET_PER_MINUTE";
 const HISTORY_DAYS_ENV: &str = "CONTENT_GATEWAY_BUDGET_HISTORY_DAYS";
 const REDIS_ENV: &str = "REDIS_URL";
 const API_KEY_ENV: &str = "CURSEFORGE_API_KEY";
+const MODRINTH_USER_AGENT_ENV: &str = "MODRINTH_USER_AGENT";
 const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_PORT: u16 = 5005;
 const DEFAULT_BUDGET_PER_MINUTE: u32 = 300;
@@ -35,6 +39,7 @@ pub struct Config {
     pub budget_history_days: u32,
     pub redis_url: Option<RedisUrl>,
     pub curseforge_api_key: ApiKey,
+    pub modrinth_user_agent: String,
 }
 
 /// A process allowed to call the gateway, and the budget pools it may draw from.
@@ -123,6 +128,10 @@ pub enum ConfigError {
         "{name} must be a URL such as redis://:password@127.0.0.1:6379/0 (rediss:// is not supported)"
     )]
     RedisUrl { name: &'static str },
+    #[error(
+        "{name} must be a User-Agent of printable ASCII, such as my-app/1.0 (https://example.com), got {value:?}"
+    )]
+    UserAgent { name: &'static str, value: String },
     #[error("set {API_KEY_ENV} to the CurseForge API key the gateway calls CurseForge with")]
     NoApiKey,
     #[error("set {CONSUMERS_ENV} or {TOKEN_ENV} so that something can call the gateway")]
@@ -252,6 +261,21 @@ impl Config {
             .map(|key| ApiKey(key.trim().to_owned()))
             .ok_or(ConfigError::NoApiKey)?;
 
+        let modrinth_user_agent = match lookup(MODRINTH_USER_AGENT_ENV) {
+            Some(value) => {
+                let agent = value.trim().to_owned();
+                if agent.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+                    agent
+                } else {
+                    return Err(ConfigError::UserAgent {
+                        name: MODRINTH_USER_AGENT_ENV,
+                        value,
+                    });
+                }
+            }
+            None => modrinth::DEFAULT_USER_AGENT.to_owned(),
+        };
+
         Ok(Self {
             listen: SocketAddr::new(host, port),
             consumers,
@@ -259,6 +283,7 @@ impl Config {
             budget_history_days,
             redis_url,
             curseforge_api_key,
+            modrinth_user_agent,
         })
     }
 }
@@ -457,6 +482,30 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn says_who_it_is_to_modrinth_unless_told_what_to_say() {
+        assert_eq!(
+            config_with_token(&[]).unwrap().modrinth_user_agent,
+            modrinth::DEFAULT_USER_AGENT
+        );
+        assert_eq!(
+            config_with_token(&[(
+                MODRINTH_USER_AGENT_ENV,
+                " my-app/1.0 (https://example.com) "
+            )])
+            .unwrap()
+            .modrinth_user_agent,
+            "my-app/1.0 (https://example.com)"
+        );
+        assert_eq!(
+            config_with_token(&[(MODRINTH_USER_AGENT_ENV, "my-app/1.0\nX: y")]),
+            Err(ConfigError::UserAgent {
+                name: MODRINTH_USER_AGENT_ENV,
+                value: "my-app/1.0\nX: y".to_owned(),
+            })
+        );
     }
 
     #[test]

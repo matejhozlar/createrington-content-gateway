@@ -10,7 +10,8 @@ A small HTTP service that sits between your own services and the [CurseForge](ht
 - **Cache once for everyone.** Answers are cached per route, list requests (`/mods`, `/mods/files`, fingerprints) are cached per id, and identical requests in flight share one upstream call.
 - **Count and cap calls.** Every consumer has its own token and named pools; calls are counted per pool and per day, with a ceiling against runaway loops.
 - **Back off together.** One 429 from CurseForge holds every consumer off for as long as its `Retry-After` asks, and cached answers keep being served meanwhile.
-- **Resolve downloads.** `POST /v1/resolve` finds a download URL for CurseForge files, falling back to Modrinth by SHA-1.
+- **Look files up on Modrinth.** `/v1/modrinth/version_file/{sha1}` and `/v1/modrinth/version_files` mirror Modrinth's SHA-1 lookups, cached per hash, with one User-Agent for everyone.
+- **Resolve downloads.** `POST /v1/resolve` finds a download address for CurseForge files: CurseForge's own link, else Modrinth's copy by SHA-1, else the file's built address on CurseForge's CDN when it answers with the right size.
 
 ## Running it
 
@@ -25,17 +26,18 @@ curl http://127.0.0.1:5005/v1/healthz
 
 All configuration comes from environment variables.
 
-| Variable                              | Default     | Meaning                                                                                                                                             |
-| ------------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `CURSEFORGE_API_KEY`                  |             | Required. The [CurseForge API key](https://console.curseforge.com/) every call to CurseForge is made with                                           |
-| `CONTENT_GATEWAY_HOST`                | `127.0.0.1` | IP address to listen on                                                                                                                             |
-| `CONTENT_GATEWAY_PORT`                | `5005`      | Port to listen on                                                                                                                                   |
-| `CONTENT_GATEWAY_LOG`                 | `info`      | Log filter, in [`tracing-subscriber` `EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax |
-| `CONTENT_GATEWAY_TOKEN`               |             | The token of a single consumer named `default` with one pool named `default`                                                                        |
-| `CONTENT_GATEWAY_CONSUMERS`           |             | Several consumers as JSON, see below. Set this or `CONTENT_GATEWAY_TOKEN`, not both                                                                 |
-| `CONTENT_GATEWAY_BUDGET_PER_MINUTE`   | `300`       | Calls to CurseForge per minute over all consumers and pools                                                                                         |
-| `CONTENT_GATEWAY_BUDGET_HISTORY_DAYS` | `90`        | UTC days of daily counts `/v1/budget` keeps, 1 to 3660. A day takes a few hundred bytes per pool                                                    |
-| `REDIS_URL`                           |             | Redis to keep the budget and the cache in across restarts, such as `redis://:password@127.0.0.1:6379/0`. Without it everything stays in memory      |
+| Variable                              | Default     | Meaning                                                                                                                                                                     |
+| ------------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CURSEFORGE_API_KEY`                  |             | Required. The [CurseForge API key](https://console.curseforge.com/) every call to CurseForge is made with                                                                   |
+| `CONTENT_GATEWAY_HOST`                | `127.0.0.1` | IP address to listen on                                                                                                                                                     |
+| `CONTENT_GATEWAY_PORT`                | `5005`      | Port to listen on                                                                                                                                                           |
+| `CONTENT_GATEWAY_LOG`                 | `info`      | Log filter, in [`tracing-subscriber` `EnvFilter`](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html) syntax                         |
+| `CONTENT_GATEWAY_TOKEN`               |             | The token of a single consumer named `default` with one pool named `default`                                                                                                |
+| `CONTENT_GATEWAY_CONSUMERS`           |             | Several consumers as JSON, see below. Set this or `CONTENT_GATEWAY_TOKEN`, not both                                                                                         |
+| `CONTENT_GATEWAY_BUDGET_PER_MINUTE`   | `300`       | Calls to CurseForge per minute over all consumers and pools                                                                                                                 |
+| `CONTENT_GATEWAY_BUDGET_HISTORY_DAYS` | `90`        | UTC days of daily counts `/v1/budget` keeps, 1 to 3660. A day takes a few hundred bytes per pool                                                                            |
+| `MODRINTH_USER_AGENT`                 |             | What the gateway calls itself to Modrinth, which asks for a name and a way to reach you, such as `my-app/1.0 (https://example.com)`. `content-gateway/<version>` when unset |
+| `REDIS_URL`                           |             | Redis to keep the budget and the cache in across restarts, such as `redis://:password@127.0.0.1:6379/0`. Without it everything stays in memory                              |
 
 ### Consumers and pools
 
@@ -97,12 +99,14 @@ This is how the gateway runs for Createrington: `.gitea/workflows/deploy.yml` bu
 
 ## Endpoints
 
-| Route                                           | Auth  | What it answers                                                                                                                                                                                                                                                                          |
-| ----------------------------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `GET /v1/healthz`                               | none  | `{ status, version, commit, builtAt }`                                                                                                                                                                                                                                                   |
-| `GET /v1/openapi.json`                          | none  | The OpenAPI document of these routes, the same as `openapi.json` in this repository                                                                                                                                                                                                      |
-| `GET /v1/budget?days=14`                        | token | This minute's calls sent and withheld per pool, the 429 hold, and daily counts for the last `days` UTC days (14 when left out, more than the `historyDays` kept answers the days kept): calls to CurseForge, answers given without one (`hits`), calls withheld, and 403 and 429 answers |
-| `GET /v1/curseforge/*`, `POST /v1/curseforge/*` | token | What `api.curseforge.com/v1/*` answers, see below                                                                                                                                                                                                                                        |
+| Route                                                                     | Auth  | What it answers                                                                                                                                                                                                                                                                          |
+| ------------------------------------------------------------------------- | ----- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /v1/healthz`                                                         | none  | `{ status, version, commit, builtAt }`                                                                                                                                                                                                                                                   |
+| `GET /v1/openapi.json`                                                    | none  | The OpenAPI document of these routes, the same as `openapi.json` in this repository                                                                                                                                                                                                      |
+| `GET /v1/budget?days=14`                                                  | token | This minute's calls sent and withheld per pool, the 429 hold, and daily counts for the last `days` UTC days (14 when left out, more than the `historyDays` kept answers the days kept): calls to CurseForge, answers given without one (`hits`), calls withheld, and 403 and 429 answers |
+| `GET /v1/curseforge/*`, `POST /v1/curseforge/*`                           | token | What `api.curseforge.com/v1/*` answers, see below                                                                                                                                                                                                                                        |
+| `GET /v1/modrinth/version_file/{sha1}`, `POST /v1/modrinth/version_files` | token | What Modrinth's SHA-1 lookups answer, see below                                                                                                                                                                                                                                          |
+| `POST /v1/resolve`                                                        | token | A download address per CurseForge file, see below                                                                                                                                                                                                                                        |
 
 `source` in the budget says where its counts come from: `redis` for the stored ones, `memory` when no Redis is configured, and `unavailable` when Redis did not answer, in which case the minute is the gateway's own count and the days show only what is not written to Redis yet.
 
@@ -134,6 +138,20 @@ Every other route, and every other `POST`, goes to CurseForge each time. Other s
 Without a kept answer, a 429 from CurseForge answers `503 UPSTREAM_HOLD` like any held call, a CurseForge that does not answer within 10 s `504 UPSTREAM_TIMEOUT`, and one that cannot be reached `502 UPSTREAM_UNREACHABLE`.
 
 Errors answer `{ "code", "message" }`. A call the budget refuses answers `503` with `Retry-After`, plus `pool` and `retryAfterMs` in the body; `code` is `BUDGET_SPENT` when the minute's ceiling is reached and `UPSTREAM_HOLD` while CurseForge's 429 hold lasts. A request that needs more calls than a whole minute allows answers `413 REQUEST_TOO_LARGE` without `Retry-After`, since waiting would not help.
+
+### Modrinth
+
+`GET /v1/modrinth/version_file/{sha1}` answers the version Modrinth lists the file with that SHA-1 under, as `api.modrinth.com/v2/version_file/{hash}` does, or 404 when Modrinth does not know the hash. `POST /v1/modrinth/version_files` with `{"hashes": [...], "algorithm": "sha1"}` answers the versions found keyed by lowercase hash, as `api.modrinth.com/v2/version_files` does, leaving unknown hashes out. Both are kept per hash: a found version for an hour, a miss for 10 minutes, and only the hashes not kept are asked for, 100 per call, at most 1000 hashes per request. Modrinth gets 10 s to answer, like CurseForge. Modrinth needs no key, so these calls draw from no pool and are not counted; `MODRINTH_USER_AGENT` is what Modrinth sees. A hash that is not 40 hex digits answers `400 INVALID_HASH`.
+
+### Resolve
+
+`POST /v1/resolve` with `{"fileIds": [...]}` (up to 1000) answers one entry per file id, in the order asked: `source` and `url` where to download it from, `sha1`, `fileName` and `size` as CurseForge lists them (null when CurseForge does not know the file), and `retry`. The sources are tried in order:
+
+1. `curseforge`: the `downloadUrl` CurseForge's API gives. The files are read like `POST /v1/curseforge/mods/files`, from the cache while fresh, so these are the only calls that count against the pool of the request.
+2. `modrinth`: the copy of the file Modrinth hosts, found by SHA-1 through the lookup above. Only the file whose own hash matches counts, and only an address on `cdn.modrinth.com`.
+3. `curseforge-cdn`: the file's address on CurseForge's CDN built from its id and name, the way CurseForge's own links are. The address is unofficial, so it is given only when a HEAD answers 200 with the file's size; the bytes are not read, the consumer verifies the SHA-1 when it downloads. Verdicts are kept an hour, misses 10 minutes, and at most 8 addresses are checked at once within 20 seconds. `"cdn": false` in the body skips this step.
+
+A null `source` with `retry` false means no source has the file and the consumer is left to its own fallbacks; `retry` true means a source could not be asked this time, so the miss is not worth remembering. `Cache-Control: no-cache` asks every source again. No bytes pass through the gateway. The sources are tried in a row, so a call takes 40 s at worst (10 s for CurseForge, 10 s for Modrinth, 20 s for the CDN checks): give the call at least that long.
 
 ## Keep it private
 
