@@ -81,6 +81,8 @@ docker run --rm --env-file .env -p 127.0.0.1:5005:5005 content-gateway
 
 The image is a static binary on a distroless base. Inside the container the gateway listens on `0.0.0.0`; publish the port on `127.0.0.1` as above. The build keeps downloaded crates and compiled dependencies in BuildKit cache mounts, so a rebuild after an update only compiles what changed.
 
+Every release also publishes this image as `ghcr.io/matejhozlar/createrington-content-gateway:<version>` for amd64 and arm64, and the static binaries for both, `openapi.json` and a `SHA256SUMS` on the [GitHub release](https://github.com/matejhozlar/createrington-content-gateway/releases), so running a release needs neither the toolchain nor Docker.
+
 ### As a host process
 
 The binary has no runtime dependencies, so it can run straight from a directory under systemd. `docker build --target binary --output type=local,dest=build .` writes the static binary to `build/content-gateway` without making an image (a native `cargo build --release` does the same on a machine with the toolchain). A unit for a directory that holds the binary and a `.env` with the variables above, `/opt/content-gateway` here as an example:
@@ -196,6 +198,10 @@ pnpm format:check
 `openapi.json`, `packages/client/src/generated/openapi.ts` and `packages/python-client/src/content_gateway/generated.py` are generated and checked in: `cargo test` fails when the document no longer matches the server, and each client's generate check fails when its types no longer match the document. `pnpm openapi` rewrites all three; the Python step needs [uv](https://docs.astral.sh/uv/), which also runs the Python client's own checks (see its README).
 
 Every pull request runs these checks in CI, on Gitea Actions for the primary repository (`.gitea/workflows/ci.yml`) and on GitHub Actions for the mirror (`.github/workflows/ci.yml`); both share the composite actions under `.ci/actions`.
+
+### Releasing
+
+A server release is the `vX.Y.Z` tag on the release merge into `main`. The mirror carries the tag to GitHub, where `.github/workflows/release.yml` checks it against `package.json` and `Cargo.toml`, builds the binaries and the image, and publishes the release with the notes from that version's section of `CHANGELOG.md`. The image package GHCR creates on the first push is private: make it public once in the package's settings on GitHub, or the `docker pull` above fails for everyone else.
 
 ### Releasing the client
 
