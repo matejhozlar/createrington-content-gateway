@@ -7,8 +7,14 @@ packages
 scripts
 .git
 .gitea
+.github
+.ci
 .husky
 .changeset
-.claude
 .env
 .env.*
+.vscode
+.idea
+.claude
+.cursor
+.DS_Store

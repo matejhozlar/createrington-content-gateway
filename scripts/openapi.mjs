@@ -1,5 +1,3 @@
-// Writes openapi.json from the server's own description of its routes. The
-// client's generated types follow in the pnpm script that calls this.
 import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";

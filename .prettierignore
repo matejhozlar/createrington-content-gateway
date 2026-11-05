@@ -1,9 +1,16 @@
 node_modules
 target
 dist
+.venv
+.pytest_cache
+.mypy_cache
+.ruff_cache
 pnpm-lock.yaml
 Cargo.lock
 CHANGELOG.md
-.claude
 .pnpm-store
 openapi.json
+.vscode
+.idea
+.claude
+.cursor

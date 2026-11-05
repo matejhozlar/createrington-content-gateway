@@ -25,10 +25,8 @@ pub struct Answer {
     pub body: Bytes,
 }
 
-/// A cached answer, when it was stored, and until when it is fresh and after that stale, in milliseconds since the
-/// Unix epoch. For a project or a file, `row` is the object under `data`, a slice of the body, and `owner` the
-/// project a file belongs to. For a fingerprint, the body and `row` are the `exactMatches` items it matched, joined
-/// with commas: not JSON on its own, so such an entry is only ever joined into a rebuilt answer, never sent.
+/// A cached answer with its fresh and stale times in milliseconds since the Unix epoch; a fingerprint entry is
+/// not JSON on its own and is only ever joined into a rebuilt answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub answer: Answer,
@@ -61,15 +59,7 @@ impl Entry {
     }
 }
 
-/// The answers of CurseForge, in memory, at most 256 MiB of them, and in
-/// Redis when one is configured, so they survive a restart.
-///
-/// An entry is kept 24 h past its fresh time, for answering when a call is
-/// refused or CurseForge fails. Memory answers first; Redis is asked only
-/// when memory has no entry, and an entry found there is kept in memory
-/// again. New entries go to Redis in the background, until their stale
-/// time. Requests for a key whose load is running wait for that load
-/// instead of starting one.
+/// The upstream answers, in memory and in Redis when configured, with the loads in flight.
 pub struct AnswerCache {
     entries: Cache<String, Kept>,
     loading: Mutex<HashMap<String, Waiting>>,
@@ -167,9 +157,7 @@ impl AnswerCache {
             .flatten()
     }
 
-    /// The entries of `keys`, in their order, asking Redis once for every key memory has no entry for. An entry
-    /// from Redis whose stale time has passed is none, and one that is kept in memory again stays there only for
-    /// the time it has left.
+    /// The entries of `keys` in their order, asking Redis once for the keys memory has no entry for.
     pub async fn lookup_many(&self, keys: &[String], now_ms: u64) -> Vec<Option<Arc<Entry>>> {
         let mut entries: Vec<Option<Arc<Entry>>> = keys.iter().map(|key| self.get(key)).collect();
         let Some(redis) = &self.redis else {
@@ -242,8 +230,7 @@ impl AnswerCache {
         });
     }
 
-    /// Joins the load of `key` that is running, or registers a new one. The sender comes back only for a new load:
-    /// whoever holds it runs the load to the end, also when every request waiting on it is gone, and calls `finish`.
+    /// Joins the running load of `key`, or registers a new one whose holder must call `finish`.
     pub fn join(&self, key: &str) -> (Waiting, Option<Finisher>) {
         let mut loading = self.loading();
         if let Some(waiting) = loading

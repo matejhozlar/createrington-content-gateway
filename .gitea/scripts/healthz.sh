@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Prints what the gateway deployed in the given directory answers on /v1/healthz,
-# read through the host's network since a job container's loopback is its own.
-# Exits non-zero when it does not answer.
 set -euo pipefail
 
 dir=$1

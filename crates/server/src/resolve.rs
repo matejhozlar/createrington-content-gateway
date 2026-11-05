@@ -28,8 +28,7 @@ use crate::{
 pub const CURSEFORGE_CDN: &str = "https://mediafilez.forgecdn.net";
 pub const CDN_TIMEOUT: Duration = Duration::from_secs(10);
 const CDN_WAIT: Duration = Duration::from_secs(20);
-/// The longest a `POST /v1/resolve` can take: CurseForge's timeout, then Modrinth's, then the CDN wait. The client's
-/// timeout for `resolve()` is set above it.
+/// The longest a `POST /v1/resolve` can take: CurseForge's timeout, then Modrinth's, then the CDN wait.
 pub const LONGEST: Duration = Duration::from_secs(40);
 const CDN_AT_ONCE: usize = 8;
 const CDN_FOUND_MS: u64 = HOUR_MS;
@@ -110,11 +109,8 @@ fn yes() -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum FileSource {
-    /// The link CurseForge's API gives for the file.
     Curseforge,
-    /// The copy of the file Modrinth hosts, found by its SHA-1.
     Modrinth,
-    /// The file's built address on CurseForge's CDN, which answered a HEAD with the file's size.
     CurseforgeCdn,
 }
 
@@ -402,8 +398,6 @@ fn cdn_key(file_id: u64, size: u64) -> String {
     format!("cdn:{file_id}:{size}")
 }
 
-/// Each candidate's address on the CDN when it answers a HEAD with the file's size, `None` when it does not have
-/// the file, absent when it could not be asked within the wait.
 async fn check_cdn(
     state: &Arc<AppState>,
     candidates: &[Candidate],

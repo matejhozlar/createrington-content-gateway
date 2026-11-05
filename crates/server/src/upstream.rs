@@ -38,8 +38,7 @@ impl Source {
     }
 }
 
-/// Why an upstream gave no answer: it took longer than the timeout, could not be reached, sent more than the gateway
-/// keeps, or sent a batch answer the gateway could not split into rows.
+/// Why an upstream gave no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamFailure {
     Timeout,
@@ -48,8 +47,7 @@ pub enum UpstreamFailure {
     Unreadable,
 }
 
-/// What an upstream answered, with the headers that say when to try again: `Retry-After`, or Modrinth's
-/// `X-Ratelimit-Reset` in seconds when that is all there is.
+/// What an upstream answered, with its `Retry-After` or `X-Ratelimit-Reset`.
 pub struct Sent {
     pub answer: Answer,
     pub retry_after: Option<String>,

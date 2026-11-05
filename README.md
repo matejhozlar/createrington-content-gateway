@@ -2,9 +2,7 @@
 
 A small HTTP service that sits between your own services and the [CurseForge](https://docs.curseforge.com/rest-api/) and [Modrinth](https://docs.modrinth.com/api/) APIs. It holds the CurseForge API key so your services do not have to, shares one cache between all of them, counts every call made on the key, and holds every caller off when CurseForge answers 429.
 
-> **Status:** early. Consumers, tokens, the call budget, the CurseForge passthrough with its cache, the OpenAPI document and the TypeScript client exist. The rest is being built in the open; the plan lives in [Createrington/app#1692](https://gitea.matejhoz.com/Createrington/app/issues/1692).
-
-## What it will do
+## What it does
 
 - **Pass CurseForge through.** `/v1/curseforge/*` mirrors `api.curseforge.com/v1/*`: same paths, same JSON, with the gateway's key.
 - **Cache once for everyone.** Answers are cached per route, list requests (`/mods`, `/mods/files`, fingerprints) are cached per id, and identical requests in flight share one upstream call.
@@ -83,6 +81,8 @@ docker run --rm --env-file .env -p 127.0.0.1:5005:5005 content-gateway
 
 The image is a static binary on a distroless base. Inside the container the gateway listens on `0.0.0.0`; publish the port on `127.0.0.1` as above. The build keeps downloaded crates and compiled dependencies in BuildKit cache mounts, so a rebuild after an update only compiles what changed.
 
+Every release also publishes this image as `ghcr.io/matejhozlar/createrington-content-gateway:<version>` for amd64 and arm64, and the static binaries for both, `openapi.json` and a `SHA256SUMS` on the [GitHub release](https://github.com/matejhozlar/createrington-content-gateway/releases), so running a release needs neither the toolchain nor Docker.
+
 ### As a host process
 
 The binary has no runtime dependencies, so it can run straight from a directory under systemd. `docker build --target binary --output type=local,dest=build .` writes the static binary to `build/content-gateway` without making an image (a native `cargo build --release` does the same on a machine with the toolchain). A unit for a directory that holds the binary and a `.env` with the variables above, `/opt/content-gateway` here as an example:
@@ -97,7 +97,7 @@ RestartSec=5
 User=content-gateway
 ```
 
-This is how the gateway runs for Createrington: `.gitea/workflows/deploy.yml` builds the binary when a release merges into `main`, writes `.env` from Infisical, keeps the previous binary and `.env` as `content-gateway.previous` and `.env.previous`, touches `.restart-trigger` for a systemd path unit that restarts the service, and waits until `/v1/healthz` reports the deployed commit and build time; when it does not, the previous build is put back and restarted. The directory and the Infisical project come from the `DEPLOY_DIR` and `INFISICAL_PROJECT_ID` repository variables, the Infisical credentials from secrets.
+`.gitea/workflows/deploy.yml` is an example of that deploy for Gitea Actions: it builds the binary when a release merges into `main`, writes `.env` from [Infisical](https://infisical.com/), keeps the previous binary and `.env` as `content-gateway.previous` and `.env.previous`, touches `.restart-trigger` for a systemd path unit that restarts the service, and waits until `/v1/healthz` reports the deployed commit and build time; when it does not, the previous build is put back and restarted. The directory and the Infisical project come from the `DEPLOY_DIR` and `INFISICAL_PROJECT_ID` repository variables, the Infisical credentials from secrets.
 
 ## Endpoints
 
@@ -113,7 +113,7 @@ This is how the gateway runs for Createrington: `.gitea/workflows/deploy.yml` bu
 
 `source` in the budget says where its counts come from: `redis` for the stored ones, `memory` when no Redis is configured, and `unavailable` when Redis did not answer, in which case the minute is the gateway's own count and the days show only what is not written to Redis yet.
 
-The gateway's own answers are described by [`openapi.json`](openapi.json), which the server derives from its types (`content-gateway --openapi` prints it). Its `info.version` is the version of the API, the `1` of `/v1`; the gateway's own version is in `/v1/healthz`. The CurseForge answers are CurseForge's and are not described there. TypeScript consumers install [`@createrington/content-gateway-client`](packages/client/README.md), whose types come from the document; anyone else can generate a client from it.
+The gateway's own answers are described by [`openapi.json`](openapi.json), which the server derives from its types (`content-gateway --openapi` prints it). Its `info.version` is the version of the API, the `1` of `/v1`; the gateway's own version is in `/v1/healthz`. The CurseForge answers are CurseForge's and are not described there. TypeScript consumers install [`@createrington/content-gateway-client`](packages/client/README.md) and Python consumers [`content-gateway-client`](packages/python-client/README.md), whose types come from the document; anyone else can generate a client from it.
 
 ### CurseForge
 
@@ -171,7 +171,7 @@ A null `source` with `retry` false means no source has the file and the consumer
 
 ### Minecraft and loader versions
 
-These routes replace the version lists every consumer used to fetch and cache itself. The sources need no key: Mojang's `version_manifest_v2.json`, NeoForge's Maven, Forge's `promotions_slim.json` and Fabric's meta. Each document is kept for an hour (a version's own document a day), fetched once for everyone asking, and the old copy keeps answering for a day after that when its source fails, so a short outage does not empty a picker. They draw from no budget.
+These routes serve the version lists so that no consumer fetches and caches them itself. The sources need no key: Mojang's `version_manifest_v2.json`, NeoForge's Maven, Forge's `promotions_slim.json` and Fabric's meta. Each document is kept for an hour (a version's own document a day), fetched once for everyone asking, and the old copy keeps answering for a day after that when its source fails, so a short outage does not empty a picker. They draw from no budget.
 
 - `GET /v1/minecraft/versions?type=release&loader=neoforge`: the versions Mojang lists, newest first, with `latest.release` and `latest.snapshot`. `type` is `release` (the default), `snapshot` or `all`. `loader` keeps only the versions that loader has at least one build for, which is what a server or pack picker should offer.
 - `GET /v1/minecraft/versions/{id}`: one version with `javaMajor`, the Java it runs on, from Mojang's document of the version; `404 UNKNOWN_VERSION` for an id Mojang does not list.
@@ -188,13 +188,20 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 pnpm install        # Prettier, the pre-commit hook, the Infisical CLI and the client's dependencies
-pnpm dev            # cargo run with the env injected from Infisical (maintainers)
+cargo run           # the gateway on 127.0.0.1:5005 with the variables exported in the shell
+pnpm dev            # the same with the env injected from Infisical, for the maintainers
 pnpm openapi        # rewrite openapi.json and the client's generated types after a route or type changed
-pnpm test           # the client's tests; pnpm typecheck and pnpm build likewise
+pnpm test           # the TypeScript client's tests; pnpm typecheck and pnpm build likewise
 pnpm format:check
 ```
 
-`openapi.json` and `packages/client/src/generated/openapi.ts` are generated and checked in: `cargo test` fails when the document no longer matches the server, and the client's `generate:check` fails when the types no longer match the document.
+`openapi.json`, `packages/client/src/generated/openapi.ts` and `packages/python-client/src/content_gateway/generated.py` are generated and checked in: `cargo test` fails when the document no longer matches the server, and each client's generate check fails when its types no longer match the document. `pnpm openapi` rewrites all three; the Python step needs [uv](https://docs.astral.sh/uv/), which also runs the Python client's own checks (see its README).
+
+Every pull request runs these checks in CI, on Gitea Actions for the primary repository (`.gitea/workflows/ci.yml`) and on GitHub Actions for the mirror (`.github/workflows/ci.yml`); both share the composite actions under `.ci/actions`.
+
+### Releasing
+
+A server release is the `vX.Y.Z` tag on the release merge into `main`. The mirror carries the tag to GitHub, where `.github/workflows/release.yml` checks it against `package.json` and `Cargo.toml`, builds the binaries and the image, and publishes the release with the notes from that version's section of `CHANGELOG.md`, then publishes the Python client to PyPI when its version is not there yet. The image package GHCR creates on the first push is private: make it public once in the package's settings on GitHub, or the `docker pull` above fails for everyone else.
 
 ### Releasing the client
 

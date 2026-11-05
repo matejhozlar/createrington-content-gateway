@@ -1,8 +1,12 @@
 {
   "name": "content-gateway",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": true,
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/matejhozlar/createrington-content-gateway.git"
+  },
   "type": "module",
   "packageManager": "pnpm@12.16.1",
   "engines": {
@@ -10,7 +14,7 @@
   },
   "scripts": {
     "dev": "infisical run --env=dev -- cargo run",
-    "openapi": "node scripts/openapi.mjs && pnpm --filter @createrington/content-gateway-client generate",
+    "openapi": "node scripts/openapi.mjs && pnpm --filter @createrington/content-gateway-client generate && uv run --directory packages/python-client python scripts/generate.py",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",

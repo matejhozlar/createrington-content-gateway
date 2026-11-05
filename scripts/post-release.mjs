@@ -1,6 +1,3 @@
-// After a release: brings main and dev up to date, merges main into dev so dev
-// holds the release merge, and pushes dev. Refuses when tracked files have
-// uncommitted changes. Leaves you on dev.
 import {
   checkout,
   fail,

@@ -96,20 +96,7 @@ pub enum Refusal {
     TooLarge { calls: u32, limit_per_minute: u32 },
 }
 
-/// Counts and caps the calls every consumer makes on the CurseForge key.
-///
-/// One ceiling per minute covers all pools. A call is admitted before it goes
-/// upstream and recorded once CurseForge answered; a 429 holds every pool off
-/// for as long as its `Retry-After` asks (30 s without one, 1 s to 10 min).
-/// Daily counts per pool are kept for a configured number of UTC days.
-///
-/// With Redis, the minute's counts, the hold and the daily counts live there
-/// and survive a restart: admitting is one atomic script, which also stores a
-/// hold only this process knew of, and daily counts are added up in memory
-/// and written in the background after every change. While Redis fails, the
-/// minute is counted in memory and the daily counts wait in memory until it
-/// answers again. Without Redis everything stays in memory, which is correct
-/// for a single gateway process.
+/// Counts and caps the calls every consumer makes on one upstream, in memory and in Redis when configured.
 pub struct Budget {
     limit_per_minute: u32,
     history_days: u32,
@@ -289,8 +276,7 @@ impl Budget {
         self
     }
 
-    /// Makes this the budget of another upstream, called `name` in log lines, with its Redis keys under
-    /// `budget:{namespace}:` instead of `budget:`.
+    /// Makes this the budget of another upstream, with its Redis keys under `budget:{namespace}:`.
     pub fn named(mut self, namespace: &'static str, name: &'static str) -> Self {
         self.name = name;
         self.redis = self
@@ -300,8 +286,7 @@ impl Budget {
         self
     }
 
-    /// Reserves `calls` upstream calls for one request, all or none. Zero calls (everything cached) always passes.
-    /// Refused calls are counted as withheld, call by call.
+    /// Reserves `calls` upstream calls for one request, all or none.
     pub async fn admit(&self, consumer: &str, pool: &str, calls: u32) -> Result<(), Refusal> {
         if calls == 0 {
             return Ok(());
@@ -372,8 +357,7 @@ impl Budget {
         self.write_days_soon();
     }
 
-    /// Writes the daily counts that are not in Redis yet, even while Redis is being skipped after a failure, and
-    /// logs how many are lost when that fails too. For shutdown.
+    /// Writes the daily counts that are not in Redis yet, for shutdown.
     pub async fn write_days_at_exit(&self) {
         let Some(redis) = &self.redis else {
             return;
