@@ -23,6 +23,7 @@ jobs:
     if: github.server_url == 'https://github.com'
     runs-on: ubuntu-latest
     outputs:
+      released: ${{ steps.released.outputs.released }}
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
       commit: ${{ steps.release.outputs.commit }}
@@ -34,7 +35,21 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
+      - name: Stop when the tag is already released
+        id: released
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          if [ "${{ github.event_name }}" = "push" ] && gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName > /dev/null 2>&1; then
+            echo "$TAG is already released; a tag pushed again builds nothing. Run the workflow by hand to rebuild it."
+            echo "released=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Check that the tag and the manifests agree
+        if: steps.released.outputs.released != 'true'
         id: release
         env:
           TAG: ${{ inputs.tag || github.ref_name }}
@@ -72,6 +87,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Write the release notes from the changelog
+        if: steps.released.outputs.released != 'true'
         env:
           TAG: ${{ steps.release.outputs.tag }}
         run: |
@@ -86,12 +102,13 @@ jobs:
           cat notes/notes.md
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: steps.released.outputs.released != 'true'
         with:
           name: notes
           path: notes/notes.md
 
   build:
-    if: github.server_url == 'https://github.com'
+    if: github.server_url == 'https://github.com' && needs.check.outputs.released != 'true'
     needs: check
     permissions:
       contents: read
@@ -180,7 +197,7 @@ jobs:
           if-no-files-found: error
 
   image:
-    if: github.server_url == 'https://github.com'
+    if: github.server_url == 'https://github.com' && needs.check.outputs.released != 'true'
     needs: [check, build]
     permissions:
       contents: read
@@ -224,7 +241,7 @@ jobs:
           docker buildx imagetools inspect "$IMAGE:$VERSION"
 
   release:
-    if: github.server_url == 'https://github.com'
+    if: github.server_url == 'https://github.com' && needs.check.outputs.released != 'true'
     needs: [check, build, image]
     permissions:
       contents: write
@@ -261,7 +278,7 @@ jobs:
           fail_on_unmatched_files: true
 
   python:
-    if: github.server_url == 'https://github.com'
+    if: github.server_url == 'https://github.com' && needs.check.outputs.released != 'true'
     needs: [check, release]
     permissions:
       contents: read
