@@ -36,9 +36,7 @@ def generate(into: Path) -> None:
         check=True,
         cwd=PACKAGE,
     )
-    into.write_bytes(into.read_bytes().replace(b"
-", b"
-"))
+    into.write_bytes(into.read_bytes().replace(b"\r\n", b"\n"))
 
 
 def main() -> int:
