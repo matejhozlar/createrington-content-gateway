@@ -35,11 +35,11 @@ const page = curseforgePage(curseforgeModSchema).parse(answer.body);
 
 Only the gateway's own answers throw, as `ContentGatewayError` with the gateway's `code` (`BUDGET_SPENT`, `UPSTREAM_HOLD`, `UNAUTHORIZED`, ...), `status`, `pool` and `retryAfterMs`. `code` is `null` when the answer was not the gateway's JSON error at all, such as a proxy's HTML page.
 
-`modrinthVersionFile(sha1)` and `modrinthVersionFiles(hashes)` send the SHA-1 lookups through `/v1/modrinth/*` the same way and answer a `PassthroughAnswer`; parse the body with `modrinthVersionSchema` or `modrinthVersionFilesSchema`, and `modrinthFileUrl(version, sha1)` picks the address of the file itself on Modrinth's CDN. They draw from no pool.
+`modrinth(path, request)` sends `api.modrinth.com/v2/<path>` through the gateway the same way and answers a `PassthroughAnswer`; the calls draw from the pool's Modrinth budget. `modrinthVersionFile(sha1)` and `modrinthVersionFiles(hashes)` are the two SHA-1 lookups. Loose schemas exist for what consumers read: `modrinthProjectSchema`, `modrinthSearchSchema`, `modrinthVersionSchema`, `modrinthVersionFilesSchema`, `modrinthTagSchema` and `modrinthGameVersionSchema`; `modrinthFileUrl(version, sha1)` picks the address of the file itself on Modrinth's CDN.
 
 `resolve(fileIds, { cdn, pool, fresh, waitUpToMs })` reads `/v1/resolve`: a download address per CurseForge file, from CurseForge's own link, else Modrinth's copy of the file found by SHA-1, else the file's built address on CurseForge's CDN when it answers a HEAD with the file's size (`cdn: false` skips that step). A file with a null `source` and `retry: true` could not be fully checked this time. The consumer downloads from the address itself; no bytes pass through the gateway. The gateway tries the three sources in a row, so a call can take 40 s at worst; `resolve()` therefore waits `RESOLVE_TIMEOUT_MS` (60 s) rather than the client's timeout, or `timeoutMs` in its options.
 
-`health()` reads `/v1/healthz` and `budget({ days })` reads `/v1/budget` with the last `days` UTC days of counts (14 when left out, more than the gateway's `historyDays` answers the days kept), both typed from `openapi.json`. The `paths` and `components` types of the document are exported for anything else.
+`health()` reads `/v1/healthz` and `budget({ days })` reads `/v1/budget`, one `UpstreamBudget` for CurseForge and one for Modrinth with the last `days` UTC days of counts (14 when left out, more than the gateway's `historyDays` answers the days kept), both typed from `openapi.json`. The `paths` and `components` types of the document are exported for anything else.
 
 ### Waiting out a refusal
 

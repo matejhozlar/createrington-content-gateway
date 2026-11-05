@@ -45,21 +45,26 @@ describe("the gateway's own routes", () => {
   });
 
   it("reads the budget with the token and the pool", async () => {
+    const upstream = {
+      limitPerMinute: 300,
+      used: 2,
+      withheld: 0,
+      resetsAt: "2026-11-03T20:01:00Z",
+      heldUntil: null,
+      pools: [],
+      days: [],
+    };
     gateway.reply(
       json(200, {
-        limitPerMinute: 300,
         historyDays: 90,
-        used: 2,
-        withheld: 0,
-        resetsAt: "2026-11-03T20:01:00Z",
-        heldUntil: null,
         source: "redis",
-        pools: [],
-        days: [],
+        curseforge: upstream,
+        modrinth: { ...upstream, used: 0 },
       }),
     );
     const budget = await client({ pool: "launcher" }).budget({ days: 30 });
-    expect(budget.used).toBe(2);
+    expect(budget.curseforge.used).toBe(2);
+    expect(budget.modrinth.used).toBe(0);
     expect(budget.historyDays).toBe(90);
     expect(gateway.seen[0]?.url).toBe("/v1/budget?days=30");
     expect(gateway.seen[0]?.headers.authorization).toBe(`Bearer ${TOKEN}`);
@@ -127,18 +132,30 @@ describe("the CurseForge passthrough", () => {
     expect(seen?.headers["x-budget-pool"]).toBe("app");
   });
 
-  it("looks a file up on Modrinth without a pool and the version files with one call", async () => {
+  it("sends Modrinth calls through with the pool and looks files up by hash", async () => {
+    gateway.reply(json(200, { hits: [], total_hits: 0 }, "hit"));
+    const search = await client({ pool: "launcher" }).modrinth("/search", {
+      query: { query: "sodium", limit: 20 },
+    });
+    expect(search.cache).toBe("hit");
+    expect(gateway.seen[0]?.method).toBe("GET");
+    expect(gateway.seen[0]?.url).toBe(
+      "/v1/modrinth/search?query=sodium&limit=20",
+    );
+    expect(gateway.seen[0]?.headers["x-budget-pool"]).toBe("launcher");
+
     gateway.reply(json(200, { id: "v", files: [] }, "miss"));
     const one = await client({ pool: "launcher" }).modrinthVersionFile(
       "3E1DD9FB5EA2F0DD4FFCC2B1A7D0BB1A1A9D6A8E",
-      { fresh: true },
+      { fresh: true, pool: "app" },
     );
     expect(one.cache).toBe("miss");
     expect(one.body).toEqual({ id: "v", files: [] });
-    expect(gateway.seen[0]?.url).toBe(
+    expect(gateway.seen[1]?.url).toBe(
       "/v1/modrinth/version_file/3E1DD9FB5EA2F0DD4FFCC2B1A7D0BB1A1A9D6A8E",
     );
-    expect(gateway.seen[0]?.headers["cache-control"]).toBe("no-cache");
+    expect(gateway.seen[1]?.headers["cache-control"]).toBe("no-cache");
+    expect(gateway.seen[1]?.headers["x-budget-pool"]).toBe("app");
 
     gateway.reply(json(404, "", "hit"));
     const none = await client().modrinthVersionFile("abc");
@@ -147,9 +164,9 @@ describe("the CurseForge passthrough", () => {
 
     gateway.reply(json(200, {}, "hit"));
     await client().modrinthVersionFiles(["abc", "def"]);
-    expect(gateway.seen[2]?.method).toBe("POST");
-    expect(gateway.seen[2]?.url).toBe("/v1/modrinth/version_files");
-    expect(gateway.seen[2]?.body).toBe(
+    expect(gateway.seen[3]?.method).toBe("POST");
+    expect(gateway.seen[3]?.url).toBe("/v1/modrinth/version_files");
+    expect(gateway.seen[3]?.body).toBe(
       '{"hashes":["abc","def"],"algorithm":"sha1"}',
     );
   });
