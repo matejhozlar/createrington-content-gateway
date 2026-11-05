@@ -33,7 +33,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ inputs.tag || github.sha }}
 
       - name: Stop when the tag is already released
         id: released
@@ -66,16 +66,16 @@ jobs:
             exit 1
           fi
           for attempt in 1 2 3 4 5 6; do
-            tags=$(git ls-remote --tags --refs origin 'refs/tags/v*' | awk -F/ '{ print $NF }')
-            if grep -qxF "$TAG" <<< "$tags"; then
+            if remote=$(git ls-remote --tags --refs origin 'refs/tags/v*'); then
               break
             fi
             if [ "$attempt" = 6 ]; then
-              echo "::error::Could not read $TAG from the remote's tags"
+              echo "::error::Could not read the remote's tags"
               exit 1
             fi
             sleep 10
           done
+          tags=$(printf '%s\n' "$remote" | awk -F/ 'NF { print $NF }'; echo "$TAG")
           newest=$(grep -v -- '-' <<< "$tags" | sort -V | tail -n 1)
           {
             echo "tag=$TAG"
@@ -272,6 +272,7 @@ jobs:
       - uses: softprops/action-gh-release@28ab305d0ffa26d60ec4bd614126329e26c7a0ec # v3.0.4
         with:
           tag_name: ${{ needs.check.outputs.tag }}
+          target_commitish: ${{ needs.check.outputs.commit }}
           name: ${{ needs.check.outputs.tag }}
           body_path: notes/notes.md
           files: dist/*
