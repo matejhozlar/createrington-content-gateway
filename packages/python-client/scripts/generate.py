@@ -36,6 +36,9 @@ def generate(into: Path) -> None:
         check=True,
         cwd=PACKAGE,
     )
+    into.write_bytes(into.read_bytes().replace(b"
+", b"
+"))
 
 
 def main() -> int:
