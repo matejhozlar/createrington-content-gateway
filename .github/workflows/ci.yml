@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+      - dev
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  HUSKY: "0"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  format:
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup
+        uses: ./.ci/actions/setup
+
+      - name: Check formatting
+        run: pnpm format:check
+
+  audit:
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup
+        uses: ./.ci/actions/setup
+
+      - name: Audit dependencies
+        run: pnpm audit --audit-level=high
+
+  client:
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup
+        uses: ./.ci/actions/setup
+
+      - name: Require a changeset for a changed client
+        if: github.event_name == 'pull_request'
+        run: pnpm changeset:check "origin/${{ github.base_ref }}"
+
+      - name: Refuse a release that leaves changesets unconsumed
+        if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        run: |
+          pending=$(find .changeset -name '*.md' ! -name README.md)
+          if [ -n "$pending" ]; then
+            echo "::error::These changesets were not turned into a version, run pnpm version-packages on the release branch:"
+            echo "$pending"
+            exit 1
+          fi
+
+      - name: Check the generated types against openapi.json
+        run: pnpm --filter @createrington/content-gateway-client generate:check
+
+      - name: Type check
+        run: pnpm --filter @createrington/content-gateway-client typecheck
+
+      - name: Test
+        run: pnpm --filter @createrington/content-gateway-client test
+
+      - name: Build
+        run: pnpm --filter @createrington/content-gateway-client build
+
+      - name: Load the package in Node
+        working-directory: packages/client
+        run: node --input-type=module -e "const { ContentGateway } = await import('@createrington/content-gateway-client'); if (typeof ContentGateway !== 'function') process.exit(1)"
+
+  rust-format:
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: ./.ci/actions/setup-rust
+        with:
+          cache-target: "false"
+
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  rust-deps:
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    env:
+      CARGO_DENY_VERSION: "0.20.2"
+      CARGO_MACHETE_VERSION: "0.9.2"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: ./.ci/actions/setup-rust
+        with:
+          cache-target: "false"
+
+      - name: Cache dependency tools
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/cargo-deny
+            ~/.cargo/bin/cargo-machete
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-deps-tools-${{ env.CARGO_DENY_VERSION }}-${{ env.CARGO_MACHETE_VERSION }}
+
+      - name: Install dependency tools
+        run: |
+          cargo-deny --version 2> /dev/null | grep -qF "$CARGO_DENY_VERSION" \
+            || cargo install --locked "cargo-deny@$CARGO_DENY_VERSION"
+          cargo-machete --version 2> /dev/null | grep -qF "$CARGO_MACHETE_VERSION" \
+            || cargo install --locked "cargo-machete@$CARGO_MACHETE_VERSION"
+
+      - name: Check advisories, licences, bans and sources
+        run: cargo deny --locked check
+
+      - name: Find unused dependencies
+        run: cargo machete
+
+  rust:
+    if: github.server_url == 'https://github.com'
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:8.10-alpine
+        ports:
+          - 6379:6379
+    env:
+      CONTENT_GATEWAY_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Rust
+        uses: ./.ci/actions/setup-rust
+
+      - name: Check
+        run: cargo check --workspace --locked
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace --locked

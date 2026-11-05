@@ -195,6 +195,8 @@ pnpm format:check
 
 `openapi.json` and `packages/client/src/generated/openapi.ts` are generated and checked in: `cargo test` fails when the document no longer matches the server, and the client's `generate:check` fails when the types no longer match the document.
 
+Every pull request runs these checks in CI, on Gitea Actions for the primary repository (`.gitea/workflows/ci.yml`) and on GitHub Actions for the mirror (`.github/workflows/ci.yml`); both share the composite actions under `.ci/actions`.
+
 ### Releasing the client
 
 The client package is versioned with [changesets](https://github.com/changesets/changesets), apart from the server. A change to `packages/client` comes with a changeset written on its branch (`pnpm changeset`); CI refuses a changed client without one. The release PR runs `pnpm version-packages`, which turns the changesets into the version bump and the package's `CHANGELOG.md` entry, and the merge into `main` publishes that version to the npm registry named in the package's `publishConfig` (`.gitea/workflows/publish-client.yml`, with the registry token in the `NPM_PUBLISH_TOKEN` secret). A version the registry already has is not published again, and a merge that still carries unconsumed changesets fails instead of publishing.
