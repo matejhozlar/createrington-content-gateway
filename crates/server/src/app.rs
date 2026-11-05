@@ -71,7 +71,7 @@ impl AppState {
                 redis.clone(),
             )
             .keeping_days(config.budget_history_days)
-            .named("modrinth"),
+            .named("modrinth", "Modrinth"),
             upstream: Upstream::new(
                 Source::CurseForge,
                 CURSEFORGE_API,

@@ -113,6 +113,7 @@ pub enum Refusal {
 pub struct Budget {
     limit_per_minute: u32,
     history_days: u32,
+    name: &'static str,
     pools: Vec<PoolKey>,
     clock: Arc<dyn Clock>,
     memory: Arc<Mutex<Counts>>,
@@ -271,22 +272,14 @@ impl Budget {
         Self {
             limit_per_minute,
             history_days: DEFAULT_HISTORY_DAYS,
+            name: "CurseForge",
             pools: pools
                 .into_iter()
                 .map(|(consumer, pool)| (consumer.into(), pool.into()))
                 .collect(),
             clock,
             memory: Arc::default(),
-            redis: redis.map(|store| {
-                Arc::new(Shared {
-                    store,
-                    admit: Script::new(ADMIT_SCRIPT),
-                    hold: Script::new(HOLD_SCRIPT),
-                    writing_days: tokio::sync::Mutex::new(()),
-                    trimmed_on: Mutex::new(None),
-                    namespace: "",
-                })
-            }),
+            redis: redis.map(|store| Arc::new(Shared::new(store, ""))),
         }
     }
 
@@ -296,11 +289,14 @@ impl Budget {
         self
     }
 
-    /// Keeps this budget's Redis keys under `budget:{namespace}:` instead of `budget:`, for a second upstream.
-    pub fn named(mut self, namespace: &'static str) -> Self {
-        if let Some(redis) = self.redis.as_mut().and_then(Arc::get_mut) {
-            redis.namespace = namespace;
-        }
+    /// Makes this the budget of another upstream, called `name` in log lines, with its Redis keys under
+    /// `budget:{namespace}:` instead of `budget:`.
+    pub fn named(mut self, namespace: &'static str, name: &'static str) -> Self {
+        self.name = name;
+        self.redis = self
+            .redis
+            .take()
+            .map(|redis| Arc::new(Shared::new(redis.store.clone(), namespace)));
         self
     }
 
@@ -386,7 +382,10 @@ impl Budget {
             .write_days(&self.memory, &*self.clock, self.history_days, true)
             .await;
         if lost > 0 {
-            tracing::warn!("Redis did not take the last daily counts, {lost} of them are lost");
+            tracing::warn!(
+                "Redis did not take the last daily counts of the {} budget, {lost} of them are lost",
+                self.name
+            );
         }
     }
 
@@ -837,6 +836,17 @@ fn pool_snapshot(key: &PoolKey, counts: MinuteCounts) -> PoolSnapshot {
 }
 
 impl Shared {
+    fn new(store: Arc<RedisStore>, namespace: &'static str) -> Self {
+        Self {
+            store,
+            namespace,
+            admit: Script::new(ADMIT_SCRIPT),
+            hold: Script::new(HOLD_SCRIPT),
+            writing_days: tokio::sync::Mutex::new(()),
+            trimmed_on: Mutex::new(None),
+        }
+    }
+
     fn key(&self, tail: &str) -> String {
         if self.namespace.is_empty() {
             format!("budget:{tail}")
@@ -1512,7 +1522,8 @@ mod tests {
         let clock = TestClock::at(NOV_3_2026_20H);
         let store = Arc::new(RedisStore::open(&url, prefix.clone()).unwrap());
         let curseforge = Budget::new(5, POOLS, clock.clone(), Some(store.clone()));
-        let modrinth = Budget::new(5, POOLS, clock.clone(), Some(store.clone())).named("modrinth");
+        let shared = Budget::new(5, POOLS, clock.clone(), Some(store.clone()));
+        let modrinth = shared.named("modrinth", "Modrinth");
         curseforge.admit("app", "app", 5).await.unwrap();
         curseforge.record("app", "app", Some(200), None).await;
         assert_eq!(modrinth.admit("app", "app", 5).await, Ok(()));

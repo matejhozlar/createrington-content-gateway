@@ -163,7 +163,7 @@ fn gateway_with(
             clock.clone(),
             redis.clone(),
         )
-        .named("modrinth"),
+        .named("modrinth", "Modrinth"),
         upstream: Upstream::new(
             Source::CurseForge,
             format!("{}/v1", mock.base),
