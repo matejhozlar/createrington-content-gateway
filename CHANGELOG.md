@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.1 (2026-11-05)
+
+- [add] Add the Modrinth passthrough at `/v1/modrinth/*`, mirroring `api.modrinth.com/v2/*` like the CurseForge one (status, content type and body as they came, `X-Cache`, shared in-flight calls, stale answers when Modrinth fails, a 10 s timeout) with its own per-route cache table, per-hash caching for `GET /version_file/{sha1}` and `POST /version_files` (up to 1000 SHA-1 hashes, 100 per call, `400 INVALID_HASH` for a malformed one, other algorithms passed through as they came), and paths that accept every character Modrinth slugs allow
+- [add] Add a separate Modrinth budget per pool with its own ceiling (`CONTENT_GATEWAY_MODRINTH_PER_MINUTE`, default 300), its own Redis keys, and a shared hold after Modrinth answers 429 for as long as `X-Ratelimit-Reset` or `Retry-After` asks; `MODRINTH_USER_AGENT` sets what the gateway calls itself to Modrinth (`content-gateway/<version>` when unset)
+- [add] Add `POST /v1/resolve`, which answers a download address per CurseForge file id (up to 1000) from CurseForge's own link, else Modrinth's copy matched by SHA-1, else the file's CurseForge CDN address when a HEAD confirms its size (skippable with `"cdn": false`), with `sha1`, `fileName`, `size` and a `retry` flag per file; no bytes pass through the gateway
+- [add] Add `GET /v1/minecraft/versions`, `GET /v1/minecraft/versions/{id}` and `GET /v1/minecraft/loaders/{loader}/versions`, serving Mojang's Minecraft versions (filterable by type and by loader support, with the Java major a version runs on) and NeoForge, Forge and Fabric builds with `stable` and `recommended` flags, from one shared cache kept an hour and served stale for a day when a source fails, drawing on no budget
+- [add] Add `CONTENT_GATEWAY_BUDGET_HISTORY_DAYS` (default 90, 1 to 3660) to choose how many UTC days of daily counts are kept, deleting older days on the first trim after the value is lowered, and a `days` query on `GET /v1/budget` (default 14, `400 INVALID_DAYS` for a bad value) to choose how many are answered
+- [refactor] Change the `GET /v1/budget` answer to hold one budget per upstream under `curseforge` and `modrinth`, with `source` and the new `historyDays` at the top level; readers of the previous flat shape must move to `curseforge`
+- [chore] Make the example deploy workflow say so on a first deploy instead of claiming the build already runs
+
 ## v0.1.0 (2026-11-04)
 
 - [add] Add the content-gateway service: a loopback HTTP server that holds the CurseForge API key, configured from environment variables (`CURSEFORGE_API_KEY`, `CONTENT_GATEWAY_HOST`, `CONTENT_GATEWAY_PORT`, `CONTENT_GATEWAY_LOG`), refusing an invalid value at startup with a message naming the variable and stopping within five seconds of a shutdown signal
