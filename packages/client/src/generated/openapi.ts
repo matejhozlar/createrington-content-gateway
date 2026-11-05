@@ -62,6 +62,66 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/v1/minecraft/loaders/{loader}/versions": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * A loader's builds, newest first: NeoForge from its Maven, Forge's promoted builds (the recommended and the
+     *     latest per Minecraft version, which is what pickers show), Fabric's loaders from its meta. `minecraft` keeps
+     *     only the builds for that version; for Fabric, whose loader is not tied to one, that means all of them when
+     *     Fabric supports the version and none otherwise. Each list is kept for an hour.
+     */
+    get: operations["loader_versions"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v1/minecraft/versions": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * The Minecraft versions Mojang lists, releases unless asked otherwise, newest first.
+     * @description `loader` keeps only the versions that loader has builds for, which is what a server or pack picker offers.
+     *     Mojang's manifest is kept for an hour and the old copy answers when Mojang fails.
+     */
+    get: operations["minecraft_versions"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v1/minecraft/versions/{id}": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** One Minecraft version with the Java it needs, from Mojang's own document of the version, kept a day. */
+    get: operations["minecraft_version"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/v1/modrinth/{path}": {
     parameters: {
       query?: never;
@@ -218,6 +278,9 @@ export interface components {
       | "INVALID_DAYS"
       | "INVALID_HASH"
       | "INVALID_BODY"
+      | "INVALID_QUERY"
+      | "UNKNOWN_VERSION"
+      | "UNKNOWN_LOADER"
       | "UPSTREAM_TIMEOUT"
       | "UPSTREAM_UNREACHABLE"
       | "UPSTREAM_TOO_LARGE"
@@ -246,6 +309,60 @@ export interface components {
        * @example 0.1.0
        */
       version: string;
+    };
+    /** @description The newest release and snapshot Mojang names, whatever the filter. */
+    Latest: {
+      release: string;
+      snapshot: string;
+    };
+    /**
+     * @description The mod loaders whose versions the gateway lists.
+     * @enum {string}
+     */
+    Loader: "neoforge" | "forge" | "fabric";
+    /** @description One build of a loader. */
+    LoaderVersion: {
+      /** @description The Minecraft version the build is for; null for Fabric, whose loader works with every version it supports. */
+      minecraft?: string | null;
+      /** @description True for the build its maintainers recommend for the Minecraft version, where they say. */
+      recommended: boolean;
+      /** @description False for a beta or pre-release build. */
+      stable: boolean;
+      /** @description Such as `21.1.57` (NeoForge), `52.0.1` (Forge) or `0.16.5` (Fabric). */
+      version: string;
+    };
+    /** @description What `GET /v1/minecraft/loaders/{loader}/versions` answers. */
+    LoaderVersions: {
+      loader: components["schemas"]["Loader"];
+      /** @description The Minecraft version the list was narrowed to, or null for every build. */
+      minecraft?: string | null;
+      /** @description Newest first. */
+      versions: components["schemas"]["LoaderVersion"][];
+    };
+    /** @description One Minecraft version as Mojang's manifest lists it. */
+    MinecraftVersion: {
+      /** @description Such as `1.21.1` or `24w33a`. */
+      id: string;
+      /** @description ISO 8601. */
+      releaseTime: string;
+      type: components["schemas"]["VersionType"];
+    };
+    /** @description What `GET /v1/minecraft/versions/{id}` answers: the version and the Java it needs. */
+    MinecraftVersionDetails: {
+      id: string;
+      /**
+       * Format: int32
+       * @description The major version of the Java the version runs on, such as 21, or null when Mojang does not say.
+       */
+      javaMajor?: number | null;
+      releaseTime: string;
+      type: components["schemas"]["VersionType"];
+    };
+    /** @description What `GET /v1/minecraft/versions` answers. */
+    MinecraftVersions: {
+      latest: components["schemas"]["Latest"];
+      /** @description Newest first, as Mojang lists them. */
+      versions: components["schemas"]["MinecraftVersion"][];
     };
     /** @description One pool's calls this minute. */
     PoolSnapshot: {
@@ -360,6 +477,16 @@ export interface components {
        */
       hashes: string[];
     };
+    /**
+     * @description Which versions `GET /v1/minecraft/versions` lists.
+     * @enum {string}
+     */
+    VersionFilter: "release" | "snapshot" | "all";
+    /**
+     * @description Mojang's kinds of versions.
+     * @enum {string}
+     */
+    VersionType: "release" | "snapshot" | "old_beta" | "old_alpha";
   };
   responses: never;
   parameters: never;
@@ -614,6 +741,194 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["Health"];
+        };
+      };
+    };
+  };
+  loader_versions: {
+    parameters: {
+      query?: {
+        /** @description Only the builds for this Minecraft version, such as `1.21.1`. */
+        minecraft?: string;
+      };
+      header?: never;
+      path: {
+        /**
+         * @description `neoforge`, `forge` or `fabric`
+         * @example neoforge
+         */
+        loader: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description The builds */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["LoaderVersions"];
+        };
+      };
+      /** @description No valid consumer token */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description No such loader, `UNKNOWN_LOADER` */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The loader's source could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE` */
+      502: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The source did not answer in time, `UPSTREAM_TIMEOUT` */
+      504: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  minecraft_versions: {
+    parameters: {
+      query?: {
+        /** @description Only the versions this loader has at least one build for. */
+        loader?: components["schemas"]["Loader"];
+        /** @description `release` (the default), `snapshot` (snapshots only) or `all` (every kind, old betas and alphas included). */
+        type?: components["schemas"]["VersionFilter"];
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description The versions */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["MinecraftVersions"];
+        };
+      };
+      /** @description `INVALID_QUERY`: an unknown `type` or `loader` */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description No valid consumer token */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Mojang or the loader's source could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE` */
+      502: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The source did not answer in time, `UPSTREAM_TIMEOUT` */
+      504: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+    };
+  };
+  minecraft_version: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /**
+         * @description The version as Mojang names it
+         * @example 1.21.1
+         */
+        id: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description The version */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["MinecraftVersionDetails"];
+        };
+      };
+      /** @description No valid consumer token */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Mojang lists no such version, `UNKNOWN_VERSION` */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Mojang could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE` */
+      502: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Mojang did not answer in time, `UPSTREAM_TIMEOUT` */
+      504: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
         };
       };
     };
