@@ -20,8 +20,21 @@
         "tags": [
           "gateway"
         ],
-        "summary": "This minute's calls per pool, the 429 hold, and the daily counts of the last 14 UTC days.",
+        "summary": "This minute's calls per pool, the 429 hold, and the daily counts of the last UTC days.",
         "operationId": "readout",
+        "parameters": [
+          {
+            "name": "days",
+            "in": "query",
+            "description": "UTC days to answer, today included, 1 up to the days kept (14 when left out).",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 1
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "The budget as it stands",
@@ -29,6 +42,16 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/BudgetSnapshot"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`days` is not a whole number from 1 up",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
                 }
               }
             }
@@ -410,9 +433,10 @@
       },
       "BudgetSnapshot": {
         "type": "object",
-        "description": "What `/v1/budget` answers: this minute over all pools and per pool, the 429 hold, and the last 14 UTC days.",
+        "description": "What `/v1/budget` answers: this minute over all pools and per pool, the 429 hold, and the last UTC days.",
         "required": [
           "limitPerMinute",
+          "historyDays",
           "used",
           "withheld",
           "resetsAt",
@@ -426,7 +450,7 @@
             "items": {
               "$ref": "#/components/schemas/DaySnapshot"
             },
-            "description": "The last 14 UTC days, today first."
+            "description": "The UTC days asked for, today first; a day without a single count is left out."
           },
           "heldUntil": {
             "type": [
@@ -435,6 +459,12 @@
             ],
             "format": "date-time",
             "description": "Until when CurseForge's 429 holds every call off, ISO 8601, or null while no hold is on."
+          },
+          "historyDays": {
+            "type": "integer",
+            "format": "int32",
+            "description": "UTC days of daily counts the gateway keeps, the most `days` can cover.",
+            "minimum": 0
           },
           "limitPerMinute": {
             "type": "integer",
@@ -566,6 +596,7 @@
           "POOL_REQUIRED",
           "UNKNOWN_POOL",
           "INVALID_PATH",
+          "INVALID_DAYS",
           "UPSTREAM_TIMEOUT",
           "UPSTREAM_UNREACHABLE",
           "UPSTREAM_TOO_LARGE",

@@ -16,6 +16,7 @@ pub enum ErrorCode {
     PoolRequired,
     UnknownPool,
     InvalidPath,
+    InvalidDays,
     UpstreamTimeout,
     UpstreamUnreachable,
     UpstreamTooLarge,
@@ -81,6 +82,14 @@ impl ApiError {
             StatusCode::BAD_REQUEST,
             ErrorCode::InvalidPath,
             "a CurseForge path is segments of letters, digits, - and _, separated by single slashes",
+        )
+    }
+
+    pub fn invalid_days() -> Self {
+        Self::new(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidDays,
+            "days must be a whole number of UTC days from 1 up",
         )
     }
 

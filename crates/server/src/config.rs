@@ -7,17 +7,21 @@ use std::{
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
+use crate::budget::DEFAULT_HISTORY_DAYS;
+
 const HOST_ENV: &str = "CONTENT_GATEWAY_HOST";
 const PORT_ENV: &str = "CONTENT_GATEWAY_PORT";
 const LOG_ENV: &str = "CONTENT_GATEWAY_LOG";
 const CONSUMERS_ENV: &str = "CONTENT_GATEWAY_CONSUMERS";
 const TOKEN_ENV: &str = "CONTENT_GATEWAY_TOKEN";
 const BUDGET_ENV: &str = "CONTENT_GATEWAY_BUDGET_PER_MINUTE";
+const HISTORY_DAYS_ENV: &str = "CONTENT_GATEWAY_BUDGET_HISTORY_DAYS";
 const REDIS_ENV: &str = "REDIS_URL";
 const API_KEY_ENV: &str = "CURSEFORGE_API_KEY";
 const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_PORT: u16 = 5005;
 const DEFAULT_BUDGET_PER_MINUTE: u32 = 300;
+const MAX_HISTORY_DAYS: u32 = 3660;
 const MIN_TOKEN_LENGTH: usize = 32;
 const MAX_NAME_LENGTH: usize = 64;
 pub const DEFAULT_LOG: &str = "info";
@@ -29,6 +33,7 @@ pub struct Config {
     pub listen: SocketAddr,
     pub consumers: Vec<Consumer>,
     pub budget_per_minute: u32,
+    pub budget_history_days: u32,
     pub redis_url: Option<RedisUrl>,
     pub curseforge_api_key: ApiKey,
 }
@@ -113,6 +118,8 @@ pub enum ConfigError {
     },
     #[error("{name} must be a whole number of calls per minute from 1 up, got {value:?}")]
     Budget { name: &'static str, value: String },
+    #[error("{name} must be a whole number of days from 1 to {MAX_HISTORY_DAYS}, got {value:?}")]
+    HistoryDays { name: &'static str, value: String },
     #[error(
         "{name} must be a URL such as redis://:password@127.0.0.1:6379/0 (rediss:// is not supported)"
     )]
@@ -209,6 +216,19 @@ impl Config {
             None => DEFAULT_BUDGET_PER_MINUTE,
         };
 
+        let budget_history_days = match lookup(HISTORY_DAYS_ENV) {
+            Some(value) => match value.parse::<u32>() {
+                Ok(days) if (1..=MAX_HISTORY_DAYS).contains(&days) => days,
+                _ => {
+                    return Err(ConfigError::HistoryDays {
+                        name: HISTORY_DAYS_ENV,
+                        value,
+                    });
+                }
+            },
+            None => DEFAULT_HISTORY_DAYS,
+        };
+
         let redis_url = match lookup(REDIS_ENV) {
             Some(value) => match redis::Client::open(value.as_str()) {
                 Ok(_) => Some(RedisUrl(value)),
@@ -237,6 +257,7 @@ impl Config {
             listen: SocketAddr::new(host, port),
             consumers,
             budget_per_minute,
+            budget_history_days,
             redis_url,
             curseforge_api_key,
         })
@@ -413,6 +434,26 @@ mod tests {
                 config_with_token(&[(BUDGET_ENV, value)]),
                 Err(ConfigError::Budget {
                     name: BUDGET_ENV,
+                    value: value.to_owned(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_ninety_days_of_counts_unless_told_otherwise() {
+        assert_eq!(config_with_token(&[]).unwrap().budget_history_days, 90);
+        assert_eq!(
+            config_with_token(&[(HISTORY_DAYS_ENV, "365")])
+                .unwrap()
+                .budget_history_days,
+            365
+        );
+        for value in ["0", "-1", "3661", "forever"] {
+            assert_eq!(
+                config_with_token(&[(HISTORY_DAYS_ENV, value)]),
+                Err(ConfigError::HistoryDays {
+                    name: HISTORY_DAYS_ENV,
                     value: value.to_owned(),
                 })
             );

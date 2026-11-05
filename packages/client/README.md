@@ -35,7 +35,7 @@ const page = curseforgePage(curseforgeModSchema).parse(answer.body);
 
 Only the gateway's own answers throw, as `ContentGatewayError` with the gateway's `code` (`BUDGET_SPENT`, `UPSTREAM_HOLD`, `UNAUTHORIZED`, ...), `status`, `pool` and `retryAfterMs`. `code` is `null` when the answer was not the gateway's JSON error at all, such as a proxy's HTML page.
 
-`health()` reads `/v1/healthz` and `budget()` reads `/v1/budget`, both typed from `openapi.json`. The `paths` and `components` types of the document are exported for anything else.
+`health()` reads `/v1/healthz` and `budget({ days })` reads `/v1/budget` with the last `days` UTC days of counts (14 when left out, up to the gateway's `historyDays`), both typed from `openapi.json`. The `paths` and `components` types of the document are exported for anything else.
 
 ### Waiting out a refusal
 

@@ -35,7 +35,8 @@ impl AppState {
                 pools,
                 clock.clone(),
                 redis.clone(),
-            ),
+            )
+            .keeping_days(config.budget_history_days),
             upstream: Upstream::new(
                 CURSEFORGE_API,
                 config.curseforge_api_key.clone(),
@@ -177,6 +178,22 @@ mod tests {
         assert_eq!(body["source"], "memory");
         assert_eq!(body["pools"][0]["consumer"], "app");
         assert_eq!(body["pools"][1]["pool"], "app");
+    }
+
+    #[tokio::test]
+    async fn the_budget_answers_the_days_asked_for_and_refuses_a_bad_number() {
+        let (status, _, body) = get("/v1/budget?days=30", Some(TOKEN)).await;
+        assert_eq!(status, StatusCode::OK);
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["historyDays"], 90);
+        assert_eq!(body["days"], Value::Array(Vec::new()));
+
+        for query in ["days=0", "days=-1", "days=many", "days="] {
+            let (status, _, body) = get(&format!("/v1/budget?{query}"), Some(TOKEN)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["code"], "INVALID_DAYS", "{query}");
+        }
     }
 
     #[tokio::test]

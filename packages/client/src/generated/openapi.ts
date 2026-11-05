@@ -6,7 +6,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** This minute's calls per pool, the 429 hold, and the daily counts of the last 14 UTC days. */
+    /** This minute's calls per pool, the 429 hold, and the daily counts of the last UTC days. */
     get: operations["readout"];
     put?: never;
     post?: never;
@@ -96,15 +96,20 @@ export interface components {
        */
       retryAfterMs?: number | null;
     };
-    /** @description What `/v1/budget` answers: this minute over all pools and per pool, the 429 hold, and the last 14 UTC days. */
+    /** @description What `/v1/budget` answers: this minute over all pools and per pool, the 429 hold, and the last UTC days. */
     BudgetSnapshot: {
-      /** @description The last 14 UTC days, today first. */
+      /** @description The UTC days asked for, today first; a day without a single count is left out. */
       days: components["schemas"]["DaySnapshot"][];
       /**
        * Format: date-time
        * @description Until when CurseForge's 429 holds every call off, ISO 8601, or null while no hold is on.
        */
       heldUntil?: string | null;
+      /**
+       * Format: int32
+       * @description UTC days of daily counts the gateway keeps, the most `days` can cover.
+       */
+      historyDays: number;
       /**
        * Format: int32
        * @description Calls to CurseForge the minute allows over all pools.
@@ -180,6 +185,7 @@ export interface components {
       | "POOL_REQUIRED"
       | "UNKNOWN_POOL"
       | "INVALID_PATH"
+      | "INVALID_DAYS"
       | "UPSTREAM_TIMEOUT"
       | "UPSTREAM_UNREACHABLE"
       | "UPSTREAM_TOO_LARGE"
@@ -237,7 +243,10 @@ export type $defs = Record<string, never>;
 export interface operations {
   readout: {
     parameters: {
-      query?: never;
+      query?: {
+        /** @description UTC days to answer, today included, 1 up to the days kept (14 when left out). */
+        days?: number;
+      };
       header?: never;
       path?: never;
       cookie?: never;
@@ -251,6 +260,15 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["BudgetSnapshot"];
+        };
+      };
+      /** @description `days` is not a whole number from 1 up */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
         };
       };
       /** @description No valid consumer token */

@@ -43,6 +43,7 @@ describe("the gateway's own routes", () => {
     gateway.reply(
       json(200, {
         limitPerMinute: 300,
+        historyDays: 90,
         used: 2,
         withheld: 0,
         resetsAt: "2026-11-03T20:01:00Z",
@@ -52,9 +53,10 @@ describe("the gateway's own routes", () => {
         days: [],
       }),
     );
-    const budget = await client({ pool: "launcher" }).budget();
+    const budget = await client({ pool: "launcher" }).budget({ days: 30 });
     expect(budget.used).toBe(2);
-    expect(gateway.seen[0]?.url).toBe("/v1/budget");
+    expect(budget.historyDays).toBe(90);
+    expect(gateway.seen[0]?.url).toBe("/v1/budget?days=30");
     expect(gateway.seen[0]?.headers.authorization).toBe(`Bearer ${TOKEN}`);
     expect(gateway.seen[0]?.headers["x-budget-pool"]).toBe("launcher");
   });
