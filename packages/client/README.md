@@ -72,7 +72,7 @@ A consumer that needs more of a file than its ids extends the file schema for th
 
 A change consumers can notice comes with a changeset (`pnpm changeset` at the repository root); the release PR turns the changesets into the version and `CHANGELOG.md`, and the merge into `main` publishes. Never edit the version by hand.
 
-The package is published to the registry named in `publishConfig.registry` of `package.json`, under the `@createrington` scope. A fork that publishes its own copy changes both the registry and the scope there, and sets its own `NPM_PUBLISH_TOKEN` secret for the publish workflow.
+The package is published under the `@createrington` scope to the registry the publish workflow reads from the `NPM_PUBLISH_REGISTRY` repository variable, with the `NPM_PUBLISH_TOKEN` secret. A fork that publishes its own copy changes the scope in `package.json` and sets its own variable and secret.
 
 ```bash
 pnpm --filter @createrington/content-gateway-client test

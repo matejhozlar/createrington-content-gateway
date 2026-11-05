@@ -97,7 +97,7 @@ RestartSec=5
 User=content-gateway
 ```
 
-`.gitea/workflows/deploy.yml` is an example of that deploy for Gitea Actions: it builds the binary when a release merges into `main`, writes `.env` from [Infisical](https://infisical.com/), keeps the previous binary and `.env` as `content-gateway.previous` and `.env.previous`, touches `.restart-trigger` for a systemd path unit that restarts the service, and waits until `/v1/healthz` reports the deployed commit and build time; when it does not, the previous build is put back and restarted. The directory and the Infisical project come from the `DEPLOY_DIR` and `INFISICAL_PROJECT_ID` repository variables, the Infisical credentials from secrets.
+`.gitea/workflows/deploy.yml` is an example of that deploy as a Gitea Actions workflow: it builds the binary when a release merges into `main`, writes `.env` from [Infisical](https://infisical.com/), keeps the previous binary and `.env` as `content-gateway.previous` and `.env.previous`, touches `.restart-trigger` for a systemd path unit that restarts the service, and waits until `/v1/healthz` reports the deployed commit and build time; when it does not, the previous build is put back and restarted. The directory and the Infisical project come from the `DEPLOY_DIR` and `INFISICAL_PROJECT_ID` repository variables, the Infisical credentials from secrets.
 
 ## Endpoints
 
@@ -197,15 +197,15 @@ pnpm format:check
 
 `openapi.json`, `packages/client/src/generated/openapi.ts` and `packages/python-client/src/content_gateway/generated.py` are generated and checked in: `cargo test` fails when the document no longer matches the server, and each client's generate check fails when its types no longer match the document. `pnpm openapi` rewrites all three; the Python step needs [uv](https://docs.astral.sh/uv/), which also runs the Python client's own checks (see its README).
 
-Every pull request runs these checks in CI, on Gitea Actions for the primary repository (`.gitea/workflows/ci.yml`) and on GitHub Actions for the mirror (`.github/workflows/ci.yml`); both share the composite actions under `.ci/actions`.
+Every pull request runs these checks in CI. The same jobs exist as a Gitea Actions workflow (`.gitea/workflows/ci.yml`) and as a GitHub Actions workflow (`.github/workflows/ci.yml`), sharing the composite actions under `.ci/actions`, so the checks are the same wherever the repository is hosted.
 
 ### Releasing
 
-A server release is the `vX.Y.Z` tag on the release merge into `main`. The mirror carries the tag to GitHub, where `.github/workflows/release.yml` checks it against `package.json` and `Cargo.toml`, builds the binaries and the image, and publishes the release with the notes from that version's section of `CHANGELOG.md`, then publishes the Python client to PyPI when its version is not there yet. The image package GHCR creates on the first push is private: make it public once in the package's settings on GitHub, or the `docker pull` above fails for everyone else.
+A server release is the `vX.Y.Z` tag on the release merge into `main`. On GitHub, `.github/workflows/release.yml` checks the tag against `package.json` and `Cargo.toml`, builds the binaries and the image, and publishes the release with the notes from that version's section of `CHANGELOG.md`, then publishes the Python client to PyPI when its version is not there yet. The image package GHCR creates on the first push is private: make it public once in the package's settings on GitHub, or the `docker pull` above fails for everyone else.
 
 ### Releasing the client
 
-The client package is versioned with [changesets](https://github.com/changesets/changesets), apart from the server. A change to `packages/client` comes with a changeset written on its branch (`pnpm changeset`); CI refuses a changed client without one. The release PR runs `pnpm version-packages`, which turns the changesets into the version bump and the package's `CHANGELOG.md` entry, and the merge into `main` publishes that version to the npm registry named in the package's `publishConfig` (`.gitea/workflows/publish-client.yml`, with the registry token in the `NPM_PUBLISH_TOKEN` secret). A version the registry already has is not published again, and a merge that still carries unconsumed changesets fails instead of publishing.
+The client package is versioned with [changesets](https://github.com/changesets/changesets), apart from the server. A change to `packages/client` comes with a changeset written on its branch (`pnpm changeset`); CI refuses a changed client without one. The release PR runs `pnpm version-packages`, which turns the changesets into the version bump and the package's `CHANGELOG.md` entry, and the merge into `main` publishes that version to the npm registry named by the `NPM_PUBLISH_REGISTRY` repository variable (`.gitea/workflows/publish-client.yml`, with the registry token in the `NPM_PUBLISH_TOKEN` secret). A version the registry already has is not published again, and a merge that still carries unconsumed changesets fails instead of publishing.
 
 The budget's tests also run against a real Redis when `CONTENT_GATEWAY_TEST_REDIS_URL` names one, for example `docker run --rm -p 127.0.0.1:6390:6379 redis:8.10-alpine` and `CONTENT_GATEWAY_TEST_REDIS_URL=redis://127.0.0.1:6390/0 cargo test`. Each test uses its own key prefix and deletes its keys; CI runs them against a throwaway Redis.
 
