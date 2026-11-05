@@ -7,7 +7,10 @@ export {
   type CurseForgeAnswer,
   type CurseForgeMethod,
   type CurseForgeRequest,
+  type ModrinthRequest,
+  type PassthroughAnswer,
   type Query,
+  type ResolveOptions,
 } from "./client.js";
 export type {
   ApiError,
@@ -17,9 +20,15 @@ export type {
   DayPoolSnapshot,
   DaySnapshot,
   ErrorCode,
+  FileSource,
   Health,
   PoolSnapshot,
+  ResolveRequest,
+  Resolved,
+  ResolvedFile,
+  VersionFilesRequest,
   components,
   paths,
 } from "./gateway.js";
 export * from "./curseforge.js";
+export * from "./modrinth.js";

@@ -62,6 +62,48 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/v1/modrinth/version_file/{hash}": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * The Modrinth version of the file with this SHA-1, as `GET api.modrinth.com/v2/version_file/{hash}` answers it.
+     * @description Kept for an hour once found and for 10 minutes when Modrinth does not know the hash. `Cache-Control: no-cache`
+     *     asks Modrinth again. Modrinth calls do not count against the CurseForge budget.
+     */
+    get: operations["version_file"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v1/modrinth/version_files": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * The Modrinth versions of the files with these SHA-1s, keyed by hash, as `POST api.modrinth.com/v2/version_files`
+     *     answers them: a hash Modrinth does not know is left out.
+     * @description Answered per hash from the cache; only the hashes not kept are asked for, 100 per call.
+     */
+    post: operations["version_files"];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/v1/openapi.json": {
     parameters: {
       query?: never;
@@ -73,6 +115,30 @@ export interface paths {
     get: operations["document"];
     put?: never;
     post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  "/v1/resolve": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * A download address for each CurseForge file: CurseForge's own link, else Modrinth's copy of the file found by
+     *     its SHA-1, else the file's built address on CurseForge's CDN when a HEAD answers 200 with the file's size.
+     * @description The files are read from the cache like `POST /v1/curseforge/mods/files`, and the CurseForge calls for the ones
+     *     not kept count against the budget. Modrinth answers and CDN verdicts are kept for an hour, misses for 10
+     *     minutes. No bytes pass through the gateway: the consumer downloads from the address given. A null `source` with
+     *     `retry` false means no source has the file; `retry` true means a source could not be asked this time.
+     */
+    post: operations["resolve"];
     delete?: never;
     options?: never;
     head?: never;
@@ -186,6 +252,8 @@ export interface components {
       | "UNKNOWN_POOL"
       | "INVALID_PATH"
       | "INVALID_DAYS"
+      | "INVALID_HASH"
+      | "INVALID_BODY"
       | "UPSTREAM_TIMEOUT"
       | "UPSTREAM_UNREACHABLE"
       | "UPSTREAM_TOO_LARGE"
@@ -193,6 +261,11 @@ export interface components {
       | "BUDGET_SPENT"
       | "UPSTREAM_HOLD"
       | "REQUEST_TOO_LARGE";
+    /**
+     * @description Where a file's download address comes from.
+     * @enum {string}
+     */
+    FileSource: "curseforge" | "modrinth" | "curseforge-cdn";
     /** @description What `/v1/healthz` answers: the running gateway's version and build. */
     Health: {
       /** @description When the binary was built, ISO 8601 in UTC, when the build said. */
@@ -225,6 +298,50 @@ export interface components {
        */
       withheld: number;
     };
+    /** @description What `POST /v1/resolve` answers. */
+    Resolved: {
+      /** @description One entry per file id asked for, in the order asked, each id once. */
+      files: components["schemas"]["ResolvedFile"][];
+    };
+    /** @description What `POST /v1/resolve` answers for each file asked for. */
+    ResolvedFile: {
+      /** Format: int64 */
+      fileId: number;
+      /** @description The file's name as CurseForge lists it, null when CurseForge does not know the file. */
+      fileName?: string | null;
+      /**
+       * @description True when a source could not be asked for the file, so that a null `source` is worth asking again later
+       *     rather than remembering.
+       */
+      retry: boolean;
+      /** @description The file's SHA-1 as CurseForge lists it, null when CurseForge does not know the file. */
+      sha1?: string | null;
+      /**
+       * Format: int64
+       * @description The file's size in bytes as CurseForge lists it, null when CurseForge does not know the file.
+       */
+      size?: number | null;
+      source?: components["schemas"]["FileSource"] | null;
+      /** @description The address to download the file from, or null when no source has it. */
+      url?: string | null;
+    };
+    /** @description The body of `POST /v1/resolve`. */
+    ResolveRequest: {
+      /**
+       * @description Whether a file's built address on CurseForge's CDN may be checked and given when neither CurseForge nor
+       *     Modrinth has a link. On unless set to false.
+       * @default true
+       */
+      cdn: boolean;
+      /**
+       * @description CurseForge file ids, up to 1000.
+       * @example [
+       *       4567890,
+       *       4567891
+       *     ]
+       */
+      fileIds: number[];
+    };
     /**
      * @description Where a readout's counts come from: `redis` when they are the stored ones, `memory` when no Redis is configured,
      *     `unavailable` when Redis did not answer, so the minute is this process's own count and the days hold only what
@@ -232,6 +349,21 @@ export interface components {
      * @enum {string}
      */
     Source: "redis" | "memory" | "unavailable";
+    /** @description The body of `POST /v1/modrinth/version_files`. */
+    VersionFilesRequest: {
+      /**
+       * @description Only `sha1` is supported.
+       * @example sha1
+       */
+      algorithm?: string;
+      /**
+       * @description SHA-1 hashes of the wanted files, 40 hex digits each.
+       * @example [
+       *       "3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e"
+       *     ]
+       */
+      hashes: string[];
+    };
   };
   responses: never;
   parameters: never;
@@ -490,6 +622,161 @@ export interface operations {
       };
     };
   };
+  version_file: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description `no-cache` asks Modrinth again instead of answering from the cache */
+        "Cache-Control"?: string | null;
+      };
+      path: {
+        /**
+         * @description The file's SHA-1, 40 hex digits
+         * @example 3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e
+         */
+        hash: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description The version Modrinth lists the file under, as Modrinth sent it */
+      200: {
+        headers: {
+          /** @description `hit` from the cache, `miss` from Modrinth, `stale` an old answer given because Modrinth could not be asked */
+          "X-Cache"?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description `INVALID_HASH` */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description No valid consumer token */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Modrinth does not know the hash */
+      404: {
+        headers: {
+          /** @description As on 200 */
+          "X-Cache"?: string;
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Modrinth could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE` */
+      502: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Modrinth did not answer in time, `UPSTREAM_TIMEOUT` */
+      504: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Any other status Modrinth answered, with its body. Only the gateway's own answers lack `X-Cache` */
+      default: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
+  version_files: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description `no-cache` asks Modrinth again instead of answering from the cache */
+        "Cache-Control"?: string | null;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["VersionFilesRequest"];
+      };
+    };
+    responses: {
+      /** @description The versions found, keyed by lowercase hash, each as Modrinth sent it */
+      200: {
+        headers: {
+          /** @description `hit` when every hash was kept, `miss` when Modrinth was asked, `stale` an old answer given because Modrinth could not be asked */
+          "X-Cache"?: string;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": unknown;
+        };
+      };
+      /** @description `INVALID_BODY` or `INVALID_HASH` */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description No valid consumer token */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Modrinth could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE` */
+      502: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Modrinth did not answer in time, `UPSTREAM_TIMEOUT` */
+      504: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Any other status Modrinth answered, with its body. Only the gateway's own answers lack `X-Cache` */
+      default: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
   document: {
     parameters: {
       query?: never;
@@ -506,6 +793,91 @@ export interface operations {
         };
         content: {
           "application/json": unknown;
+        };
+      };
+    };
+  };
+  resolve: {
+    parameters: {
+      query?: never;
+      header?: {
+        /** @description `no-cache` asks every source again instead of answering from the cache */
+        "Cache-Control"?: string | null;
+        /** @description The pool the CurseForge calls draw from. Required when the token has more than one pool */
+        "X-Budget-Pool"?: string | null;
+      };
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        "application/json": components["schemas"]["ResolveRequest"];
+      };
+    };
+    responses: {
+      /** @description An address per file, in the order asked */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["Resolved"];
+        };
+      };
+      /** @description `INVALID_BODY`, `POOL_REQUIRED` or `UNKNOWN_POOL` */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description No valid consumer token */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The files need more CurseForge calls than a whole minute allows, `REQUEST_TOO_LARGE`; split them */
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description CurseForge could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE` */
+      502: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The CurseForge call was refused: `BUDGET_SPENT` this minute or `UPSTREAM_HOLD` after a 429 */
+      503: {
+        headers: {
+          /** @description Seconds until the next call can go out */
+          "Retry-After"?: number;
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description CurseForge did not answer in time, `UPSTREAM_TIMEOUT` */
+      504: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
         };
       };
     };

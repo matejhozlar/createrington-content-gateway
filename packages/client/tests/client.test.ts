@@ -122,6 +122,73 @@ describe("the CurseForge passthrough", () => {
     expect(seen?.headers["x-budget-pool"]).toBe("app");
   });
 
+  it("looks a file up on Modrinth without a pool and the version files with one call", async () => {
+    gateway.reply(json(200, { id: "v", files: [] }, "miss"));
+    const one = await client({ pool: "launcher" }).modrinthVersionFile(
+      "3E1DD9FB5EA2F0DD4FFCC2B1A7D0BB1A1A9D6A8E",
+      { fresh: true },
+    );
+    expect(one.cache).toBe("miss");
+    expect(one.body).toEqual({ id: "v", files: [] });
+    expect(gateway.seen[0]?.url).toBe(
+      "/v1/modrinth/version_file/3E1DD9FB5EA2F0DD4FFCC2B1A7D0BB1A1A9D6A8E",
+    );
+    expect(gateway.seen[0]?.headers["cache-control"]).toBe("no-cache");
+
+    gateway.reply(json(404, "", "hit"));
+    const none = await client().modrinthVersionFile("abc");
+    expect(none.status).toBe(404);
+    expect(none.ok).toBe(false);
+
+    gateway.reply(json(200, {}, "hit"));
+    await client().modrinthVersionFiles(["abc", "def"]);
+    expect(gateway.seen[2]?.method).toBe("POST");
+    expect(gateway.seen[2]?.url).toBe("/v1/modrinth/version_files");
+    expect(gateway.seen[2]?.body).toBe(
+      '{"hashes":["abc","def"],"algorithm":"sha1"}',
+    );
+  });
+
+  it("resolves files with the pool and without the CDN when asked", async () => {
+    gateway.reply(
+      json(200, {
+        files: [
+          {
+            fileId: 1,
+            source: "curseforge-cdn",
+            url: "https://mediafilez.forgecdn.net/files/0/1/a.jar",
+            sha1: "abc",
+            fileName: "a.jar",
+            size: 10,
+            retry: false,
+          },
+        ],
+      }),
+    );
+    const resolved = await client({ pool: "launcher" }).resolve([1, 1], {
+      cdn: false,
+      pool: "app",
+    });
+    expect(resolved.files[0]?.source).toBe("curseforge-cdn");
+    expect(gateway.seen[0]?.url).toBe("/v1/resolve");
+    expect(gateway.seen[0]?.body).toBe('{"fileIds":[1,1],"cdn":false}');
+    expect(gateway.seen[0]?.headers["x-budget-pool"]).toBe("app");
+
+    gateway.reply(
+      json(503, {
+        code: "BUDGET_SPENT",
+        message: "spent",
+        pool: "app",
+        retryAfterMs: 1000,
+      }),
+    );
+    const error = (await client()
+      .resolve([2])
+      .catch((error: unknown) => error)) as ContentGatewayError;
+    expect(error).toBeInstanceOf(ContentGatewayError);
+    expect(error.code).toBe("BUDGET_SPENT");
+  });
+
   it("refuses a GET with a body before sending anything", async () => {
     const request = { method: "GET", body: { modIds: [1] } } as const;
     const error = (await client()

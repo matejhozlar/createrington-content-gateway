@@ -1,4 +1,10 @@
-import type { ApiError, BudgetSnapshot, ErrorCode, Health } from "./gateway.js";
+import type {
+  ApiError,
+  BudgetSnapshot,
+  ErrorCode,
+  Health,
+  Resolved,
+} from "./gateway.js";
 
 /**
  * How long one request to the gateway may take. Above the 10 s the gateway
@@ -49,11 +55,35 @@ export type CurseForgeRequest = CurseForgeMethod & {
   signal?: AbortSignal;
 };
 
+/** A Modrinth lookup's options. Modrinth calls draw from no pool. */
+export interface ModrinthRequest {
+  /** Ask Modrinth again instead of answering from the cache (`Cache-Control: no-cache`). */
+  fresh?: boolean;
+  signal?: AbortSignal;
+}
+
+/** What `resolve()` asks for. */
+export interface ResolveOptions {
+  /**
+   * Whether a file's built address on CurseForge's CDN may be checked and
+   * given when neither CurseForge nor Modrinth has a link. On unless false.
+   */
+  cdn?: boolean;
+  /** The pool the CurseForge calls draw from instead of the client's. */
+  pool?: string;
+  /** Ask every source again instead of answering from the cache. */
+  fresh?: boolean;
+  /** As on `CurseForgeRequest`. */
+  waitUpToMs?: number;
+  signal?: AbortSignal;
+}
+
 /** How the gateway answered a passthrough call, from `X-Cache`. */
 export type CacheStatus = (typeof CACHE_STATUSES)[number];
 
-export interface CurseForgeAnswer {
-  /** CurseForge's status, as it came. */
+/** What an upstream (CurseForge or Modrinth) answered through the gateway. */
+export interface PassthroughAnswer {
+  /** The upstream's status, as it came. */
   status: number;
   /** Whether `status` is 2xx. */
   ok: boolean;
@@ -62,6 +92,8 @@ export interface CurseForgeAnswer {
   body: unknown;
   headers: Headers;
 }
+
+export type CurseForgeAnswer = PassthroughAnswer;
 
 /**
  * An answer the gateway gave itself instead of passing one on: a refused call,
@@ -167,7 +199,7 @@ export class ContentGateway {
         `a GET to ${path} cannot carry a body; leave method unset or make it POST`,
       );
     }
-    const { response, body } = await this.send({
+    return this.passthrough({
       method,
       path: `/v1/curseforge/${path.replace(/^\/+/, "")}`,
       query: request.query,
@@ -178,12 +210,82 @@ export class ContentGateway {
       waitUpToMs: request.waitUpToMs,
       signal: request.signal,
     });
+  }
+
+  /**
+   * `GET /v1/modrinth/version_file/<sha1>`: the version Modrinth lists the
+   * file with this SHA-1 under, as `GET api.modrinth.com/v2/version_file/{hash}`
+   * answers it, or a 404 when Modrinth does not know the hash. Parse the body
+   * with `modrinthVersionSchema`; `modrinthFileUrl` picks the file's own address.
+   */
+  async modrinthVersionFile(
+    sha1: string,
+    request: ModrinthRequest = {},
+  ): Promise<PassthroughAnswer> {
+    return this.passthrough({
+      method: "GET",
+      path: `/v1/modrinth/version_file/${encodeURIComponent(sha1)}`,
+      authenticated: true,
+      fresh: request.fresh,
+      signal: request.signal,
+    });
+  }
+
+  /**
+   * `POST /v1/modrinth/version_files`: the versions Modrinth lists these
+   * SHA-1s under, keyed by lowercase hash, as `POST api.modrinth.com/v2/version_files`
+   * answers them; a hash Modrinth does not know is left out. Parse the body
+   * with `modrinthVersionFilesSchema`.
+   */
+  async modrinthVersionFiles(
+    hashes: readonly string[],
+    request: ModrinthRequest = {},
+  ): Promise<PassthroughAnswer> {
+    return this.passthrough({
+      method: "POST",
+      path: "/v1/modrinth/version_files",
+      body: { hashes, algorithm: "sha1" },
+      authenticated: true,
+      fresh: request.fresh,
+      signal: request.signal,
+    });
+  }
+
+  /**
+   * `POST /v1/resolve`: a download address per CurseForge file id, from
+   * CurseForge's own link, else Modrinth's copy found by SHA-1, else the
+   * file's built address on CurseForge's CDN when it answers with the file's
+   * size. The gateway's refusals and CurseForge's failures throw as
+   * `ContentGatewayError`.
+   */
+  async resolve(
+    fileIds: readonly number[],
+    options: ResolveOptions = {},
+  ): Promise<Resolved> {
+    const { body } = await this.send({
+      method: "POST",
+      path: "/v1/resolve",
+      body: {
+        fileIds,
+        ...(options.cdn === undefined ? {} : { cdn: options.cdn }),
+      },
+      authenticated: true,
+      pool: options.pool,
+      fresh: options.fresh,
+      waitUpToMs: options.waitUpToMs,
+      signal: options.signal,
+    });
+    return body as Resolved;
+  }
+
+  private async passthrough(options: SendOptions): Promise<PassthroughAnswer> {
+    const { response, body } = await this.send(options);
     const cache = response.headers.get(CACHE_HEADER);
     if (!isCacheStatus(cache)) {
       throw new ContentGatewayError(
         response.status,
         null,
-        `the answer to ${method} ${path} did not come through the gateway: no X-Cache header`,
+        `the answer to ${options.method} ${options.path} did not come through the gateway: no X-Cache header`,
       );
     }
     return {
