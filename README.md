@@ -155,7 +155,7 @@ Errors answer `{ "code", "message" }`. A call the budget refuses answers `503` w
 | `GET /version/{id}`                                                         | 10 min | 10 min          |
 | `GET /version_file/{sha1}`, `POST /version_files` (per hash)                | 1 h    | 10 min          |
 
-`GET /version_file/{sha1}` and `POST /version_files` with `{"hashes": [...], "algorithm": "sha1"}` (up to 1000 hashes) are kept per hash and share their entries: only the hashes not kept are asked for, 100 per call, and the batch answer is the versions found keyed by lowercase hash, leaving unknown hashes out as Modrinth does. A hash that is not 40 hex digits answers `400 INVALID_HASH`. Every other route, such as `POST /version_files/update`, is asked each time and still counted.
+`GET /version_file/{sha1}` and `POST /version_files` with `{"hashes": [...], "algorithm": "sha1"}` (up to 1000 hashes) are kept per hash and share their entries: only the hashes not kept are asked for, 100 per call, and the batch answer is the versions found keyed by lowercase hash, leaving unknown hashes out as Modrinth does. A hash that is not 40 hex digits answers `400 INVALID_HASH`; a body asking for another algorithm goes to Modrinth as it came. Every other route, such as `POST /version_files/update`, is asked each time and still counted. A Modrinth path may hold the characters its slugs allow (`.`, `+`, `!`, `(`, `)`, `~`, `'`, `,`, `@`, `$`) besides letters, digits, `-` and `_`.
 
 ### Resolve
 

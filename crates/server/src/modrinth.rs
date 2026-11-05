@@ -63,6 +63,20 @@ pub fn sha1_query(query: Option<&str>) -> bool {
     }
 }
 
+/// Whether a `version_files` body asks for SHA-1 (or nothing), the lookup the gateway keeps per hash. Any other
+/// body goes to Modrinth as it came.
+pub fn sha1_body(body: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct Algorithm {
+        algorithm: Option<String>,
+    }
+    serde_json::from_slice::<Algorithm>(body).map_or(true, |asked| {
+        asked
+            .algorithm
+            .is_none_or(|algorithm| algorithm.eq_ignore_ascii_case("sha1"))
+    })
+}
+
 /// The body of `POST /v1/modrinth/version_files`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct VersionFilesRequest {
@@ -673,9 +687,9 @@ mod tests {
         let many = format!(r#"{{"hashes":[{}]}}"#, many.join(","));
         for (body, code) in [
             ("{}", "INVALID_BODY"),
+            ("nope", "INVALID_BODY"),
             (r#"{"hashes":[]}"#, "INVALID_BODY"),
             (many.as_str(), "INVALID_BODY"),
-            (r#"{"hashes":["abc"],"algorithm":"sha512"}"#, "INVALID_BODY"),
             (r#"{"hashes":["abc"]}"#, "INVALID_HASH"),
         ] {
             let got = send(
@@ -800,6 +814,58 @@ mod tests {
                 .held_until
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn another_hash_algorithm_goes_to_modrinth_as_it_came() {
+        let mock = Mock::start(Duration::ZERO, |_, _| reply(200, r#"{"x":{}}"#)).await;
+        let gateway = gateway(&mock, 300, TIMEOUT);
+        for _ in 0..2 {
+            let got = send(
+                &gateway.router,
+                Request::post("/v1/modrinth/version_files")
+                    .header("content-type", "application/json"),
+                r#"{"hashes":["abc"],"algorithm":"sha512"}"#,
+            )
+            .await;
+            assert_eq!(got.status, StatusCode::OK);
+            assert_eq!(got.header("x-cache"), Some("miss"));
+            assert_eq!(got.json()["x"], serde_json::json!({}));
+        }
+        let seen = mock.seen();
+        assert_eq!(seen.len(), 2);
+        assert!(seen[0].body.contains("sha512"));
+        let single = get(
+            &gateway.router,
+            "/v1/modrinth/version_file/abc?algorithm=sha512",
+        )
+        .await;
+        assert_eq!(single.status, StatusCode::OK);
+        assert_eq!(mock.seen()[2].uri, "/v2/version_file/abc?algorithm=sha512");
+    }
+
+    #[tokio::test]
+    async fn a_slug_with_the_characters_modrinth_allows_passes_and_a_dot_segment_does_not() {
+        let mock = Mock::start(Duration::ZERO, |_, _| reply(200, r#"{"slug":"x"}"#)).await;
+        let gateway = gateway(&mock, 300, TIMEOUT);
+        let got = get(
+            &gateway.router,
+            "/v1/modrinth/project/fabric-api.v1+jar(a)!",
+        )
+        .await;
+        assert_eq!(got.status, StatusCode::OK);
+        assert_eq!(mock.seen()[0].uri, "/v2/project/fabric-api.v1+jar(a)!");
+        for uri in [
+            "/v1/modrinth/project/../search",
+            "/v1/modrinth/project/.",
+            "/v1/modrinth/project/a%25b",
+            "/v1/curseforge/mods/fabric-api.v1",
+        ] {
+            let got = get(&gateway.router, uri).await;
+            assert_eq!(got.status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_eq!(got.json()["code"], "INVALID_PATH", "{uri}");
+        }
+        assert_eq!(mock.calls(), 1);
     }
 
     #[tokio::test]

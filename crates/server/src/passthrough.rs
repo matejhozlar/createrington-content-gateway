@@ -40,12 +40,17 @@ pub const fn fresh(found_ms: u64, not_found_ms: Option<u64>) -> Option<Freshness
     })
 }
 
-/// A path segment an upstream may be asked for: letters, digits, `-` and `_`.
-pub fn valid_segment(segment: &str) -> bool {
+/// A path segment `source` may be asked for: letters, digits, `-` and `_`, plus for Modrinth the other characters
+/// its slugs may hold (`.`, `+`, `!`, `(`, `)`, `~`, `'`, `,`, `@`, `$`). Never `.` or `..` alone, nor anything that
+/// could change the request, such as `/`, `%`, `?` or `#`.
+pub fn valid_segment(source: Source, segment: &str) -> bool {
+    let slug_byte = |byte: u8| source == Source::Modrinth && b".+!()~',@$".contains(&byte);
     !segment.is_empty()
-        && segment
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        && segment != "."
+        && segment != ".."
+        && segment.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || slug_byte(byte)
+        })
 }
 
 pub fn is_id(segment: &str) -> bool {
@@ -94,7 +99,10 @@ pub async fn passthrough(state: Arc<AppState>, source: Source, request: Request)
         body,
     } = request;
     let segments: Vec<&str> = path.split('/').collect();
-    if !segments.iter().all(|segment| valid_segment(segment)) {
+    if !segments
+        .iter()
+        .all(|segment| valid_segment(source, segment))
+    {
         return ApiError::invalid_path().into_response();
     }
     let query = uri.query().map(str::to_owned);
@@ -109,7 +117,9 @@ pub async fn passthrough(state: Arc<AppState>, source: Source, request: Request)
                 return batch::answer(state, pool, batch, ids, forced).await;
             }
         }
-        (Source::Modrinth, Method::POST, ["version_files"]) if no_query => {
+        (Source::Modrinth, Method::POST, ["version_files"])
+            if no_query && modrinth::sha1_body(&body) =>
+        {
             return modrinth::version_files(state, pool, &body, forced).await;
         }
         (Source::Modrinth, Method::GET, ["version_file", hash])
