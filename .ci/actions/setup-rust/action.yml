@@ -43,7 +43,7 @@ runs:
 
     - name: Cache cargo registry
       if: env.CI_PERSISTENT_RUST != '1'
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry/index
@@ -55,7 +55,7 @@ runs:
 
     - name: Cache target directory
       if: env.CI_PERSISTENT_RUST != '1' && inputs.cache-target == 'true'
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: target
         key: ${{ runner.os }}-cargo-target-${{ hashFiles('rust-toolchain.toml') }}-${{ hashFiles('Cargo.lock') }}
