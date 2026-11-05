@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.3 (2026-11-05)
+
+- [fix] Make the GitHub release workflow read the release tags from the remote instead of fetching them with the checkout, retrying for up to a minute until the new tag is visible and failing the release when it never is, and ignore pre-release tags when deciding which release is the latest
+- [chore] Move the CI, deploy and publish workflows and the shared composite actions to the Node 24 majors of their actions (`actions/checkout@v7`, `actions/setup-node@v7`, `actions/cache@v6`, `pnpm/action-setup@v6`)
+- [chore] Describe the Gitea and GitHub CI workflows in the README as equivalent, without naming either as the primary host
+
 ## v0.1.2 (2026-11-05)
 
 - [add] Publish every release on GitHub: the `vX.Y.Z` tag builds static amd64 and arm64 binaries, `openapi.json` and a `SHA256SUMS` for the GitHub release, with notes taken from this changelog, and a multi-arch image at `ghcr.io/matejhozlar/createrington-content-gateway:<version>`, after checking that the tag matches `package.json` and `Cargo.toml`

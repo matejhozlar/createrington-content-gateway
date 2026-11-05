@@ -16,8 +16,14 @@ env:
 jobs:
   publish:
     runs-on: oracle
+    env:
+      NPM_PUBLISH_REGISTRY: ${{ vars.NPM_PUBLISH_REGISTRY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+
+      - name: Validate the publish variables
+        run: |
+          : "${NPM_PUBLISH_REGISTRY:?}"
 
       - name: Setup
         uses: ./.ci/actions/setup
@@ -36,8 +42,10 @@ jobs:
 
       - name: Publish the version the registry does not have yet
         env:
+          npm_config_registry: ${{ env.NPM_PUBLISH_REGISTRY }}
           NPM_PUBLISH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
         run: |
-          registry=$(node -p "new URL(require('./packages/client/package.json').publishConfig.registry).host + new URL(require('./packages/client/package.json').publishConfig.registry).pathname")
-          echo "//${registry}:_authToken=${NPM_PUBLISH_TOKEN}" >> .npmrc
+          : "${NPM_PUBLISH_TOKEN:?}"
+          host=$(node -p "const url = new URL(process.env.npm_config_registry); url.host + url.pathname")
+          echo "//${host}:_authToken=${NPM_PUBLISH_TOKEN}" >> .npmrc
           pnpm changeset publish --no-git-tag
