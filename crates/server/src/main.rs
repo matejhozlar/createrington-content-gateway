@@ -80,10 +80,11 @@ async fn main() -> ExitCode {
         }
     };
     tracing::info!(
-        "listening on {} for {} consumer(s), {} calls a minute, budget and cache kept in {}",
+        "listening on {} for {} consumer(s), {} CurseForge and {} Modrinth calls a minute, budgets and cache kept in {}",
         config.listen,
         config.consumers.len(),
         config.budget_per_minute,
+        config.modrinth_per_minute,
         if config.redis_url.is_some() {
             "Redis, in memory while it fails"
         } else {
@@ -98,7 +99,6 @@ async fn main() -> ExitCode {
     )
     .await;
     state.budget.write_days_at_exit().await;
-    state.modrinth_budget.write_days_at_exit().await;
     state.modrinth_budget.write_days_at_exit().await;
     match stopped {
         Ok(Stopped::Drained) => {
