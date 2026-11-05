@@ -5,7 +5,10 @@ use utoipa::{
 };
 
 use crate::{
-    budget::{self, BudgetSnapshot, DayCounts, DayPoolSnapshot, DaySnapshot, PoolSnapshot, Source},
+    budget::{
+        self, BudgetSnapshot, DayCounts, DayPoolSnapshot, DaySnapshot, PoolSnapshot, Source,
+        UpstreamBudget,
+    },
     curseforge,
     error::{ApiError, ErrorCode},
     health::{self, Health},
@@ -23,14 +26,14 @@ pub const API_VERSION: &str = "1";
     info(
         title = "content-gateway",
         version = API_VERSION,
-        description = "A gateway in front of the CurseForge and Modrinth APIs that holds the CurseForge key, caches answers for every consumer, counts the calls made on the key and holds every consumer off after a 429. `/v1/curseforge/{path}` mirrors `api.curseforge.com/v1/{path}` and `/v1/modrinth/version_file(s)` the SHA-1 lookups of `api.modrinth.com/v2`, answering their JSON as it came; `/v1/resolve` finds a download address per CurseForge file; the other routes are the gateway's own. Every route but `/v1/healthz` and `/v1/openapi.json` needs a consumer's bearer token.",
+        description = "A gateway in front of the CurseForge and Modrinth APIs that holds the CurseForge key, caches answers for every consumer, counts the calls made on the key and holds every consumer off after a 429. `/v1/curseforge/{path}` mirrors `api.curseforge.com/v1/{path}` and `/v1/modrinth/{path}` mirrors `api.modrinth.com/v2/{path}`, answering their JSON as it came; `/v1/resolve` finds a download address per CurseForge file; the other routes are the gateway's own. Every route but `/v1/healthz` and `/v1/openapi.json` needs a consumer's bearer token.",
         license(name = "MIT"),
     ),
     servers((url = "http://127.0.0.1:5005", description = "The default listen address")),
     tags(
         (name = "gateway", description = "The gateway's own routes"),
         (name = "curseforge", description = "The CurseForge passthrough"),
-        (name = "modrinth", description = "The Modrinth SHA-1 lookups"),
+        (name = "modrinth", description = "The Modrinth passthrough"),
     ),
     paths(
         health::healthz,
@@ -38,13 +41,14 @@ pub const API_VERSION: &str = "1";
         budget::readout,
         curseforge::passthrough_get,
         curseforge::passthrough_post,
-        modrinth::version_file,
-        modrinth::version_files,
+        modrinth::passthrough_get,
+        modrinth::passthrough_post,
         resolve::resolve,
     ),
     components(schemas(
         Health,
         BudgetSnapshot,
+        UpstreamBudget,
         PoolSnapshot,
         DaySnapshot,
         DayPoolSnapshot,

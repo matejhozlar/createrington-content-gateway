@@ -18,6 +18,7 @@ const LOG_ENV: &str = "CONTENT_GATEWAY_LOG";
 const CONSUMERS_ENV: &str = "CONTENT_GATEWAY_CONSUMERS";
 const TOKEN_ENV: &str = "CONTENT_GATEWAY_TOKEN";
 const BUDGET_ENV: &str = "CONTENT_GATEWAY_BUDGET_PER_MINUTE";
+const MODRINTH_BUDGET_ENV: &str = "CONTENT_GATEWAY_MODRINTH_PER_MINUTE";
 const HISTORY_DAYS_ENV: &str = "CONTENT_GATEWAY_BUDGET_HISTORY_DAYS";
 const REDIS_ENV: &str = "REDIS_URL";
 const API_KEY_ENV: &str = "CURSEFORGE_API_KEY";
@@ -25,6 +26,8 @@ const MODRINTH_USER_AGENT_ENV: &str = "MODRINTH_USER_AGENT";
 const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_PORT: u16 = 5005;
 const DEFAULT_BUDGET_PER_MINUTE: u32 = 300;
+/// Modrinth allows 300 requests a minute per address.
+const DEFAULT_MODRINTH_PER_MINUTE: u32 = 300;
 const MIN_TOKEN_LENGTH: usize = 32;
 const MAX_NAME_LENGTH: usize = 64;
 pub const DEFAULT_LOG: &str = "info";
@@ -36,6 +39,7 @@ pub struct Config {
     pub listen: SocketAddr,
     pub consumers: Vec<Consumer>,
     pub budget_per_minute: u32,
+    pub modrinth_per_minute: u32,
     pub budget_history_days: u32,
     pub redis_url: Option<RedisUrl>,
     pub curseforge_api_key: ApiKey,
@@ -224,6 +228,19 @@ impl Config {
             None => DEFAULT_BUDGET_PER_MINUTE,
         };
 
+        let modrinth_per_minute = match lookup(MODRINTH_BUDGET_ENV) {
+            Some(value) => match value.parse::<u32>() {
+                Ok(budget) if budget != 0 => budget,
+                _ => {
+                    return Err(ConfigError::Budget {
+                        name: MODRINTH_BUDGET_ENV,
+                        value,
+                    });
+                }
+            },
+            None => DEFAULT_MODRINTH_PER_MINUTE,
+        };
+
         let budget_history_days = match lookup(HISTORY_DAYS_ENV) {
             Some(value) => match value.parse::<u32>() {
                 Ok(days) if (1..=MAX_HISTORY_DAYS).contains(&days) => days,
@@ -280,6 +297,7 @@ impl Config {
             listen: SocketAddr::new(host, port),
             consumers,
             budget_per_minute,
+            modrinth_per_minute,
             budget_history_days,
             redis_url,
             curseforge_api_key,
@@ -462,6 +480,24 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn allows_modrinth_300_calls_a_minute_unless_told_otherwise() {
+        assert_eq!(config_with_token(&[]).unwrap().modrinth_per_minute, 300);
+        assert_eq!(
+            config_with_token(&[(MODRINTH_BUDGET_ENV, "100")])
+                .unwrap()
+                .modrinth_per_minute,
+            100
+        );
+        assert_eq!(
+            config_with_token(&[(MODRINTH_BUDGET_ENV, "0")]),
+            Err(ConfigError::Budget {
+                name: MODRINTH_BUDGET_ENV,
+                value: "0".to_owned(),
+            })
+        );
     }
 
     #[test]

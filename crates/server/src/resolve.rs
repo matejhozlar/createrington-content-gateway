@@ -20,9 +20,9 @@ use crate::{
     auth::Pool,
     batch::{self, Batch},
     cache::{Answer, Entry},
-    curseforge::{self, HOUR_MS, MINUTE_MS},
     error::ApiError,
     modrinth,
+    passthrough::{self, HOUR_MS, MINUTE_MS},
 };
 
 pub const CURSEFORGE_CDN: &str = "https://mediafilez.forgecdn.net";
@@ -247,9 +247,17 @@ pub async fn resolve(
                 .into_response();
         }
     }
-    let forced = curseforge::wants_fresh(&headers);
+    let forced = passthrough::wants_fresh(&headers);
 
-    let rows = match batch::rows(state.clone(), pool, Batch::Files, ids.clone(), forced).await {
+    let rows = match batch::rows(
+        state.clone(),
+        pool.clone(),
+        Batch::Files,
+        ids.clone(),
+        forced,
+    )
+    .await
+    {
         Ok(rows) => rows,
         Err(response) => return *response,
     };
@@ -284,7 +292,7 @@ pub async fn resolve(
     let (on_modrinth, modrinth_failed) = if hashes.is_empty() {
         (HashMap::new(), false)
     } else {
-        match modrinth::lookup(&state, hashes, forced).await {
+        match modrinth::lookup(&state, &pool, hashes, forced).await {
             Ok(looked) => (
                 looked
                     .known

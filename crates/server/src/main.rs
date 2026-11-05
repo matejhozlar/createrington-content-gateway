@@ -98,6 +98,8 @@ async fn main() -> ExitCode {
     )
     .await;
     state.budget.write_days_at_exit().await;
+    state.modrinth_budget.write_days_at_exit().await;
+    state.modrinth_budget.write_days_at_exit().await;
     match stopped {
         Ok(Stopped::Drained) => {
             tracing::info!("stopped");

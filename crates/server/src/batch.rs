@@ -15,10 +15,11 @@ use crate::{
     app::AppState,
     auth::Pool,
     cache::{Answer, AnswerCache, Entry, Finisher, LoadFailure, Outcome, Waiting},
-    curseforge::{self, UpstreamFailure},
+    passthrough,
+    upstream::{Source, UpstreamFailure},
 };
 
-use crate::curseforge::{HOUR_MS, MINUTE_MS};
+use crate::passthrough::{HOUR_MS, MINUTE_MS};
 
 pub const IDS_PER_CALL: usize = 100;
 
@@ -222,7 +223,7 @@ pub async fn answer(
         Err(response) => return *response,
     };
     if batch.is_fingerprints() {
-        return curseforge::respond(&json(fingerprint_answer(&rows, &asked)), cache);
+        return passthrough::respond(&json(fingerprint_answer(&rows, &asked)), cache);
     }
     if rows.is_empty() {
         let answer = Answer {
@@ -230,14 +231,14 @@ pub async fn answer(
             content_type: None,
             body: Bytes::new(),
         };
-        return curseforge::respond(&answer, cache);
+        return passthrough::respond(&answer, cache);
     }
     let mut body =
         Vec::with_capacity(rows.iter().map(|(_, row)| row.len() + 1).sum::<usize>() + 11);
     body.extend_from_slice(b"{\"data\":[");
     join(&mut body, rows.iter().map(|(_, row)| row.as_ref()));
     body.extend_from_slice(b"]}");
-    curseforge::respond(&json(body), cache)
+    passthrough::respond(&json(body), cache)
 }
 
 /// The rows of these ids (each once), from the cache while fresh, the rest asked for 100 per call. An id CurseForge
@@ -311,7 +312,13 @@ pub async fn rows(
                         stale = true;
                         entry
                     }
-                    _ => return Err(Box::new(curseforge::failed(failure, &pool))),
+                    _ => {
+                        return Err(Box::new(passthrough::failed(
+                            failure,
+                            &pool,
+                            Source::CurseForge,
+                        )));
+                    }
                 }
             }
         };
@@ -423,8 +430,9 @@ async fn fetch(state: Arc<AppState>, pool: Pool, batch: Batch, mine: Vec<Mine>, 
 
 async fn fetch_chunk(state: Arc<AppState>, pool: Pool, batch: Batch, chunk: Vec<Mine>) {
     let ids: Vec<u64> = chunk.iter().map(|load| load.id).collect();
-    let sent = curseforge::send_recorded(
+    let sent = passthrough::send_recorded(
         &state,
+        Source::CurseForge,
         &pool,
         Method::POST,
         batch.path(),

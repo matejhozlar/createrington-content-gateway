@@ -22,10 +22,10 @@ use crate::{
     budget::{Budget, TestClock},
     cache::AnswerCache,
     config::{ApiKey, Consumer, Token},
-    curseforge::Upstream,
-    modrinth::{self, Modrinth},
+    curseforge, modrinth,
     redis_store::RedisStore,
     resolve::{self, Cdn},
+    upstream::{Source, Upstream},
 };
 
 pub(crate) const NOV_3_2026_20H: u64 = 1_793_736_000_000;
@@ -137,10 +137,6 @@ pub(crate) fn gateway_on(
     gateway_with(mock, limit, timeout, redis, &["launcher"])
 }
 
-pub(crate) fn gateway_with_pools(mock: &Mock, pools: &[&str]) -> Gateway {
-    gateway_with(mock, 300, crate::curseforge::TIMEOUT, None, pools)
-}
-
 fn gateway_with(
     mock: &Mock,
     limit: u32,
@@ -161,8 +157,29 @@ fn gateway_with(
             clock.clone(),
             redis.clone(),
         ),
-        upstream: Upstream::new(mock.base.clone(), ApiKey::new(KEY), timeout).unwrap(),
-        modrinth: Modrinth::new(mock.base.clone(), USER_AGENT, modrinth::TIMEOUT).unwrap(),
+        modrinth_budget: Budget::new(
+            limit,
+            pools.iter().map(|pool| ("app", *pool)),
+            clock.clone(),
+            redis.clone(),
+        )
+        .named("modrinth"),
+        upstream: Upstream::new(
+            Source::CurseForge,
+            format!("{}/v1", mock.base),
+            Some(ApiKey::new(KEY)),
+            curseforge::USER_AGENT,
+            timeout,
+        )
+        .unwrap(),
+        modrinth: Upstream::new(
+            Source::Modrinth,
+            format!("{}/v2", mock.base),
+            None,
+            USER_AGENT,
+            modrinth::TIMEOUT,
+        )
+        .unwrap(),
         cdn: Cdn::new(mock.base.clone(), resolve::CDN_TIMEOUT).unwrap(),
         cache: AnswerCache::new(redis),
         clock: clock.clone(),
