@@ -244,7 +244,7 @@ export interface operations {
   readout: {
     parameters: {
       query?: {
-        /** @description UTC days to answer, today included, 1 up to the days kept (14 when left out). */
+        /** @description UTC days to answer, today included, 1 up; 14 when left out, and more than the days kept answers the days kept. */
         days?: number;
       };
       header?: never;

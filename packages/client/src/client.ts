@@ -105,7 +105,7 @@ interface SendOptions {
 
 /** What `budget()` asks for. */
 export interface BudgetOptions {
-  /** UTC days of daily counts to answer, today included, 1 up to the gateway's `historyDays`; 14 when left out. */
+  /** UTC days of daily counts to answer, today included, 1 up; 14 when left out, more than the gateway's `historyDays` answers the days kept. */
   days?: number | undefined;
   signal?: AbortSignal | undefined;
 }
