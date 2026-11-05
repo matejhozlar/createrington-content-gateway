@@ -7,7 +7,7 @@ use std::{
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
-use crate::budget::DEFAULT_HISTORY_DAYS;
+use crate::budget::{DEFAULT_HISTORY_DAYS, MAX_HISTORY_DAYS};
 
 const HOST_ENV: &str = "CONTENT_GATEWAY_HOST";
 const PORT_ENV: &str = "CONTENT_GATEWAY_PORT";
@@ -21,7 +21,6 @@ const API_KEY_ENV: &str = "CURSEFORGE_API_KEY";
 const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_PORT: u16 = 5005;
 const DEFAULT_BUDGET_PER_MINUTE: u32 = 300;
-const MAX_HISTORY_DAYS: u32 = 3660;
 const MIN_TOKEN_LENGTH: usize = 32;
 const MAX_NAME_LENGTH: usize = 64;
 pub const DEFAULT_LOG: &str = "info";

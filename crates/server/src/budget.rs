@@ -24,6 +24,8 @@ const MINUTE_KEY_TTL_MS: u64 = 2 * MINUTE_MS;
 const DAYS_TRIMMED: u64 = 31;
 /// Days of daily counts kept unless `CONTENT_GATEWAY_BUDGET_HISTORY_DAYS` says otherwise.
 pub const DEFAULT_HISTORY_DAYS: u32 = 90;
+/// The most days of daily counts that can be kept.
+pub const MAX_HISTORY_DAYS: u32 = 3660;
 /// Days `/v1/budget` answers when not asked for a number.
 pub const DEFAULT_SNAPSHOT_DAYS: u32 = 14;
 const HOLD_KEY: &str = "budget:held-until";
@@ -199,7 +201,7 @@ pub struct BudgetSnapshot {
 #[derive(Debug, Default, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct HistoryQuery {
-    /// UTC days to answer, today included, 1 up to the days kept (14 when left out).
+    /// UTC days to answer, today included, 1 up; 14 when left out, and more than the days kept answers the days kept.
     #[param(minimum = 1)]
     pub days: Option<u32>,
 }
@@ -363,7 +365,7 @@ impl Budget {
         }
     }
 
-    /// The budget with the last 14 UTC days.
+    /// The budget with the last 14 UTC days, at most the days kept.
     pub async fn snapshot(&self) -> BudgetSnapshot {
         self.history(DEFAULT_SNAPSHOT_DAYS).await
     }
@@ -654,15 +656,20 @@ impl Shared {
         }
         let now = clock.now_ms();
         let today = utc_date(now);
-        let trim = self
+        let trimmed_on = self
             .trimmed_on
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            != Some(&today);
+            .clone();
+        let trim = trimmed_on.as_ref() != Some(&today);
         if trim {
             let kept = u64::from(history_days);
-            let gone: Vec<String> = (kept..kept + DAYS_TRIMMED)
+            let reach = if trimmed_on.is_none() {
+                u64::from(MAX_HISTORY_DAYS)
+            } else {
+                DAYS_TRIMMED
+            };
+            let gone: Vec<String> = (kept..kept + reach)
                 .map(|days_ago| {
                     self.store
                         .key(&day_key(&utc_date(now.saturating_sub(days_ago * DAY_MS))))
@@ -1403,6 +1410,48 @@ mod tests {
             .await;
         assert_eq!(ttl, Some(-1));
         forget(&url, &prefix).await;
+    }
+
+    #[tokio::test]
+    async fn days_past_a_lowered_history_are_deleted_on_the_first_write() {
+        let Some(url) = test_redis_url() else {
+            eprintln!("{TEST_REDIS_ENV} is not set, skipped");
+            return;
+        };
+        let prefix = unique_prefix();
+        let clock = TestClock::at(NOV_3_2026_20H);
+        let store = Arc::new(RedisStore::open(&url, prefix.clone()).unwrap());
+        let long = Budget::new(300, POOLS, clock.clone(), Some(store.clone())).keeping_days(90);
+        for _ in 0..80 {
+            long.record("app", "app", Some(200), None).await;
+            long.write_days_at_exit().await;
+            clock.advance(DAY_MS);
+        }
+        assert_eq!(day_keys(&store).await.len(), 80);
+
+        let short = Budget::new(300, POOLS, clock.clone(), Some(store.clone())).keeping_days(14);
+        short.record("app", "app", Some(200), None).await;
+        short.write_days_at_exit().await;
+        let days = day_keys(&store).await;
+        assert_eq!(days.len(), 14, "{days:?}");
+        assert!(days[0].ends_with("2027-01-09"), "{days:?}");
+        assert_eq!(short.history(90).await.days.len(), 14);
+        forget(&url, &prefix).await;
+    }
+
+    async fn day_keys(store: &RedisStore) -> Vec<String> {
+        let pattern = store.key("budget:day:*");
+        let mut days = store
+            .run(|mut connection| async move {
+                redis::cmd("KEYS")
+                    .arg(pattern)
+                    .query_async::<Vec<String>>(&mut connection)
+                    .await
+            })
+            .await
+            .unwrap();
+        days.sort();
+        days
     }
 
     #[tokio::test]
