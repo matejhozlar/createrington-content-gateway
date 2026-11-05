@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.1.5 (2026-11-05)
+
+- [fix] Make the GitHub release workflow build from the commit the tag push carries and point the GitHub release at that commit, and stop waiting for the new tag to show up in the remote's tags: the pushed tag is counted when deciding which release is the latest, and the workflow retries only when the remote's tags cannot be read at all
+
 ## v0.1.4 (2026-11-05)
 
 - [fix] Make the GitHub release workflow build a release tag only once: a tag that already has a GitHub release is skipped when the mirror pushes it again, and running the workflow by hand still rebuilds it
