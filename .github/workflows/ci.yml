@@ -93,6 +93,7 @@ jobs:
 
       - uses: astral-sh/setup-uv@v10
         with:
+          version: "0.13.7"
           enable-cache: true
           cache-dependency-glob: packages/python-client/uv.lock
 
