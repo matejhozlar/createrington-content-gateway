@@ -186,7 +186,8 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 pnpm install        # Prettier, the pre-commit hook, the Infisical CLI and the client's dependencies
-pnpm dev            # cargo run with the env injected from Infisical (maintainers)
+cargo run           # the gateway on 127.0.0.1:5005 with the variables exported in the shell
+pnpm dev            # the same with the env injected from Infisical, for the maintainers
 pnpm openapi        # rewrite openapi.json and the client's generated types after a route or type changed
 pnpm test           # the client's tests; pnpm typecheck and pnpm build likewise
 pnpm format:check
