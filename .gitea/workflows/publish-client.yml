@@ -19,7 +19,7 @@ jobs:
     env:
       NPM_PUBLISH_REGISTRY: ${{ vars.NPM_PUBLISH_REGISTRY }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Validate the publish variables
         run: |
