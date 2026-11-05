@@ -171,7 +171,7 @@ A null `source` with `retry` false means no source has the file and the consumer
 
 ### Minecraft and loader versions
 
-These routes replace the version lists every consumer used to fetch and cache itself. The sources need no key: Mojang's `version_manifest_v2.json`, NeoForge's Maven, Forge's `promotions_slim.json` and Fabric's meta. Each document is kept for an hour (a version's own document a day), fetched once for everyone asking, and the old copy is answered when its source fails, so an outage never empties a picker. They draw from no budget.
+These routes replace the version lists every consumer used to fetch and cache itself. The sources need no key: Mojang's `version_manifest_v2.json`, NeoForge's Maven, Forge's `promotions_slim.json` and Fabric's meta. Each document is kept for an hour (a version's own document a day), fetched once for everyone asking, and the old copy keeps answering for a day after that when its source fails, so a short outage does not empty a picker. They draw from no budget.
 
 - `GET /v1/minecraft/versions?type=release&loader=neoforge`: the versions Mojang lists, newest first, with `latest.release` and `latest.snapshot`. `type` is `release` (the default), `snapshot` or `all`. `loader` keeps only the versions that loader has at least one build for, which is what a server or pack picker should offer.
 - `GET /v1/minecraft/versions/{id}`: one version with `javaMajor`, the Java it runs on, from Mojang's document of the version; `404 UNKNOWN_VERSION` for an id Mojang does not list.

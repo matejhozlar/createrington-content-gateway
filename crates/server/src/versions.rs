@@ -29,6 +29,8 @@ const FORGE_PATH: &str = "/net/minecraftforge/forge/promotions_slim.json";
 const FABRIC_LOADER_PATH: &str = "/v2/versions/loader";
 const FABRIC_GAME_PATH: &str = "/v2/versions/game";
 const LIST_FRESH_MS: u64 = HOUR_MS;
+/// Minecraft 26.1 was the first version named after its year; NeoForge's builds for it start with the year too.
+const FIRST_YEAR_VERSION: u32 = 26;
 const DETAILS_FRESH_MS: u64 = DAY_MS;
 
 /// The clients that read the public version lists: Mojang's manifest, NeoForge's Maven, Forge's promotions and
@@ -333,22 +335,31 @@ async fn neoforge(state: &Arc<AppState>) -> Result<Vec<LoaderVersion>, UpstreamF
         .rev()
         .map(|version| LoaderVersion {
             minecraft: neoforge_minecraft(&version),
-            stable: !version.contains("-beta") && !version.contains("-rc"),
+            stable: !version.contains('-'),
             recommended: false,
             version,
         })
         .collect())
 }
 
-/// NeoForge `X.Y.Z` is for Minecraft `1.X.Y`, `1.X` when `Y` is 0.
+/// The Minecraft version a NeoForge build is for. Up to Minecraft 1.21, NeoForge `X.Y.Z` is for `1.X.Y` (`1.X`
+/// when `Y` is 0). From Minecraft's year-based names on, NeoForge `Y.D.H.B` is for `Y.D.H` (`Y.D` when `H` is 0).
 fn neoforge_minecraft(version: &str) -> Option<String> {
-    let mut parts = version.split('.');
-    let major: u32 = parts.next()?.parse().ok()?;
-    let minor: u32 = parts.next()?.parse().ok()?;
-    Some(if minor == 0 {
-        format!("1.{major}")
+    let mut parts = version.split(['.', '-']);
+    let first: u32 = parts.next()?.parse().ok()?;
+    let second: u32 = parts.next()?.parse().ok()?;
+    if first < FIRST_YEAR_VERSION {
+        return Some(if second == 0 {
+            format!("1.{first}")
+        } else {
+            format!("1.{first}.{second}")
+        });
+    }
+    let hotfix: u32 = parts.next()?.parse().ok()?;
+    Some(if hotfix == 0 {
+        format!("{first}.{second}")
     } else {
-        format!("1.{major}.{minor}")
+        format!("{first}.{second}.{hotfix}")
     })
 }
 
@@ -542,7 +553,7 @@ pub async fn minecraft_version(
     else {
         return ApiError::unknown_version(&id).into_response();
     };
-    if !version.url.starts_with(&state.meta.mojang) {
+    if !version.url.starts_with(&format!("{}/", state.meta.mojang)) {
         tracing::warn!(
             "Mojang's manifest points version {id} outside its own host: {}",
             version.url
@@ -864,6 +875,73 @@ mod tests {
         assert_eq!(neoforge_minecraft("21.1.57").as_deref(), Some("1.21.1"));
         assert_eq!(neoforge_minecraft("21.0.0-beta").as_deref(), Some("1.21"));
         assert_eq!(neoforge_minecraft("20.4.80").as_deref(), Some("1.20.4"));
+        assert_eq!(neoforge_minecraft("26.1.0.12").as_deref(), Some("26.1"));
+        assert_eq!(
+            neoforge_minecraft("26.1.1.3-alpha").as_deref(),
+            Some("26.1.1")
+        );
+        assert_eq!(neoforge_minecraft("26.1"), None);
         assert_eq!(neoforge_minecraft("nope"), None);
+    }
+
+    #[tokio::test]
+    async fn year_based_builds_and_alpha_builds_are_listed_right() {
+        let mock = Mock::start(Duration::ZERO, |_, seen| match seen.uri.as_str() {
+            NEOFORGE_PATH => reply(
+                200,
+                r#"{"isSnapshot":false,"versions":["21.1.72","26.1.0.1-alpha","26.1.0.12","26.1.1.3"]}"#,
+            ),
+            MANIFEST_PATH => reply(
+                200,
+                json!({
+                    "latest": { "release": "26.1.1", "snapshot": "26.1.1" },
+                    "versions": [
+                        { "id": "26.1.1", "type": "release", "url": "x", "time": "x", "releaseTime": "2026-05-01T00:00:00+00:00", "sha1": "a", "complianceLevel": 1 },
+                        { "id": "26.1", "type": "release", "url": "x", "time": "x", "releaseTime": "2026-03-01T00:00:00+00:00", "sha1": "b", "complianceLevel": 1 },
+                        { "id": "1.21.1", "type": "release", "url": "x", "time": "x", "releaseTime": "2024-08-08T00:00:00+00:00", "sha1": "c", "complianceLevel": 1 }
+                    ]
+                })
+                .to_string(),
+            ),
+            uri => panic!("unexpected {uri}"),
+        })
+        .await;
+        let gateway = gateway(&mock, 300, CF_TIMEOUT);
+
+        let builds = get(
+            &gateway.router,
+            "/v1/minecraft/loaders/neoforge/versions?minecraft=26.1",
+        )
+        .await;
+        let body = builds.json();
+        assert_eq!(ids(&body), ["26.1.0.12", "26.1.0.1-alpha"]);
+        assert_eq!(body["versions"][0]["stable"], true);
+        assert_eq!(body["versions"][1]["stable"], false);
+
+        let versions = get(&gateway.router, "/v1/minecraft/versions?loader=neoforge").await;
+        assert_eq!(ids(&versions.json()), ["26.1.1", "26.1", "1.21.1"]);
+    }
+
+    #[tokio::test]
+    async fn a_version_document_is_read_from_mojang_s_host_only() {
+        let mock = Mock::start(Duration::ZERO, |_, seen| match seen.uri.as_str() {
+            MANIFEST_PATH => {
+                let elsewhere = format!("{}.example.net/v1/packages/x.json", seen.base);
+                reply(
+                    200,
+                    json!({
+                        "latest": { "release": "1.21.1", "snapshot": "1.21.1" },
+                        "versions": [{ "id": "1.21.1", "type": "release", "url": elsewhere, "time": "x", "releaseTime": "2024-08-08T00:00:00+00:00", "sha1": "a", "complianceLevel": 1 }]
+                    })
+                    .to_string(),
+                )
+            }
+            uri => panic!("unexpected {uri}"),
+        })
+        .await;
+        let gateway = gateway(&mock, 300, CF_TIMEOUT);
+        let got = get(&gateway.router, "/v1/minecraft/versions/1.21.1").await;
+        assert_eq!(got.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(mock.calls(), 1);
     }
 }
