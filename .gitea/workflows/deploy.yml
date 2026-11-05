@@ -106,7 +106,9 @@ jobs:
           install -m 755 build/content-gateway "$DEPLOY_DIR/content-gateway.new"
           chown --reference="$DEPLOY_DIR" "$DEPLOY_DIR/content-gateway.new"
           running=$(bash .gitea/scripts/healthz.sh "$DEPLOY_DIR" 2>/dev/null || true)
-          if [ -f "$DEPLOY_DIR/content-gateway" ] && [ "${running#*\"commit\":\"$COMMIT\"}" = "$running" ]; then
+          if [ ! -f "$DEPLOY_DIR/content-gateway" ]; then
+            echo "First deploy, there is no previous build to keep"
+          elif [ "${running#*\"commit\":\"$COMMIT\"}" = "$running" ]; then
             mv "$DEPLOY_DIR/content-gateway" "$DEPLOY_DIR/content-gateway.previous"
             echo "ROTATED=true" >> "$GITHUB_ENV"
           else
