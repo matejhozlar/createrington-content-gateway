@@ -120,7 +120,7 @@ export type ModrinthSearch = z.infer<typeof modrinthSearchSchema>;
 export type ModrinthTag = z.infer<typeof modrinthTagSchema>;
 export type ModrinthGameVersion = z.infer<typeof modrinthGameVersionSchema>;
 
-/** The address of Modrinth's own copy of the file with this SHA-1 in a version, or `null`. */
+/** The `https://cdn.modrinth.com` address of the file with this SHA-1 in a version, or `null`; other files of the version and other hosts never count. */
 export function modrinthFileUrl(
   version: ModrinthVersion,
   sha1: string,

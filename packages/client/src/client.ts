@@ -187,7 +187,7 @@ export class ContentGateway {
     return body as BudgetSnapshot;
   }
 
-  /** Sends `api.curseforge.com/v1/<path>` through the gateway and answers what CurseForge answered, whatever its status. */
+  /** Sends `api.curseforge.com/v1/<path>` (such as `mods/search`) through the gateway; CurseForge's answer comes back whatever its status, and only the gateway's own answers throw `ContentGatewayError`. */
   async curseforge(
     path: string,
     request: CurseForgeRequest = {},
@@ -212,7 +212,7 @@ export class ContentGateway {
     });
   }
 
-  /** Sends `api.modrinth.com/v2/<path>` through the gateway and answers what Modrinth answered, whatever its status. */
+  /** Sends `api.modrinth.com/v2/<path>` (such as `project/sodium`) through the gateway; Modrinth's answer comes back whatever its status, and only the gateway's own answers throw `ContentGatewayError`. */
   async modrinth(
     path: string,
     request: ModrinthRequest = {},

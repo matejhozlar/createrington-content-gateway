@@ -25,7 +25,8 @@ pub struct Answer {
     pub body: Bytes,
 }
 
-/// A cached answer with its fresh and stale times in milliseconds since the Unix epoch.
+/// A cached answer with its fresh and stale times in milliseconds since the Unix epoch; a fingerprint entry is
+/// not JSON on its own and is only ever joined into a rebuilt answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub answer: Answer,
