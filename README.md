@@ -201,7 +201,7 @@ Every pull request runs these checks in CI, on Gitea Actions for the primary rep
 
 ### Releasing
 
-A server release is the `vX.Y.Z` tag on the release merge into `main`. The mirror carries the tag to GitHub, where `.github/workflows/release.yml` checks it against `package.json` and `Cargo.toml`, builds the binaries and the image, and publishes the release with the notes from that version's section of `CHANGELOG.md`. The image package GHCR creates on the first push is private: make it public once in the package's settings on GitHub, or the `docker pull` above fails for everyone else.
+A server release is the `vX.Y.Z` tag on the release merge into `main`. The mirror carries the tag to GitHub, where `.github/workflows/release.yml` checks it against `package.json` and `Cargo.toml`, builds the binaries and the image, and publishes the release with the notes from that version's section of `CHANGELOG.md`, then publishes the Python client to PyPI when its version is not there yet. The image package GHCR creates on the first push is private: make it public once in the package's settings on GitHub, or the `docker pull` above fails for everyone else.
 
 ### Releasing the client
 

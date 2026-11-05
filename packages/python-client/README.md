@@ -75,4 +75,4 @@ uv run python scripts/generate.py --check  # fail when it is stale
 
 `src/content_gateway/generated.py` is generated from the gateway's `openapi.json` with [datamodel-code-generator](https://koxudaxi.github.io/datamodel-code-generator/) and checked in; `pnpm openapi` at the repository root regenerates it with the TypeScript types, and CI fails when it is stale. Never edit it by hand.
 
-The version lives in `pyproject.toml` and `CHANGELOG.md` holds its entries. A release tag of the gateway publishes the package to PyPI when that version is not there yet.
+The version lives in `pyproject.toml` and `CHANGELOG.md` holds its entries. A release tag of the gateway publishes the package to PyPI when that version is not there yet, through PyPI's trusted publishing from the release workflow, so the PyPI project trusts `release.yml` of the GitHub repository and no token is stored anywhere.
