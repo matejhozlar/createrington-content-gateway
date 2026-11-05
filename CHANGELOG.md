@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.4 (2026-11-05)
+
+- [fix] Make the GitHub release workflow build a release tag only once: a tag that already has a GitHub release is skipped when the mirror pushes it again, and running the workflow by hand still rebuilds it
+- [chore] Reference the PyPI publish action in the release workflow by its `v1.14.3` release tag
+
 ## v0.1.3 (2026-11-05)
 
 - [fix] Make the GitHub release workflow read the release tags from the remote instead of fetching them with the checkout, retrying for up to a minute until the new tag is visible and failing the release when it never is, and ignore pre-release tags when deciding which release is the latest

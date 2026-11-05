@@ -42,10 +42,13 @@ jobs:
 
       - name: Publish the version the registry does not have yet
         env:
-          npm_config_registry: ${{ env.NPM_PUBLISH_REGISTRY }}
           NPM_PUBLISH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
         run: |
           : "${NPM_PUBLISH_TOKEN:?}"
-          host=$(node -p "const url = new URL(process.env.npm_config_registry); url.host + url.pathname")
-          echo "//${host}:_authToken=${NPM_PUBLISH_TOKEN}" >> .npmrc
+          scope=$(node -p "require('./packages/client/package.json').name.split('/')[0]")
+          host=$(node -p "const url = new URL(process.env.NPM_PUBLISH_REGISTRY); url.host + url.pathname")
+          {
+            echo "${scope}:registry=${NPM_PUBLISH_REGISTRY}"
+            echo "//${host}:_authToken=${NPM_PUBLISH_TOKEN}"
+          } >> .npmrc
           pnpm changeset publish --no-git-tag
