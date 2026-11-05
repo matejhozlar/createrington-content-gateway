@@ -133,7 +133,9 @@ export function modrinthFileUrl(
       if (url.protocol === "https:" && url.hostname === MODRINTH_CDN_HOST) {
         return file.url;
       }
-    } catch {}
+    } catch {
+      continue;
+    }
   }
   return null;
 }
