@@ -62,12 +62,8 @@ export type CurseForgeRequest = CurseForgeMethod & {
   signal?: AbortSignal;
 };
 
-/** A Modrinth lookup's options. Modrinth calls draw from no pool. */
-export interface ModrinthRequest {
-  /** Ask Modrinth again instead of answering from the cache (`Cache-Control: no-cache`). */
-  fresh?: boolean;
-  signal?: AbortSignal;
-}
+/** A Modrinth call's options, as `CurseForgeRequest`: the calls draw from the pool's Modrinth budget. */
+export type ModrinthRequest = CurseForgeRequest;
 
 /** What `resolve()` asks for. */
 export interface ResolveOptions {
@@ -223,41 +219,65 @@ export class ContentGateway {
   }
 
   /**
-   * `GET /v1/modrinth/version_file/<sha1>`: the version Modrinth lists the
-   * file with this SHA-1 under, as `GET api.modrinth.com/v2/version_file/{hash}`
-   * answers it, or a 404 when Modrinth does not know the hash. Parse the body
-   * with `modrinthVersionSchema`; `modrinthFileUrl` picks the file's own address.
+   * Sends `api.modrinth.com/v2/<path>` through the gateway and answers what
+   * Modrinth answered, whatever its status, like `curseforge()`.
+   *
+   * @param path - The path under `/v2/`, such as `search`, `project/sodium` or `version_file/<sha1>`
    */
-  async modrinthVersionFile(
-    sha1: string,
+  async modrinth(
+    path: string,
     request: ModrinthRequest = {},
   ): Promise<PassthroughAnswer> {
+    const method =
+      request.method ?? (request.body === undefined ? "GET" : "POST");
+    if (method === "GET" && request.body !== undefined) {
+      throw new TypeError(
+        `a GET to ${path} cannot carry a body; leave method unset or make it POST`,
+      );
+    }
     return this.passthrough({
-      method: "GET",
-      path: `/v1/modrinth/version_file/${encodeURIComponent(sha1)}`,
+      method,
+      path: `/v1/modrinth/${path.replace(/^\/+/, "")}`,
+      query: request.query,
+      body: request.body,
       authenticated: true,
+      pool: request.pool,
       fresh: request.fresh,
+      waitUpToMs: request.waitUpToMs,
       signal: request.signal,
     });
   }
 
   /**
+   * `GET /v1/modrinth/version_file/<sha1>`: the version Modrinth lists the
+   * file with this SHA-1 under, or a 404 when Modrinth does not know the hash.
+   * Parse the body with `modrinthVersionSchema`; `modrinthFileUrl` picks the
+   * file's own address.
+   */
+  async modrinthVersionFile(
+    sha1: string,
+    request: ModrinthRequest = {},
+  ): Promise<PassthroughAnswer> {
+    return this.modrinth(`version_file/${encodeURIComponent(sha1)}`, {
+      ...request,
+      method: "GET",
+      body: undefined,
+    });
+  }
+
+  /**
    * `POST /v1/modrinth/version_files`: the versions Modrinth lists these
-   * SHA-1s under, keyed by lowercase hash, as `POST api.modrinth.com/v2/version_files`
-   * answers them; a hash Modrinth does not know is left out. Parse the body
-   * with `modrinthVersionFilesSchema`.
+   * SHA-1s under, keyed by lowercase hash; a hash Modrinth does not know is
+   * left out. Parse the body with `modrinthVersionFilesSchema`.
    */
   async modrinthVersionFiles(
     hashes: readonly string[],
     request: ModrinthRequest = {},
   ): Promise<PassthroughAnswer> {
-    return this.passthrough({
+    return this.modrinth("version_files", {
+      ...request,
       method: "POST",
-      path: "/v1/modrinth/version_files",
       body: { hashes, algorithm: "sha1" },
-      authenticated: true,
-      fresh: request.fresh,
-      signal: request.signal,
     });
   }
 

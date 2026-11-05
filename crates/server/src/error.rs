@@ -6,7 +6,7 @@ use axum::{
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::{budget::Refusal, curseforge::UpstreamFailure};
+use crate::{budget::Refusal, upstream::UpstreamFailure};
 
 /// What went wrong, for a consumer to branch on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]

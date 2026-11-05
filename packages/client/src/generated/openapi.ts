@@ -6,7 +6,7 @@ export interface paths {
       path?: never;
       cookie?: never;
     };
-    /** This minute's calls per pool, the 429 hold, and the daily counts of the last UTC days. */
+    /** Each upstream's calls this minute per pool, its 429 hold, and its daily counts of the last UTC days. */
     get: operations["readout"];
     put?: never;
     post?: never;
@@ -30,7 +30,7 @@ export interface paths {
      *     asked each time. `Cache-Control: no-cache` asks CurseForge again and keeps the new answer. A kept answer that is
      *     no longer fresh is still given, marked `stale`, when the budget refuses the call or CurseForge fails.
      */
-    get: operations["passthrough_get"];
+    get: operations["curseforge_get"];
     put?: never;
     /**
      * What `POST api.curseforge.com/v1/{path}` answers to this body.
@@ -38,7 +38,7 @@ export interface paths {
      *     `POST fingerprints/432` or `POST fingerprints` with only `{"fingerprints": [...]}` are answered per id from the
      *     cache, and only the ids not kept are asked for, 100 per call. Every other body goes to CurseForge each time.
      */
-    post: operations["passthrough_post"];
+    post: operations["curseforge_post"];
     delete?: never;
     options?: never;
     head?: never;
@@ -62,7 +62,7 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
-  "/v1/modrinth/version_file/{hash}": {
+  "/v1/modrinth/{path}": {
     parameters: {
       query?: never;
       header?: never;
@@ -70,34 +70,22 @@ export interface paths {
       cookie?: never;
     };
     /**
-     * The Modrinth version of the file with this SHA-1, as `GET api.modrinth.com/v2/version_file/{hash}` answers it.
-     * @description Kept for an hour once found and for 10 minutes when Modrinth does not know the hash. `Cache-Control: no-cache`
-     *     asks Modrinth again. Modrinth calls do not count against the CurseForge budget.
+     * What `GET api.modrinth.com/v2/{path}` answers, from the cache while it is fresh.
+     * @description The query string goes to Modrinth as it came, and the answer comes back with Modrinth's status, content type and
+     *     body, marked `X-Cache`. The routes of the cache table are kept for their fresh time; every other route is asked
+     *     each time. `version_file/{sha1}` is kept per hash and shared with `POST version_files`. `Cache-Control: no-cache`
+     *     asks Modrinth again. Modrinth needs no key but limits calls per address, so every call counts against the
+     *     Modrinth budget of the request's pool, and a 429 holds every pool off.
      */
-    get: operations["version_file"];
-    put?: never;
-    post?: never;
-    delete?: never;
-    options?: never;
-    head?: never;
-    patch?: never;
-    trace?: never;
-  };
-  "/v1/modrinth/version_files": {
-    parameters: {
-      query?: never;
-      header?: never;
-      path?: never;
-      cookie?: never;
-    };
-    get?: never;
+    get: operations["modrinth_get"];
     put?: never;
     /**
-     * The Modrinth versions of the files with these SHA-1s, keyed by hash, as `POST api.modrinth.com/v2/version_files`
-     *     answers them: a hash Modrinth does not know is left out.
-     * @description Answered per hash from the cache; only the hashes not kept are asked for, 100 per call, at most 1000 hashes.
+     * What `POST api.modrinth.com/v2/{path}` answers to this body.
+     * @description `POST version_files` with `{"hashes": [...], "algorithm": "sha1"}` is answered per hash from the cache, keyed by
+     *     lowercase hash with unknown hashes left out as Modrinth does, and only the hashes not kept are asked for, 100 per
+     *     call, at most 1000 hashes. Every other body goes to Modrinth each time.
      */
-    post: operations["version_files"];
+    post: operations["modrinth_post"];
     delete?: never;
     options?: never;
     head?: never;
@@ -163,43 +151,18 @@ export interface components {
        */
       retryAfterMs?: number | null;
     };
-    /** @description What `/v1/budget` answers: this minute over all pools and per pool, the 429 hold, and the last UTC days. */
+    /** @description What `/v1/budget` answers: one budget per upstream, under one history and one source. */
     BudgetSnapshot: {
-      /** @description The UTC days asked for, today first; a day without a single count is left out. */
-      days: components["schemas"]["DaySnapshot"][];
-      /**
-       * Format: date-time
-       * @description Until when CurseForge's 429 holds every call off, ISO 8601, or null while no hold is on.
-       */
-      heldUntil?: string | null;
+      /** @description The budget of calls on the CurseForge key. */
+      curseforge: components["schemas"]["UpstreamBudget"];
       /**
        * Format: int32
        * @description UTC days of daily counts the gateway keeps, the most `days` can cover.
        */
       historyDays: number;
-      /**
-       * Format: int32
-       * @description Calls to CurseForge the minute allows over all pools.
-       */
-      limitPerMinute: number;
-      /** @description Every pool of every consumer, this minute. */
-      pools: components["schemas"]["PoolSnapshot"][];
-      /**
-       * Format: date-time
-       * @description When this minute's counts start over, ISO 8601.
-       */
-      resetsAt: string;
+      /** @description The budget of calls to Modrinth, which rate-limits the gateway's address. */
+      modrinth: components["schemas"]["UpstreamBudget"];
       source: components["schemas"]["Source"];
-      /**
-       * Format: int32
-       * @description Calls admitted this minute.
-       */
-      used: number;
-      /**
-       * Format: int32
-       * @description Calls refused this minute.
-       */
-      withheld: number;
     };
     /** @description What one pool did on one UTC day. */
     DayCounts: {
@@ -350,6 +313,38 @@ export interface components {
      * @enum {string}
      */
     Source: "redis" | "memory" | "unavailable";
+    /** @description One upstream's budget: this minute over all pools and per pool, the 429 hold, and the last UTC days. */
+    UpstreamBudget: {
+      /** @description The UTC days asked for, today first; a day without a single count is left out. */
+      days: components["schemas"]["DaySnapshot"][];
+      /**
+       * Format: date-time
+       * @description Until when the upstream's 429 holds every call off, ISO 8601, or null while no hold is on.
+       */
+      heldUntil?: string | null;
+      /**
+       * Format: int32
+       * @description Calls the minute allows over all pools.
+       */
+      limitPerMinute: number;
+      /** @description Every pool of every consumer, this minute. */
+      pools: components["schemas"]["PoolSnapshot"][];
+      /**
+       * Format: date-time
+       * @description When this minute's counts start over, ISO 8601.
+       */
+      resetsAt: string;
+      /**
+       * Format: int32
+       * @description Calls admitted this minute.
+       */
+      used: number;
+      /**
+       * Format: int32
+       * @description Calls refused this minute.
+       */
+      withheld: number;
+    };
     /** @description The body of `POST /v1/modrinth/version_files`. */
     VersionFilesRequest: {
       /**
@@ -415,7 +410,7 @@ export interface operations {
       };
     };
   };
-  passthrough_get: {
+  curseforge_get: {
     parameters: {
       query?: never;
       header?: {
@@ -502,7 +497,7 @@ export interface operations {
       };
     };
   };
-  passthrough_post: {
+  curseforge_post: {
     parameters: {
       query?: never;
       header?: {
@@ -623,25 +618,27 @@ export interface operations {
       };
     };
   };
-  version_file: {
+  modrinth_get: {
     parameters: {
       query?: never;
       header?: {
         /** @description `no-cache` asks Modrinth again instead of answering from the cache */
         "Cache-Control"?: string | null;
+        /** @description The pool the call draws from. Required when the token has more than one pool */
+        "X-Budget-Pool"?: string | null;
       };
       path: {
         /**
-         * @description The file's SHA-1, 40 hex digits
-         * @example 3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e
+         * @description The path under `api.modrinth.com/v2/`, such as `search`, `project/sodium` or `version_file/{sha1}`: segments of letters, digits, `-` and `_`
+         * @example search
          */
-        hash: string;
+        path: string;
       };
       cookie?: never;
     };
     requestBody?: never;
     responses: {
-      /** @description The version Modrinth lists the file under, as Modrinth sent it */
+      /** @description Modrinth's answer, as it came */
       200: {
         headers: {
           /** @description `hit` from the cache, `miss` from Modrinth, `stale` an old answer given because Modrinth could not be asked */
@@ -652,7 +649,7 @@ export interface operations {
           "application/json": unknown;
         };
       };
-      /** @description `INVALID_HASH` */
+      /** @description `INVALID_PATH`, `INVALID_HASH`, `POOL_REQUIRED` or `UNKNOWN_POOL` */
       400: {
         headers: {
           [name: string]: unknown;
@@ -670,18 +667,20 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
-      /** @description Modrinth does not know the hash */
-      404: {
-        headers: {
-          /** @description As on 200 */
-          "X-Cache"?: string;
-          [name: string]: unknown;
-        };
-        content?: never;
-      };
       /** @description Modrinth could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE` */
       502: {
         headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The call was refused: `BUDGET_SPENT` this minute or `UPSTREAM_HOLD` after a 429 from Modrinth */
+      503: {
+        headers: {
+          /** @description Seconds until the next call can go out */
+          "Retry-After"?: number;
           [name: string]: unknown;
         };
         content: {
@@ -706,23 +705,32 @@ export interface operations {
       };
     };
   };
-  version_files: {
+  modrinth_post: {
     parameters: {
       query?: never;
       header?: {
         /** @description `no-cache` asks Modrinth again instead of answering from the cache */
         "Cache-Control"?: string | null;
+        /** @description The pool the call draws from. Required when the token has more than one pool */
+        "X-Budget-Pool"?: string | null;
       };
-      path?: never;
+      path: {
+        /**
+         * @description The path under `api.modrinth.com/v2/`, such as `version_files` or `version_files/update`: segments of letters, digits, `-` and `_`
+         * @example version_files
+         */
+        path: string;
+      };
       cookie?: never;
     };
+    /** @description The JSON body Modrinth expects at this path; this shape for `version_files` */
     requestBody: {
       content: {
         "application/json": components["schemas"]["VersionFilesRequest"];
       };
     };
     responses: {
-      /** @description The versions found, keyed by lowercase hash, each as Modrinth sent it */
+      /** @description Modrinth's answer, as it came, or the versions found keyed by hash for `version_files` */
       200: {
         headers: {
           /** @description `hit` when every hash was kept, `miss` when Modrinth was asked, `stale` an old answer given because Modrinth could not be asked */
@@ -733,7 +741,7 @@ export interface operations {
           "application/json": unknown;
         };
       };
-      /** @description `INVALID_BODY` (no hashes, more than 1000, or another algorithm) or `INVALID_HASH` */
+      /** @description `INVALID_PATH`, `INVALID_BODY` (no hashes, more than 1000, or another algorithm), `INVALID_HASH`, `POOL_REQUIRED` or `UNKNOWN_POOL` */
       400: {
         headers: {
           [name: string]: unknown;
@@ -751,9 +759,29 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description The hashes need more calls than a whole minute allows, `REQUEST_TOO_LARGE`; split them */
+      413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
       /** @description Modrinth could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE` */
       502: {
         headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The call was refused: `BUDGET_SPENT` this minute or `UPSTREAM_HOLD` after a 429 from Modrinth */
+      503: {
+        headers: {
+          /** @description Seconds until the next call can go out */
+          "Retry-After"?: number;
           [name: string]: unknown;
         };
         content: {

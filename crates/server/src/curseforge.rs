@@ -3,186 +3,57 @@ use std::{sync::Arc, time::Duration};
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::{
-        HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
-        header::{ACCEPT, CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, RETRY_AFTER},
-    },
-    response::{IntoResponse, Response},
+    http::{HeaderMap, Method, Uri},
+    response::Response,
 };
 
 use crate::{
     app::AppState,
     auth::Pool,
-    batch::{self, Batch},
-    budget::{self, Refusal},
-    cache::{Answer, AnswerCache, Entry, Finisher, LoadFailure, Outcome},
-    config::ApiKey,
+    batch::Batch,
     error::ApiError,
+    passthrough::{self, DAY_MS, Freshness, HOUR_MS, MINUTE_MS, fresh, is_id},
+    upstream::Source,
 };
 
-pub const CURSEFORGE_API: &str = "https://api.curseforge.com";
-pub const SOURCE: &str = "CurseForge";
+pub const CURSEFORGE_API: &str = "https://api.curseforge.com/v1";
 pub const TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_ANSWER_BYTES: usize = 32 * 1024 * 1024;
-pub const MINUTE_MS: u64 = 60_000;
-pub const HOUR_MS: u64 = 60 * MINUTE_MS;
-const DAY_MS: u64 = 24 * HOUR_MS;
-const X_CACHE: HeaderName = HeaderName::from_static("x-cache");
+/// What CurseForge sees as the caller.
+pub const USER_AGENT: &str = concat!("content-gateway/", env!("CARGO_PKG_VERSION"));
 
-/// Why CurseForge gave no answer: it took longer than the timeout, could not be reached, sent more than the gateway
-/// keeps, or sent a batch answer the gateway could not split into rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpstreamFailure {
-    Timeout,
-    Unreachable,
-    TooLarge,
-    Unreadable,
-}
-
-/// The client that calls the CurseForge API with the gateway's key.
-pub struct Upstream {
-    client: reqwest::Client,
-    base: String,
-    key: ApiKey,
-}
-
-impl Upstream {
-    pub fn new(base: impl Into<String>, key: ApiKey, timeout: Duration) -> reqwest::Result<Self> {
-        Ok(Self {
-            client: reqwest::Client::builder()
-                .timeout(timeout)
-                .user_agent(concat!("content-gateway/", env!("CARGO_PKG_VERSION")))
-                .build()?,
-            base: base.into(),
-            key,
-        })
-    }
-
-    async fn send(
-        &self,
-        method: Method,
-        path: &str,
-        query: Option<&str>,
-        body: Bytes,
-    ) -> Result<(Answer, Option<String>), UpstreamFailure> {
-        let mut url = format!("{}/v1/{path}", self.base);
-        if let Some(query) = query.filter(|query| !query.is_empty()) {
-            url.push('?');
-            url.push_str(query);
-        }
-        let mut request = self
-            .client
-            .request(method, url)
-            .header("x-api-key", self.key.as_str())
-            .header(ACCEPT, "application/json");
-        if !body.is_empty() {
-            request = request.header(CONTENT_TYPE, "application/json").body(body);
-        }
-
-        let response = request
-            .send()
-            .await
-            .map_err(|error| failure(error, SOURCE))?;
-        read(response, SOURCE).await
-    }
-}
-
-/// An upstream's answer with its `Retry-After`, read up to the size the gateway keeps.
-pub async fn read(
-    mut response: reqwest::Response,
-    source: &'static str,
-) -> Result<(Answer, Option<String>), UpstreamFailure> {
-    let status = response.status();
-    let content_type = response.headers().get(CONTENT_TYPE).cloned();
-    let retry_after = response
-        .headers()
-        .get(RETRY_AFTER)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let announced = response
-        .headers()
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok()?.parse::<usize>().ok());
-    if announced.is_some_and(|length| length > MAX_ANSWER_BYTES) {
-        return Err(UpstreamFailure::TooLarge);
-    }
-    let mut body = Vec::with_capacity(announced.unwrap_or(0));
-    while let Some(chunk) = response
-        .chunk()
-        .await
-        .map_err(|error| failure(error, source))?
-    {
-        if body.len() + chunk.len() > MAX_ANSWER_BYTES {
-            return Err(UpstreamFailure::TooLarge);
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok((
-        Answer {
-            status,
-            content_type,
-            body: body.into(),
-        },
-        retry_after,
-    ))
-}
-
-/// Why `source` gave no answer, from the error reqwest reported.
-pub fn failure(error: reqwest::Error, source: &'static str) -> UpstreamFailure {
-    if error.is_timeout() {
-        tracing::warn!("{source} did not answer in time: {error}");
-        UpstreamFailure::Timeout
-    } else {
-        tracing::warn!("{source} could not be reached: {error}");
-        UpstreamFailure::Unreachable
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Freshness {
-    found_ms: u64,
-    not_found_ms: Option<u64>,
-}
-
-const fn fresh(found_ms: u64, not_found_ms: Option<u64>) -> Option<Freshness> {
-    Some(Freshness {
-        found_ms,
-        not_found_ms,
-    })
-}
-
-fn freshness(segments: &[&str]) -> Option<Freshness> {
-    let id = |segment: &str| !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit());
+/// The cache table of the CurseForge routes.
+pub fn freshness(segments: &[&str]) -> Option<Freshness> {
     match segments {
         ["mods", "search"] => fresh(5 * MINUTE_MS, None),
         ["categories"] | ["minecraft", "version"] | ["minecraft", "modloader"] => {
             fresh(DAY_MS, None)
         }
-        ["mods", project] if id(project) => {
+        ["mods", project] if is_id(project) => {
             fresh(Batch::Mods.found_ms(), Some(Batch::Mods.not_found_ms()))
         }
-        ["mods", project, "files"] if id(project) => fresh(10 * MINUTE_MS, None),
-        ["mods", project, "description"] if id(project) => fresh(DAY_MS, None),
-        ["mods", project, "files", file] if id(project) && id(file) => {
+        ["mods", project, "files"] if is_id(project) => fresh(10 * MINUTE_MS, None),
+        ["mods", project, "description"] if is_id(project) => fresh(DAY_MS, None),
+        ["mods", project, "files", file] if is_id(project) && is_id(file) => {
             fresh(Batch::Files.found_ms(), Some(Batch::Files.not_found_ms()))
         }
-        ["mods", project, "files", file, "download-url"] if id(project) && id(file) => {
+        ["mods", project, "files", file, "download-url"] if is_id(project) && is_id(file) => {
             fresh(HOUR_MS, Some(10 * MINUTE_MS))
         }
-        ["mods", project, "files", file, "changelog"] if id(project) && id(file) => {
+        ["mods", project, "files", file, "changelog"] if is_id(project) && is_id(file) => {
             fresh(DAY_MS, None)
         }
         _ => None,
     }
 }
 
+/// A single-id route whose answer is one row of a batch, kept under the batch's key for the id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Share {
+pub enum Share {
     Mod(u64),
     File { project: u64, file: u64 },
 }
 
-fn share_of(segments: &[&str], query: Option<&str>) -> Option<Share> {
+pub fn share_of(segments: &[&str], query: Option<&str>) -> Option<Share> {
     if query.is_some_and(|query| !query.is_empty()) {
         return None;
     }
@@ -196,33 +67,6 @@ fn share_of(segments: &[&str], query: Option<&str>) -> Option<Share> {
     }
 }
 
-fn valid_segment(segment: &str) -> bool {
-    !segment.is_empty()
-        && segment
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
-}
-
-fn cache_key(path: &str, query: Option<&str>) -> String {
-    let mut pairs: Vec<&str> = query
-        .unwrap_or_default()
-        .split('&')
-        .filter(|pair| !pair.is_empty())
-        .collect();
-    pairs.sort_unstable();
-    format!("{path}?{}", pairs.join("&"))
-}
-
-pub fn wants_fresh(headers: &HeaderMap) -> bool {
-    headers.get_all(CACHE_CONTROL).iter().any(|value| {
-        value.to_str().is_ok_and(|value| {
-            value
-                .split(',')
-                .any(|directive| directive.trim().eq_ignore_ascii_case("no-cache"))
-        })
-    })
-}
-
 /// What `GET api.curseforge.com/v1/{path}` answers, from the cache while it is fresh.
 ///
 /// The query string goes to CurseForge as it came, and the answer comes back with CurseForge's status, content type
@@ -231,6 +75,7 @@ pub fn wants_fresh(headers: &HeaderMap) -> bool {
 /// no longer fresh is still given, marked `stale`, when the budget refuses the call or CurseForge fails.
 #[utoipa::path(
     get,
+    operation_id = "curseforge_get",
     path = "/v1/curseforge/{path}",
     tag = "curseforge",
     security(("bearer" = [])),
@@ -256,7 +101,19 @@ pub async fn passthrough_get(
     uri: Uri,
     headers: HeaderMap,
 ) -> Response {
-    passthrough(state, path, pool, Method::GET, uri, headers, Bytes::new()).await
+    passthrough::passthrough(
+        state,
+        Source::CurseForge,
+        passthrough::Request {
+            path,
+            pool,
+            method: Method::GET,
+            uri,
+            headers,
+            body: Bytes::new(),
+        },
+    )
+    .await
 }
 
 /// What `POST api.curseforge.com/v1/{path}` answers to this body.
@@ -266,6 +123,7 @@ pub async fn passthrough_get(
 /// cache, and only the ids not kept are asked for, 100 per call. Every other body goes to CurseForge each time.
 #[utoipa::path(
     post,
+    operation_id = "curseforge_post",
     path = "/v1/curseforge/{path}",
     tag = "curseforge",
     security(("bearer" = [])),
@@ -294,298 +152,27 @@ pub async fn passthrough_post(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    passthrough(state, path, pool, Method::POST, uri, headers, body).await
-}
-
-async fn passthrough(
-    state: Arc<AppState>,
-    path: String,
-    pool: Pool,
-    method: Method,
-    uri: Uri,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let segments: Vec<&str> = path.split('/').collect();
-    if !segments.iter().all(|segment| valid_segment(segment)) {
-        return ApiError::invalid_path().into_response();
-    }
-    let query = uri.query().map(str::to_owned);
-    let forced = wants_fresh(&headers);
-
-    if method == Method::POST
-        && query.as_deref().is_none_or(str::is_empty)
-        && let Some(batch) = Batch::of(&segments)
-        && let Some(ids) = batch.ids(&body)
-    {
-        return batch::answer(state, pool, batch, ids, forced).await;
-    }
-
-    let Some(freshness) = (method == Method::GET)
-        .then(|| freshness(&segments))
-        .flatten()
-    else {
-        let call = {
-            let (state, pool) = (state.clone(), pool.clone());
-            tokio::spawn(
-                async move { call(&state, &pool, method, &path, query.as_deref(), body).await },
-            )
-        };
-        return match call.await {
-            Ok(Ok(answer)) => respond(&answer, "miss"),
-            Ok(Err(failure)) => failed(failure, &pool),
-            Err(_) => failed(LoadFailure::Upstream(UpstreamFailure::Unreachable), &pool),
-        };
-    };
-
-    let share = share_of(&segments, query.as_deref());
-    let key = match share {
-        Some(Share::Mod(project)) => Batch::Mods.key(project),
-        _ => cache_key(&path, query.as_deref()),
-    };
-    let (shared_file, cached) = match share {
-        Some(Share::File { file, .. }) => {
-            let mut found = state
-                .cache
-                .lookup_many(&[Batch::Files.key(file), key.clone()], state.clock.now_ms())
-                .await;
-            let cached = found.pop().flatten();
-            (found.pop().flatten(), cached)
-        }
-        _ => (None, state.cache.lookup(&key, state.clock.now_ms()).await),
-    };
-    let now = state.clock.now_ms();
-    if !forced
-        && let Some(Share::File { project, .. }) = share
-        && let Some(entry) = shared_file.filter(|entry| {
-            entry.is_fresh(now)
-                && entry.answer.status == StatusCode::OK
-                && entry.owner == Some(project)
-        })
-    {
-        state.budget.record_hit(&pool.consumer, &pool.name);
-        return respond(&entry.answer, "hit");
-    }
-    if !forced && let Some(entry) = cached.as_ref().filter(|entry| entry.is_fresh(now)) {
-        state.budget.record_hit(&pool.consumer, &pool.name);
-        return respond(&entry.answer, "hit");
-    }
-
-    let load_key = if forced {
-        format!("{key} no-cache")
-    } else {
-        key.clone()
-    };
-    let (waiting, finisher) = state.cache.join(&load_key);
-    let started = finisher.is_some();
-    if let Some(finisher) = finisher {
-        let load = Load {
-            state: state.clone(),
-            pool: pool.clone(),
-            key,
-            load_key,
+    passthrough::passthrough(
+        state,
+        Source::CurseForge,
+        passthrough::Request {
             path,
-            query,
-            freshness,
-            share,
-            forced,
-        };
-        tokio::spawn(load.run(finisher));
-    }
-    let outcome = AnswerCache::wait(waiting).await.unwrap_or(Outcome {
-        loaded: Err(LoadFailure::Upstream(UpstreamFailure::Unreachable)),
-        called: false,
-    });
-
-    match outcome.loaded {
-        Ok(entry) => {
-            if started && outcome.called {
-                respond(&entry.answer, "miss")
-            } else {
-                state.budget.record_hit(&pool.consumer, &pool.name);
-                respond(&entry.answer, "hit")
-            }
-        }
-        Err(failure) => {
-            let curseforge_failed = match &failure {
-                LoadFailure::Answered(answer) => answer.status.is_server_error(),
-                LoadFailure::Refused(_) | LoadFailure::Upstream(_) => true,
-            };
-            let stale = cached.filter(|entry| entry.is_stale(state.clock.now_ms()));
-            match stale {
-                Some(entry) if curseforge_failed => {
-                    state.budget.record_hit(&pool.consumer, &pool.name);
-                    respond(&entry.answer, "stale")
-                }
-                _ => failed(failure, &pool),
-            }
-        }
-    }
-}
-
-struct Load {
-    state: Arc<AppState>,
-    pool: Pool,
-    key: String,
-    load_key: String,
-    path: String,
-    query: Option<String>,
-    freshness: Freshness,
-    share: Option<Share>,
-    forced: bool,
-}
-
-impl Load {
-    async fn run(self, finisher: Finisher) {
-        let outcome = self.outcome().await;
-        self.state.cache.finish(&self.load_key, finisher, outcome);
-    }
-
-    async fn outcome(&self) -> Outcome {
-        let state = &self.state;
-        if !self.forced
-            && let Some(entry) = state
-                .cache
-                .get(&self.key)
-                .filter(|entry| entry.is_fresh(state.clock.now_ms()))
-        {
-            return Outcome {
-                loaded: Ok(entry),
-                called: false,
-            };
-        }
-        let answer = match call(
-            state,
-            &self.pool,
-            Method::GET,
-            &self.path,
-            self.query.as_deref(),
-            Bytes::new(),
-        )
-        .await
-        {
-            Ok(answer) => answer,
-            Err(failure) => {
-                return Outcome {
-                    loaded: Err(failure),
-                    called: true,
-                };
-            }
-        };
-        let fresh_ms = match answer.status {
-            StatusCode::OK => Some(self.freshness.found_ms),
-            StatusCode::NOT_FOUND => self.freshness.not_found_ms,
-            _ => None,
-        };
-        let Some(fresh_ms) = fresh_ms else {
-            return Outcome {
-                loaded: Err(LoadFailure::Answered(answer)),
-                called: true,
-            };
-        };
-        let found = answer.status == StatusCode::OK;
-        let mut entry = Entry::new(answer, state.clock.now_ms(), fresh_ms);
-        if found
-            && self.share.is_some()
-            && let Some((row, owner)) = batch::row_of(&entry.answer.body)
-        {
-            entry.row = Some(row);
-            entry.owner = owner;
-        }
-        let entry = Arc::new(entry);
-        state.cache.insert(&self.key, entry.clone());
-        if let Some(Share::File { project, file }) = self.share
-            && entry.row.is_some()
-            && entry.owner == Some(project)
-        {
-            state.cache.insert(&Batch::Files.key(file), entry.clone());
-        }
-        Outcome {
-            loaded: Ok(entry),
-            called: true,
-        }
-    }
-}
-
-async fn call(
-    state: &AppState,
-    pool: &Pool,
-    method: Method,
-    path: &str,
-    query: Option<&str>,
-    body: Bytes,
-) -> Result<Answer, LoadFailure> {
-    state
-        .budget
-        .admit(&pool.consumer, &pool.name, 1)
-        .await
-        .map_err(LoadFailure::Refused)?;
-    send_recorded(state, pool, method, path, query, body).await
-}
-
-/// Sends one call the budget already admitted and records it. A 429 comes back as the hold it starts.
-pub async fn send_recorded(
-    state: &AppState,
-    pool: &Pool,
-    method: Method,
-    path: &str,
-    query: Option<&str>,
-    body: Bytes,
-) -> Result<Answer, LoadFailure> {
-    match state.upstream.send(method, path, query, body).await {
-        Ok((answer, retry_after)) => {
-            state
-                .budget
-                .record(
-                    &pool.consumer,
-                    &pool.name,
-                    Some(answer.status.as_u16()),
-                    retry_after.as_deref(),
-                )
-                .await;
-            if answer.status == StatusCode::TOO_MANY_REQUESTS {
-                return Err(LoadFailure::Refused(Refusal::Hold {
-                    retry_after_ms: budget::hold_ms(retry_after.as_deref(), state.clock.now_ms()),
-                }));
-            }
-            Ok(answer)
-        }
-        Err(failure) => {
-            state
-                .budget
-                .record(&pool.consumer, &pool.name, None, None)
-                .await;
-            Err(LoadFailure::Upstream(failure))
-        }
-    }
-}
-
-pub fn respond(answer: &Answer, cache: &'static str) -> Response {
-    let mut response = (answer.status, answer.body.clone()).into_response();
-    let headers = response.headers_mut();
-    match &answer.content_type {
-        Some(content_type) => {
-            headers.insert(CONTENT_TYPE, content_type.clone());
-        }
-        None => {
-            headers.remove(CONTENT_TYPE);
-        }
-    }
-    headers.insert(X_CACHE, HeaderValue::from_static(cache));
-    response
-}
-
-pub fn failed(failure: LoadFailure, pool: &Pool) -> Response {
-    match failure {
-        LoadFailure::Answered(answer) => respond(&answer, "miss"),
-        LoadFailure::Refused(refusal) => ApiError::refused(refusal, &pool.name).into_response(),
-        LoadFailure::Upstream(failure) => ApiError::upstream(failure, SOURCE).into_response(),
-    }
+            pool,
+            method: Method::POST,
+            uri,
+            headers,
+            body,
+        },
+    )
+    .await
 }
 
 #[cfg(test)]
 mod tests {
-    use axum::{body::Body, http::Request};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
     use tower::ServiceExt;
 
     use super::*;

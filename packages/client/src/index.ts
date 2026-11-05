@@ -27,6 +27,7 @@ export type {
   ResolveRequest,
   Resolved,
   ResolvedFile,
+  UpstreamBudget,
   VersionFilesRequest,
   components,
   paths,

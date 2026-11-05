@@ -94,7 +94,7 @@ pub type Finisher = watch::Sender<Option<Outcome>>;
 pub enum LoadFailure {
     Answered(Answer),
     Refused(crate::budget::Refusal),
-    Upstream(crate::curseforge::UpstreamFailure),
+    Upstream(crate::upstream::UpstreamFailure),
 }
 
 #[derive(Clone)]

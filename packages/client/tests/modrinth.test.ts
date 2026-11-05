@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   modrinthFileUrl,
+  modrinthProjectSchema,
+  modrinthSearchSchema,
+  modrinthTagSchema,
   modrinthVersionFilesSchema,
   modrinthVersionSchema,
 } from "../src/index.js";
@@ -43,6 +46,43 @@ describe("the Modrinth schemas", () => {
   it("read the versions per hash", () => {
     const parsed = modrinthVersionFilesSchema.parse({ [SHA1]: version });
     expect(parsed[SHA1]?.id).toBe("AAAAAAAA");
+  });
+
+  it("read a project, a search and the tags", () => {
+    const project = modrinthProjectSchema.parse({
+      id: "AANobbMI",
+      slug: "sodium",
+      project_type: "mod",
+      title: "Sodium",
+      description: "A modern rendering engine",
+      categories: ["optimization"],
+      client_side: "required",
+      server_side: "unsupported",
+      downloads: 1,
+      team: "x",
+    });
+    expect(project.slug).toBe("sodium");
+    const search = modrinthSearchSchema.parse({
+      hits: [
+        {
+          project_id: "AANobbMI",
+          project_type: "mod",
+          slug: "sodium",
+          title: "Sodium",
+        },
+      ],
+      offset: 0,
+      limit: 10,
+      total_hits: 1,
+    });
+    expect(search.hits[0]?.slug).toBe("sodium");
+    const tag = modrinthTagSchema.parse({
+      icon: "<svg/>",
+      name: "optimization",
+      project_type: "mod",
+      header: "categories",
+    });
+    expect(tag.name).toBe("optimization");
   });
 });
 

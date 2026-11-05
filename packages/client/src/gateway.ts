@@ -5,8 +5,11 @@ export type { components, paths };
 /** What `GET /v1/healthz` answers. */
 export type Health = components["schemas"]["Health"];
 
-/** What `GET /v1/budget` answers. */
+/** What `GET /v1/budget` answers: one `UpstreamBudget` for CurseForge and one for Modrinth. */
 export type BudgetSnapshot = components["schemas"]["BudgetSnapshot"];
+
+/** One upstream's budget: this minute, the 429 hold and the daily counts. */
+export type UpstreamBudget = components["schemas"]["UpstreamBudget"];
 
 export type PoolSnapshot = components["schemas"]["PoolSnapshot"];
 

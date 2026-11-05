@@ -10,25 +10,43 @@ use crate::{
     budget::{self, Budget, Clock, SystemClock},
     cache::AnswerCache,
     config::{Config, Consumer},
-    curseforge::{self, CURSEFORGE_API, Upstream},
+    curseforge::{self, CURSEFORGE_API},
     health,
-    modrinth::{self, MODRINTH_API, Modrinth},
+    modrinth::{self, MODRINTH_API},
     openapi,
     redis_store::RedisStore,
     resolve::{self, CURSEFORGE_CDN, Cdn},
+    upstream::{Source, Upstream},
 };
 
 pub struct AppState {
     pub consumers: Vec<Consumer>,
+    /// The budget of calls on the CurseForge key.
     pub budget: Budget,
+    /// The budget of calls to Modrinth.
+    pub modrinth_budget: Budget,
     pub upstream: Upstream,
-    pub modrinth: Modrinth,
+    pub modrinth: Upstream,
     pub cdn: Cdn,
     pub cache: AnswerCache,
     pub clock: Arc<dyn Clock>,
 }
 
 impl AppState {
+    pub fn upstream_of(&self, source: Source) -> &Upstream {
+        match source {
+            Source::CurseForge => &self.upstream,
+            Source::Modrinth => &self.modrinth,
+        }
+    }
+
+    pub fn budget_of(&self, source: Source) -> &Budget {
+        match source {
+            Source::CurseForge => &self.budget,
+            Source::Modrinth => &self.modrinth_budget,
+        }
+    }
+
     pub fn from_config(config: &Config, redis: Option<Arc<RedisStore>>) -> reqwest::Result<Self> {
         let pools = config.consumers.iter().flat_map(|consumer| {
             consumer
@@ -36,21 +54,38 @@ impl AppState {
                 .iter()
                 .map(|pool| (consumer.name.as_str(), pool.as_str()))
         });
+        let pools: Vec<(&str, &str)> = pools.collect();
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         Ok(Self {
             budget: Budget::new(
                 config.budget_per_minute,
-                pools,
+                pools.iter().copied(),
                 clock.clone(),
                 redis.clone(),
             )
             .keeping_days(config.budget_history_days),
+            modrinth_budget: Budget::new(
+                config.modrinth_per_minute,
+                pools.iter().copied(),
+                clock.clone(),
+                redis.clone(),
+            )
+            .keeping_days(config.budget_history_days)
+            .named("modrinth", "Modrinth"),
             upstream: Upstream::new(
+                Source::CurseForge,
                 CURSEFORGE_API,
-                config.curseforge_api_key.clone(),
+                Some(config.curseforge_api_key.clone()),
+                curseforge::USER_AGENT,
                 curseforge::TIMEOUT,
             )?,
-            modrinth: Modrinth::new(MODRINTH_API, &config.modrinth_user_agent, modrinth::TIMEOUT)?,
+            modrinth: Upstream::new(
+                Source::Modrinth,
+                MODRINTH_API,
+                None,
+                &config.modrinth_user_agent,
+                modrinth::TIMEOUT,
+            )?,
             cdn: Cdn::new(CURSEFORGE_CDN, resolve::CDN_TIMEOUT)?,
             cache: AnswerCache::new(redis),
             clock,
@@ -67,10 +102,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(curseforge::passthrough_get).post(curseforge::passthrough_post),
         )
         .route(
-            "/v1/modrinth/version_file/{hash}",
-            get(modrinth::version_file),
+            "/v1/modrinth/{*path}",
+            get(modrinth::passthrough_get).post(modrinth::passthrough_post),
         )
-        .route("/v1/modrinth/version_files", post(modrinth::version_files))
         .route("/v1/resolve", post(resolve::resolve))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -96,15 +130,20 @@ pub(crate) fn test_state(consumers: Vec<Consumer>) -> Arc<AppState> {
         })
         .collect();
     Arc::new(AppState {
-        budget: Budget::new(300, pools, Arc::new(SystemClock), None),
+        budget: Budget::new(300, pools.clone(), Arc::new(SystemClock), None),
+        modrinth_budget: Budget::new(300, pools, Arc::new(SystemClock), None),
         upstream: Upstream::new(
-            "http://127.0.0.1:9",
-            crate::config::ApiKey::new("unused"),
+            Source::CurseForge,
+            "http://127.0.0.1:9/v1",
+            Some(crate::config::ApiKey::new("unused")),
+            curseforge::USER_AGENT,
             curseforge::TIMEOUT,
         )
         .unwrap(),
-        modrinth: Modrinth::new(
-            "http://127.0.0.1:9",
+        modrinth: Upstream::new(
+            Source::Modrinth,
+            "http://127.0.0.1:9/v2",
+            None,
             modrinth::DEFAULT_USER_AGENT,
             modrinth::TIMEOUT,
         )
@@ -195,12 +234,17 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
 
         let body: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(body["limitPerMinute"], 300);
-        assert_eq!(body["used"], 0);
-        assert_eq!(body["heldUntil"], Value::Null);
         assert_eq!(body["source"], "memory");
-        assert_eq!(body["pools"][0]["consumer"], "app");
-        assert_eq!(body["pools"][1]["pool"], "app");
+        assert_eq!(body["historyDays"], 90);
+        for upstream in ["curseforge", "modrinth"] {
+            let budget = &body[upstream];
+            assert_eq!(budget["limitPerMinute"], 300, "{upstream}");
+            assert_eq!(budget["used"], 0, "{upstream}");
+            assert_eq!(budget["heldUntil"], Value::Null, "{upstream}");
+            assert_eq!(budget["pools"][0]["consumer"], "app", "{upstream}");
+            assert_eq!(budget["pools"][1]["pool"], "app", "{upstream}");
+            assert_eq!(budget.get("source"), None, "{upstream}");
+        }
     }
 
     #[tokio::test]
@@ -209,7 +253,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["historyDays"], 90);
-        assert_eq!(body["days"], Value::Array(Vec::new()));
+        assert_eq!(body["curseforge"]["days"], Value::Array(Vec::new()));
 
         for query in ["days=0", "days=-1", "days=many", "days="] {
             let (status, _, body) = get(&format!("/v1/budget?{query}"), Some(TOKEN)).await;
