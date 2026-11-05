@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import pickle
 import time
 from collections.abc import Callable
 from typing import Any
@@ -170,6 +172,22 @@ def test_the_gateways_own_refusal_raises(fake: FakeGateway, gateway: ContentGate
     assert raised.value.pool == "app"
     assert raised.value.retry_after_ms == 4000
     assert str(raised.value) == "spent"
+
+
+def test_the_error_survives_pickling_and_copying() -> None:
+    error = ContentGatewayError(
+        503, {"code": "BUDGET_SPENT", "message": "spent", "pool": "app", "retryAfterMs": 4000}, ""
+    )
+    for twin in (pickle.loads(pickle.dumps(error)), copy.copy(error)):
+        assert isinstance(twin, ContentGatewayError)
+        assert (twin.status, twin.code, twin.pool, twin.retry_after_ms) == (
+            503,
+            "BUDGET_SPENT",
+            "app",
+            4000,
+        )
+        assert str(twin) == "spent"
+    assert str(ContentGatewayError(502, None, "fallback")) == "fallback"
 
 
 def test_an_answer_that_did_not_come_through_the_gateway_raises(

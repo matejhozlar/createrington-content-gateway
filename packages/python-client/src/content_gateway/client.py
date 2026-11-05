@@ -66,13 +66,18 @@ class ContentGatewayError(Exception):
     code: ErrorCode | None
     pool: str | None
     retry_after_ms: int | None
+    message: str
 
     def __init__(self, status: int, error: ApiError | None, fallback: str) -> None:
-        super().__init__(error["message"] if error is not None else fallback)
+        super().__init__(status, error, fallback)
+        self.message = error["message"] if error is not None else fallback
         self.status = status
         self.code = error["code"] if error is not None else None
         self.pool = error.get("pool") if error is not None else None
         self.retry_after_ms = error.get("retryAfterMs") if error is not None else None
+
+    def __str__(self) -> str:
+        return self.message
 
 
 @dataclass(frozen=True, slots=True)
