@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     Json,
@@ -24,6 +28,9 @@ use crate::{
 pub const CURSEFORGE_CDN: &str = "https://mediafilez.forgecdn.net";
 pub const CDN_TIMEOUT: Duration = Duration::from_secs(10);
 const CDN_WAIT: Duration = Duration::from_secs(20);
+/// The longest a `POST /v1/resolve` can take: CurseForge's timeout, then Modrinth's, then the CDN wait. The client's
+/// timeout for `resolve()` is set above it.
+pub const LONGEST: Duration = Duration::from_secs(40);
 const CDN_AT_ONCE: usize = 8;
 const CDN_FOUND_MS: u64 = HOUR_MS;
 const CDN_NOT_FOUND_MS: u64 = 10 * MINUTE_MS;
@@ -174,10 +181,16 @@ struct VersionHashes {
 
 struct Known {
     file_id: u64,
-    file_name: String,
-    size: u64,
+    file_name: Option<String>,
+    size: Option<u64>,
     sha1: Option<String>,
     download_url: Option<String>,
+}
+
+struct Candidate {
+    file_id: u64,
+    file_name: String,
+    size: u64,
 }
 
 /// A download address for each CurseForge file: CurseForge's own link, else Modrinth's copy of the file found by
@@ -186,7 +199,8 @@ struct Known {
 /// The files are read from the cache like `POST /v1/curseforge/mods/files`, and the CurseForge calls for the ones
 /// not kept count against the budget. Modrinth answers and CDN verdicts are kept for an hour, misses for 10
 /// minutes. No bytes pass through the gateway: the consumer downloads from the address given. A null `source` with
-/// `retry` false means no source has the file; `retry` true means a source could not be asked this time.
+/// `retry` false means no source has the file; `retry` true means a source could not be asked this time. At worst
+/// a call takes 40 s: 10 s for CurseForge, 10 s for Modrinth and 20 s for the CDN checks.
 #[utoipa::path(
     post,
     path = "/v1/resolve",
@@ -222,14 +236,16 @@ pub async fn resolve(
     if request.file_ids.is_empty() {
         return ApiError::invalid_body("`fileIds` must list at least one file id").into_response();
     }
-    let mut ids: Vec<u64> = Vec::with_capacity(request.file_ids.len());
+    let mut seen = HashSet::new();
+    let mut ids: Vec<u64> = Vec::new();
     for id in &request.file_ids {
-        if !ids.contains(id) {
+        if seen.insert(*id) {
             ids.push(*id);
         }
-    }
-    if ids.len() > MOST_FILES {
-        return ApiError::invalid_body("`fileIds` may list at most 1000 file ids").into_response();
+        if ids.len() > MOST_FILES {
+            return ApiError::invalid_body("`fileIds` may list at most 1000 file ids")
+                .into_response();
+        }
     }
     let forced = curseforge::wants_fresh(&headers);
 
@@ -246,8 +262,8 @@ pub async fn resolve(
                 *id,
                 Known {
                     file_id: row.id,
-                    file_name: row.file_name?,
-                    size: row.file_length?,
+                    file_name: row.file_name,
+                    size: row.file_length,
                     sha1: row
                         .hashes
                         .iter()
@@ -288,13 +304,19 @@ pub async fn resolve(
     };
 
     let on_cdn = if request.cdn {
-        let candidates: Vec<&Known> = wanted
+        let candidates: Vec<Candidate> = wanted
             .iter()
-            .copied()
             .filter(|file| {
                 file.sha1
                     .as_ref()
                     .is_none_or(|sha1| !on_modrinth.contains_key(sha1))
+            })
+            .filter_map(|file| {
+                Some(Candidate {
+                    file_id: file.file_id,
+                    file_name: file.file_name.clone()?,
+                    size: file.size?,
+                })
             })
             .collect();
         check_cdn(&state, &candidates, forced).await
@@ -321,7 +343,7 @@ pub async fn resolve(
             } else if let Some(url) = file.sha1.as_ref().and_then(|sha1| on_modrinth.get(sha1)) {
                 (Some((FileSource::Modrinth, url.clone())), false)
             } else {
-                let cdn = if request.cdn {
+                let cdn = if request.cdn && file.file_name.is_some() && file.size.is_some() {
                     on_cdn.get(id)
                 } else {
                     Some(&None)
@@ -339,8 +361,8 @@ pub async fn resolve(
                 source,
                 url,
                 sha1: file.sha1.clone(),
-                file_name: Some(file.file_name.clone()),
-                size: Some(file.size),
+                file_name: file.file_name.clone(),
+                size: file.size,
                 retry,
             }
         })
@@ -376,7 +398,7 @@ fn cdn_key(file_id: u64, size: u64) -> String {
 /// the file, absent when it could not be asked within the wait.
 async fn check_cdn(
     state: &Arc<AppState>,
-    candidates: &[&Known],
+    candidates: &[Candidate],
     forced: bool,
 ) -> HashMap<u64, Option<String>> {
     let mut verdicts = HashMap::with_capacity(candidates.len());
@@ -708,6 +730,40 @@ mod tests {
         let got = resolve(&gateway, &format!(r#"{{"fileIds":[{}]}}"#, many.join(","))).await;
         assert_eq!(got.status, StatusCode::BAD_REQUEST);
         assert_eq!(mock.calls(), 0);
+    }
+
+    #[test]
+    fn the_longest_call_is_the_three_sources_in_a_row() {
+        assert_eq!(TIMEOUT + modrinth::TIMEOUT + CDN_WAIT, LONGEST);
+    }
+
+    #[tokio::test]
+    async fn a_file_without_a_name_or_size_keeps_its_link_and_skips_the_cdn() {
+        let mock = Mock::start(Duration::ZERO, |_, seen| match seen.uri.as_str() {
+            "/v1/mods/files" => reply(
+                200,
+                json!({ "data": [
+                    { "id": 1007, "modId": 100, "downloadUrl": "https://edge.forgecdn.net/bare.jar", "hashes": [] },
+                    { "id": 1008, "modId": 100, "fileLength": 80, "hashes": [{ "value": CREATE_SHA1, "algo": 1 }] },
+                ] })
+                .to_string(),
+            ),
+            "/v2/version_files" => reply(200, "{}"),
+            uri => panic!("unexpected {uri}"),
+        })
+        .await;
+        let gateway = gateway(&mock, 300, TIMEOUT);
+
+        let got = resolve(&gateway, r#"{"fileIds":[1007,1008]}"#).await;
+        let files = got.json()["files"].clone();
+        assert_eq!(files[0]["source"], "curseforge");
+        assert_eq!(files[0]["fileName"], Value::Null);
+        assert_eq!(files[0]["size"], Value::Null);
+        assert_eq!(files[1]["source"], Value::Null);
+        assert_eq!(files[1]["sha1"], CREATE_SHA1);
+        assert_eq!(files[1]["size"], 80);
+        assert_eq!(files[1]["retry"], false);
+        assert!(mock.seen().iter().all(|seen| seen.method != "HEAD"));
     }
 
     #[test]

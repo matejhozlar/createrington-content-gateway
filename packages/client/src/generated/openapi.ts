@@ -95,7 +95,7 @@ export interface paths {
     /**
      * The Modrinth versions of the files with these SHA-1s, keyed by hash, as `POST api.modrinth.com/v2/version_files`
      *     answers them: a hash Modrinth does not know is left out.
-     * @description Answered per hash from the cache; only the hashes not kept are asked for, 100 per call.
+     * @description Answered per hash from the cache; only the hashes not kept are asked for, 100 per call, at most 1000 hashes.
      */
     post: operations["version_files"];
     delete?: never;
@@ -136,7 +136,8 @@ export interface paths {
      * @description The files are read from the cache like `POST /v1/curseforge/mods/files`, and the CurseForge calls for the ones
      *     not kept count against the budget. Modrinth answers and CDN verdicts are kept for an hour, misses for 10
      *     minutes. No bytes pass through the gateway: the consumer downloads from the address given. A null `source` with
-     *     `retry` false means no source has the file; `retry` true means a source could not be asked this time.
+     *     `retry` false means no source has the file; `retry` true means a source could not be asked this time. At worst
+     *     a call takes 40 s: 10 s for CurseForge, 10 s for Modrinth and 20 s for the CDN checks.
      */
     post: operations["resolve"];
     delete?: never;
@@ -357,7 +358,7 @@ export interface components {
        */
       algorithm?: string;
       /**
-       * @description SHA-1 hashes of the wanted files, 40 hex digits each.
+       * @description SHA-1 hashes of the wanted files, 40 hex digits each, up to 1000.
        * @example [
        *       "3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e"
        *     ]
@@ -732,7 +733,7 @@ export interface operations {
           "application/json": unknown;
         };
       };
-      /** @description `INVALID_BODY` or `INVALID_HASH` */
+      /** @description `INVALID_BODY` (no hashes, more than 1000, or another algorithm) or `INVALID_HASH` */
       400: {
         headers: {
           [name: string]: unknown;

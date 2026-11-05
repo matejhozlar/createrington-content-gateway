@@ -141,7 +141,7 @@ Errors answer `{ "code", "message" }`. A call the budget refuses answers `503` w
 
 ### Modrinth
 
-`GET /v1/modrinth/version_file/{sha1}` answers the version Modrinth lists the file with that SHA-1 under, as `api.modrinth.com/v2/version_file/{hash}` does, or 404 when Modrinth does not know the hash. `POST /v1/modrinth/version_files` with `{"hashes": [...], "algorithm": "sha1"}` answers the versions found keyed by lowercase hash, as `api.modrinth.com/v2/version_files` does, leaving unknown hashes out. Both are kept per hash: a found version for an hour, a miss for 10 minutes, and only the hashes not kept are asked for, 100 per call. Modrinth needs no key, so these calls draw from no pool and are not counted; `MODRINTH_USER_AGENT` is what Modrinth sees. A hash that is not 40 hex digits answers `400 INVALID_HASH`.
+`GET /v1/modrinth/version_file/{sha1}` answers the version Modrinth lists the file with that SHA-1 under, as `api.modrinth.com/v2/version_file/{hash}` does, or 404 when Modrinth does not know the hash. `POST /v1/modrinth/version_files` with `{"hashes": [...], "algorithm": "sha1"}` answers the versions found keyed by lowercase hash, as `api.modrinth.com/v2/version_files` does, leaving unknown hashes out. Both are kept per hash: a found version for an hour, a miss for 10 minutes, and only the hashes not kept are asked for, 100 per call, at most 1000 hashes per request. Modrinth gets 10 s to answer, like CurseForge. Modrinth needs no key, so these calls draw from no pool and are not counted; `MODRINTH_USER_AGENT` is what Modrinth sees. A hash that is not 40 hex digits answers `400 INVALID_HASH`.
 
 ### Resolve
 
@@ -151,7 +151,7 @@ Errors answer `{ "code", "message" }`. A call the budget refuses answers `503` w
 2. `modrinth`: the copy of the file Modrinth hosts, found by SHA-1 through the lookup above. Only the file whose own hash matches counts, and only an address on `cdn.modrinth.com`.
 3. `curseforge-cdn`: the file's address on CurseForge's CDN built from its id and name, the way CurseForge's own links are. The address is unofficial, so it is given only when a HEAD answers 200 with the file's size; the bytes are not read, the consumer verifies the SHA-1 when it downloads. Verdicts are kept an hour, misses 10 minutes, and at most 8 addresses are checked at once within 20 seconds. `"cdn": false` in the body skips this step.
 
-A null `source` with `retry` false means no source has the file and the consumer is left to its own fallbacks; `retry` true means a source could not be asked this time, so the miss is not worth remembering. `Cache-Control: no-cache` asks every source again. No bytes pass through the gateway.
+A null `source` with `retry` false means no source has the file and the consumer is left to its own fallbacks; `retry` true means a source could not be asked this time, so the miss is not worth remembering. `Cache-Control: no-cache` asks every source again. No bytes pass through the gateway. The sources are tried in a row, so a call takes 40 s at worst (10 s for CurseForge, 10 s for Modrinth, 20 s for the CDN checks): give the call at least that long.
 
 ## Keep it private
 

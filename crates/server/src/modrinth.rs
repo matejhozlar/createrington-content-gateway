@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     Json,
@@ -23,7 +27,9 @@ use crate::{
 };
 
 pub const MODRINTH_API: &str = "https://api.modrinth.com";
-pub const TIMEOUT: Duration = Duration::from_secs(15);
+pub const TIMEOUT: Duration = Duration::from_secs(10);
+/// How many hashes one `POST /v1/modrinth/version_files` may ask for.
+pub const MOST_HASHES: usize = 1000;
 /// Modrinth asks every client to say who it is; this is what the gateway says unless `MODRINTH_USER_AGENT` is set.
 pub const DEFAULT_USER_AGENT: &str = concat!("content-gateway/", env!("CARGO_PKG_VERSION"));
 pub const SOURCE: &str = "Modrinth";
@@ -73,7 +79,7 @@ impl Modrinth {
 /// The body of `POST /v1/modrinth/version_files`.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct VersionFilesRequest {
-    /// SHA-1 hashes of the wanted files, 40 hex digits each.
+    /// SHA-1 hashes of the wanted files, 40 hex digits each, up to 1000.
     #[schema(example = json!(["3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e"]))]
     pub hashes: Vec<String>,
     /// Only `sha1` is supported.
@@ -379,7 +385,7 @@ pub async fn version_file(
 /// The Modrinth versions of the files with these SHA-1s, keyed by hash, as `POST api.modrinth.com/v2/version_files`
 /// answers them: a hash Modrinth does not know is left out.
 ///
-/// Answered per hash from the cache; only the hashes not kept are asked for, 100 per call.
+/// Answered per hash from the cache; only the hashes not kept are asked for, 100 per call, at most 1000 hashes.
 #[utoipa::path(
     post,
     path = "/v1/modrinth/version_files",
@@ -391,7 +397,7 @@ pub async fn version_file(
     request_body(content = VersionFilesRequest, content_type = "application/json"),
     responses(
         (status = 200, description = "The versions found, keyed by lowercase hash, each as Modrinth sent it", body = Value, headers(("X-Cache" = String, description = "`hit` when every hash was kept, `miss` when Modrinth was asked, `stale` an old answer given because Modrinth could not be asked"))),
-        (status = 400, description = "`INVALID_BODY` or `INVALID_HASH`", body = ApiError),
+        (status = 400, description = "`INVALID_BODY` (no hashes, more than 1000, or another algorithm) or `INVALID_HASH`", body = ApiError),
         (status = 401, description = "No valid consumer token", body = ApiError),
         (status = 502, description = "Modrinth could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`", body = ApiError),
         (status = 504, description = "Modrinth did not answer in time, `UPSTREAM_TIMEOUT`", body = ApiError),
@@ -413,13 +419,17 @@ pub async fn version_files(
     if request.hashes.is_empty() {
         return ApiError::invalid_body("`hashes` must list at least one SHA-1").into_response();
     }
-    let mut hashes = Vec::with_capacity(request.hashes.len());
+    let mut seen = HashSet::new();
+    let mut hashes = Vec::new();
     for hash in &request.hashes {
         let Some(hash) = sha1_of(hash) else {
             return ApiError::invalid_hash().into_response();
         };
-        if !hashes.contains(&hash) {
+        if seen.insert(hash.clone()) {
             hashes.push(hash);
+        }
+        if hashes.len() > MOST_HASHES {
+            return ApiError::invalid_body("`hashes` may list at most 1000 SHA-1s").into_response();
         }
     }
     let looked = match lookup(&state, hashes, curseforge::wants_fresh(&headers)).await {
@@ -585,9 +595,12 @@ mod tests {
         assert_eq!(got.status, StatusCode::BAD_REQUEST);
         assert_eq!(got.json()["code"], "INVALID_HASH");
 
+        let many: Vec<String> = (0..1001).map(|n| format!("\"{n:040x}\"")).collect();
+        let many = format!(r#"{{"hashes":[{}]}}"#, many.join(","));
         for (body, code) in [
             ("{}", "INVALID_BODY"),
             (r#"{"hashes":[]}"#, "INVALID_BODY"),
+            (many.as_str(), "INVALID_BODY"),
             (r#"{"hashes":["abc"],"algorithm":"sha512"}"#, "INVALID_BODY"),
             (r#"{"hashes":["abc"]}"#, "INVALID_HASH"),
         ] {
