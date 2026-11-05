@@ -14,7 +14,7 @@
   },
   "scripts": {
     "dev": "infisical run --env=dev -- cargo run",
-    "openapi": "node scripts/openapi.mjs && pnpm --filter @createrington/content-gateway-client generate",
+    "openapi": "node scripts/openapi.mjs && pnpm --filter @createrington/content-gateway-client generate && uv run --directory packages/python-client python scripts/generate.py",
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",

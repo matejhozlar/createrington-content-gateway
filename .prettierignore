@@ -1,6 +1,10 @@
 node_modules
 target
 dist
+.venv
+.pytest_cache
+.mypy_cache
+.ruff_cache
 pnpm-lock.yaml
 Cargo.lock
 CHANGELOG.md

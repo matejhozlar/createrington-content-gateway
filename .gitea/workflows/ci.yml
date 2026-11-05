@@ -79,6 +79,26 @@ jobs:
         working-directory: packages/client
         run: node --input-type=module -e "const { ContentGateway } = await import('@createrington/content-gateway-client'); if (typeof ContentGateway !== 'function') process.exit(1)"
 
+  python:
+    runs-on: oracle
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Check the Python client
+        working-directory: packages/python-client
+        run: |
+          uv sync --locked
+          uv run python scripts/generate.py --check
+          uv run ruff format --check .
+          uv run ruff check .
+          uv run mypy
+          uv run pytest
+
   rust-format:
     runs-on: hetzner
     steps:

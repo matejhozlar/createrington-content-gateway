@@ -111,7 +111,7 @@ User=content-gateway
 
 `source` in the budget says where its counts come from: `redis` for the stored ones, `memory` when no Redis is configured, and `unavailable` when Redis did not answer, in which case the minute is the gateway's own count and the days show only what is not written to Redis yet.
 
-The gateway's own answers are described by [`openapi.json`](openapi.json), which the server derives from its types (`content-gateway --openapi` prints it). Its `info.version` is the version of the API, the `1` of `/v1`; the gateway's own version is in `/v1/healthz`. The CurseForge answers are CurseForge's and are not described there. TypeScript consumers install [`@createrington/content-gateway-client`](packages/client/README.md), whose types come from the document; anyone else can generate a client from it.
+The gateway's own answers are described by [`openapi.json`](openapi.json), which the server derives from its types (`content-gateway --openapi` prints it). Its `info.version` is the version of the API, the `1` of `/v1`; the gateway's own version is in `/v1/healthz`. The CurseForge answers are CurseForge's and are not described there. TypeScript consumers install [`@createrington/content-gateway-client`](packages/client/README.md) and Python consumers [`content-gateway-client`](packages/python-client/README.md), whose types come from the document; anyone else can generate a client from it.
 
 ### CurseForge
 
@@ -189,11 +189,11 @@ pnpm install        # Prettier, the pre-commit hook, the Infisical CLI and the c
 cargo run           # the gateway on 127.0.0.1:5005 with the variables exported in the shell
 pnpm dev            # the same with the env injected from Infisical, for the maintainers
 pnpm openapi        # rewrite openapi.json and the client's generated types after a route or type changed
-pnpm test           # the client's tests; pnpm typecheck and pnpm build likewise
+pnpm test           # the TypeScript client's tests; pnpm typecheck and pnpm build likewise
 pnpm format:check
 ```
 
-`openapi.json` and `packages/client/src/generated/openapi.ts` are generated and checked in: `cargo test` fails when the document no longer matches the server, and the client's `generate:check` fails when the types no longer match the document.
+`openapi.json`, `packages/client/src/generated/openapi.ts` and `packages/python-client/src/content_gateway/generated.py` are generated and checked in: `cargo test` fails when the document no longer matches the server, and each client's generate check fails when its types no longer match the document. `pnpm openapi` rewrites all three; the Python step needs [uv](https://docs.astral.sh/uv/), which also runs the Python client's own checks (see its README).
 
 Every pull request runs these checks in CI, on Gitea Actions for the primary repository (`.gitea/workflows/ci.yml`) and on GitHub Actions for the mirror (`.github/workflows/ci.yml`); both share the composite actions under `.ci/actions`.
 
