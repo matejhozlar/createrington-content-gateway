@@ -13,6 +13,13 @@ import type {
  */
 export const DEFAULT_TIMEOUT_MS = 15_000;
 
+/**
+ * How long `resolve()` may take unless its options say otherwise. The gateway
+ * tries CurseForge (10 s), Modrinth (10 s) and the CDN (20 s) in a row, so at
+ * worst it answers after 40 s, and this is set above that.
+ */
+export const RESOLVE_TIMEOUT_MS = 60_000;
+
 const CACHE_HEADER = "x-cache";
 const POOL_HEADER = "x-budget-pool";
 const CACHE_STATUSES = ["hit", "miss", "stale"] as const;
@@ -75,6 +82,8 @@ export interface ResolveOptions {
   fresh?: boolean;
   /** As on `CurseForgeRequest`. */
   waitUpToMs?: number;
+  /** How long the call may take, in milliseconds. `RESOLVE_TIMEOUT_MS` when unset, longer than the client's own timeout. */
+  timeoutMs?: number;
   signal?: AbortSignal;
 }
 
@@ -132,6 +141,7 @@ interface SendOptions {
   pool?: string | undefined;
   fresh?: boolean | undefined;
   waitUpToMs?: number | undefined;
+  timeoutMs?: number | undefined;
   signal?: AbortSignal | undefined;
 }
 
@@ -273,6 +283,7 @@ export class ContentGateway {
       pool: options.pool,
       fresh: options.fresh,
       waitUpToMs: options.waitUpToMs,
+      timeoutMs: options.timeoutMs ?? RESOLVE_TIMEOUT_MS,
       signal: options.signal,
     });
     return body as Resolved;
@@ -318,7 +329,10 @@ export class ContentGateway {
         method: options.method,
         headers,
         body,
-        signal: attemptSignal(this.timeoutMs, options.signal),
+        signal: attemptSignal(
+          options.timeoutMs ?? this.timeoutMs,
+          options.signal,
+        ),
       });
       const answer = await readBody(response);
       if (response.headers.has(CACHE_HEADER) || response.ok) {

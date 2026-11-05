@@ -2,6 +2,7 @@ export {
   ContentGateway,
   ContentGatewayError,
   DEFAULT_TIMEOUT_MS,
+  RESOLVE_TIMEOUT_MS,
   type CacheStatus,
   type ContentGatewayOptions,
   type CurseForgeAnswer,

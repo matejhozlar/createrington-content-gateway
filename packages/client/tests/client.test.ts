@@ -1,5 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ContentGateway, ContentGatewayError } from "../src/index.js";
+import {
+  ContentGateway,
+  ContentGatewayError,
+  DEFAULT_TIMEOUT_MS,
+  RESOLVE_TIMEOUT_MS,
+} from "../src/index.js";
 import { FakeGateway, json } from "./gateway.js";
 
 const TOKEN = "app-token-0123456789abcdef0123456789";
@@ -187,6 +192,18 @@ describe("the CurseForge passthrough", () => {
       .catch((error: unknown) => error)) as ContentGatewayError;
     expect(error).toBeInstanceOf(ContentGatewayError);
     expect(error.code).toBe("BUDGET_SPENT");
+  });
+
+  it("gives resolve longer than the gateway's three sources in a row", async () => {
+    const gatewayWorstCaseMs = 10_000 + 10_000 + 20_000;
+    expect(RESOLVE_TIMEOUT_MS).toBeGreaterThan(gatewayWorstCaseMs);
+    expect(DEFAULT_TIMEOUT_MS).toBeGreaterThan(10_000);
+
+    gateway.reply({ ...json(200, { files: [] }), delayMs: 50 });
+    const error = (await client({ timeoutMs: 10 })
+      .resolve([1], { timeoutMs: 10 })
+      .catch((error: unknown) => error)) as Error;
+    expect(error.name).toBe("TimeoutError");
   });
 
   it("refuses a GET with a body before sending anything", async () => {
