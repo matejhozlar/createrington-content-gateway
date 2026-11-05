@@ -3,7 +3,12 @@ import type {
   BudgetSnapshot,
   ErrorCode,
   Health,
+  Loader,
+  LoaderVersions,
+  MinecraftVersionDetails,
+  MinecraftVersions,
   Resolved,
+  VersionFilter,
 } from "./gateway.js";
 
 /**
@@ -80,6 +85,22 @@ export interface ResolveOptions {
   waitUpToMs?: number;
   /** How long the call may take, in milliseconds. `RESOLVE_TIMEOUT_MS` when unset, longer than the client's own timeout. */
   timeoutMs?: number;
+  signal?: AbortSignal;
+}
+
+/** What `minecraftVersions()` asks for. */
+export interface MinecraftVersionsOptions {
+  /** `release` (the default), `snapshot` or `all`. */
+  type?: VersionFilter;
+  /** Only the versions this loader has at least one build for. */
+  loader?: Loader;
+  signal?: AbortSignal;
+}
+
+/** What `loaderVersions()` asks for. */
+export interface LoaderVersionsOptions {
+  /** Only the builds for this Minecraft version, such as `1.21.1`. */
+  minecraft?: string;
   signal?: AbortSignal;
 }
 
@@ -307,6 +328,56 @@ export class ContentGateway {
       signal: options.signal,
     });
     return body as Resolved;
+  }
+
+  /**
+   * `GET /v1/minecraft/versions`: the Minecraft versions Mojang lists, newest
+   * first, releases unless `type` says otherwise, and only the ones `loader`
+   * has builds for when given.
+   */
+  async minecraftVersions(
+    options: MinecraftVersionsOptions = {},
+  ): Promise<MinecraftVersions> {
+    const { body } = await this.send({
+      method: "GET",
+      path: "/v1/minecraft/versions",
+      query: { type: options.type, loader: options.loader },
+      authenticated: true,
+      signal: options.signal,
+    });
+    return body as MinecraftVersions;
+  }
+
+  /** `GET /v1/minecraft/versions/<id>`: one version with the Java major it needs. Throws `UNKNOWN_VERSION` as a `ContentGatewayError`. */
+  async minecraftVersion(
+    id: string,
+    signal?: AbortSignal,
+  ): Promise<MinecraftVersionDetails> {
+    const { body } = await this.send({
+      method: "GET",
+      path: `/v1/minecraft/versions/${encodeURIComponent(id)}`,
+      authenticated: true,
+      signal,
+    });
+    return body as MinecraftVersionDetails;
+  }
+
+  /**
+   * `GET /v1/minecraft/loaders/<loader>/versions`: a loader's builds, newest
+   * first, narrowed to a Minecraft version when `minecraft` is given.
+   */
+  async loaderVersions(
+    loader: Loader,
+    options: LoaderVersionsOptions = {},
+  ): Promise<LoaderVersions> {
+    const { body } = await this.send({
+      method: "GET",
+      path: `/v1/minecraft/loaders/${loader}/versions`,
+      query: { minecraft: options.minecraft },
+      authenticated: true,
+      signal: options.signal,
+    });
+    return body as LoaderVersions;
   }
 
   private async passthrough(options: SendOptions): Promise<PassthroughAnswer> {

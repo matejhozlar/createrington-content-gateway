@@ -35,6 +35,29 @@ export type ResolveRequest = components["schemas"]["ResolveRequest"];
 
 export type VersionFilesRequest = components["schemas"]["VersionFilesRequest"];
 
+/** What `GET /v1/minecraft/versions` answers. */
+export type MinecraftVersions = components["schemas"]["MinecraftVersions"];
+
+export type MinecraftVersion = components["schemas"]["MinecraftVersion"];
+
+/** What `GET /v1/minecraft/versions/{id}` answers. */
+export type MinecraftVersionDetails =
+  components["schemas"]["MinecraftVersionDetails"];
+
+/** Mojang's kinds of versions. */
+export type VersionType = components["schemas"]["VersionType"];
+
+/** Which versions to list: `release`, `snapshot` or `all`. */
+export type VersionFilter = components["schemas"]["VersionFilter"];
+
+/** The mod loaders the gateway lists builds for. */
+export type Loader = components["schemas"]["Loader"];
+
+/** What `GET /v1/minecraft/loaders/{loader}/versions` answers. */
+export type LoaderVersions = components["schemas"]["LoaderVersions"];
+
+export type LoaderVersion = components["schemas"]["LoaderVersion"];
+
 /** The JSON body of every error the gateway answers itself. */
 export type ApiError = components["schemas"]["ApiError"];
 

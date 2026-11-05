@@ -26,6 +26,7 @@ use crate::{
     redis_store::RedisStore,
     resolve::{self, Cdn},
     upstream::{Source, Upstream},
+    versions::{self, Meta},
 };
 
 pub(crate) const NOV_3_2026_20H: u64 = 1_793_736_000_000;
@@ -35,6 +36,7 @@ pub(crate) const USER_AGENT: &str = "test-gateway/0 (https://example.com)";
 
 #[derive(Debug, Clone)]
 pub(crate) struct Seen {
+    pub(crate) base: String,
     pub(crate) method: String,
     pub(crate) uri: String,
     pub(crate) key: Option<String>,
@@ -70,12 +72,17 @@ impl Mock {
         let answer = Arc::new(answer);
         let calls = Arc::new(AtomicUsize::new(0));
         let recorded = seen.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let served = base.clone();
         let mock = Router::new().fallback(move |request: Request<Body>| {
             let (recorded, answer, calls) = (recorded.clone(), answer.clone(), calls.clone());
+            let base = served.clone();
             async move {
                 let (parts, body) = request.into_parts();
                 let body = body.collect().await.unwrap().to_bytes();
                 let seen = Seen {
+                    base,
                     method: parts.method.to_string(),
                     uri: parts.uri.to_string(),
                     key: parts
@@ -103,8 +110,6 @@ impl Mock {
                 response.body(body).unwrap()
             }
         });
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
         Self { base, seen }
     }
@@ -181,6 +186,15 @@ fn gateway_with(
         )
         .unwrap(),
         cdn: Cdn::new(mock.base.clone(), resolve::CDN_TIMEOUT).unwrap(),
+        meta: Meta::new(
+            mock.base.clone(),
+            mock.base.clone(),
+            mock.base.clone(),
+            mock.base.clone(),
+            USER_AGENT,
+            versions::TIMEOUT,
+        )
+        .unwrap(),
         cache: AnswerCache::new(redis),
         clock: clock.clone(),
         consumers,

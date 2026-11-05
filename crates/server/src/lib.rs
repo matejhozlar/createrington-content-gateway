@@ -16,3 +16,4 @@ pub mod serve;
 #[cfg(test)]
 mod test_support;
 pub mod upstream;
+pub mod versions;

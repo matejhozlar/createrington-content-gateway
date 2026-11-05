@@ -223,6 +223,66 @@ describe("the CurseForge passthrough", () => {
     expect(error.name).toBe("TimeoutError");
   });
 
+  it("lists Minecraft and loader versions", async () => {
+    gateway.reply(
+      json(200, {
+        latest: { release: "1.21.1", snapshot: "24w33a" },
+        versions: [
+          {
+            id: "1.21.1",
+            type: "release",
+            releaseTime: "2024-08-08T00:00:00Z",
+          },
+        ],
+      }),
+    );
+    const versions = await client().minecraftVersions({ loader: "neoforge" });
+    expect(versions.versions[0]?.id).toBe("1.21.1");
+    expect(gateway.seen[0]?.url).toBe("/v1/minecraft/versions?loader=neoforge");
+
+    gateway.reply(
+      json(200, {
+        id: "1.21.1",
+        type: "release",
+        releaseTime: "2024-08-08T00:00:00Z",
+        javaMajor: 21,
+      }),
+    );
+    const version = await client().minecraftVersion("1.21.1");
+    expect(version.javaMajor).toBe(21);
+    expect(gateway.seen[1]?.url).toBe("/v1/minecraft/versions/1.21.1");
+
+    gateway.reply(
+      json(200, {
+        loader: "neoforge",
+        minecraft: "1.21.1",
+        versions: [
+          {
+            version: "21.1.72",
+            minecraft: "1.21.1",
+            stable: true,
+            recommended: false,
+          },
+        ],
+      }),
+    );
+    const builds = await client().loaderVersions("neoforge", {
+      minecraft: "1.21.1",
+    });
+    expect(builds.versions[0]?.version).toBe("21.1.72");
+    expect(gateway.seen[2]?.url).toBe(
+      "/v1/minecraft/loaders/neoforge/versions?minecraft=1.21.1",
+    );
+
+    gateway.reply(
+      json(404, { code: "UNKNOWN_VERSION", message: "no such version" }),
+    );
+    const error = (await client()
+      .minecraftVersion("1.99")
+      .catch((error: unknown) => error)) as ContentGatewayError;
+    expect(error.code).toBe("UNKNOWN_VERSION");
+  });
+
   it("refuses a GET with a body before sending anything", async () => {
     const request = { method: "GET", body: { modIds: [1] } } as const;
     const error = (await client()

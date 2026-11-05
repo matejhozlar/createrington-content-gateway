@@ -108,12 +108,16 @@ impl Upstream {
         let response = request
             .send()
             .await
-            .map_err(|error| failure(error, self.source))?;
-        read(response, self.source).await
+            .map_err(|error| failure(error, self.source.name()))?;
+        read(response, self.source.name()).await
     }
 }
 
-async fn read(mut response: reqwest::Response, source: Source) -> Result<Sent, UpstreamFailure> {
+/// An answer read up to the size the gateway keeps, with its `Retry-After` or `X-Ratelimit-Reset`.
+pub async fn read(
+    mut response: reqwest::Response,
+    name: &'static str,
+) -> Result<Sent, UpstreamFailure> {
     let status = response.status();
     let content_type = response.headers().get(CONTENT_TYPE).cloned();
     let header = |name: &str| {
@@ -135,7 +139,7 @@ async fn read(mut response: reqwest::Response, source: Source) -> Result<Sent, U
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| failure(error, source))?
+        .map_err(|error| failure(error, name))?
     {
         if body.len() + chunk.len() > MAX_ANSWER_BYTES {
             return Err(UpstreamFailure::TooLarge);
@@ -152,12 +156,13 @@ async fn read(mut response: reqwest::Response, source: Source) -> Result<Sent, U
     })
 }
 
-fn failure(error: reqwest::Error, source: Source) -> UpstreamFailure {
+/// Why `name` gave no answer, from the error reqwest reported.
+pub fn failure(error: reqwest::Error, name: &'static str) -> UpstreamFailure {
     if error.is_timeout() {
-        tracing::warn!("{} did not answer in time: {error}", source.name());
+        tracing::warn!("{name} did not answer in time: {error}");
         UpstreamFailure::Timeout
     } else {
-        tracing::warn!("{} could not be reached: {error}", source.name());
+        tracing::warn!("{name} could not be reached: {error}");
         UpstreamFailure::Unreachable
     }
 }
