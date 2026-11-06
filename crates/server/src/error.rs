@@ -22,6 +22,7 @@ pub enum ErrorCode {
     InvalidQuery,
     UnknownVersion,
     UnknownLoader,
+    UnknownRuntime,
     UpstreamTimeout,
     UpstreamUnreachable,
     UpstreamTooLarge,
@@ -135,6 +136,14 @@ impl ApiError {
             StatusCode::NOT_FOUND,
             ErrorCode::UnknownLoader,
             "the loaders are neoforge, forge and fabric",
+        )
+    }
+
+    pub fn unknown_runtime(what: &str, platform: &str) -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::UnknownRuntime,
+            format!("Mojang ships no {what} for platform {platform:?}"),
         )
     }
 

@@ -16,6 +16,7 @@ from .generated import (
     BudgetSnapshot,
     ErrorCode,
     Health,
+    JavaRuntime,
     Loader,
     LoaderVersions,
     MinecraftVersionDetails,
@@ -220,6 +221,16 @@ class _Gateway:
             "GET", f"/v1/minecraft/loaders/{loader}/versions", query={"minecraft": minecraft}
         )
 
+    @staticmethod
+    def _java_runtime_request(platform: str, major: int | None, component: str | None) -> _Request:
+        if (major is None) == (component is None):
+            raise ValueError("pass either major or component")
+        return _Request(
+            "GET",
+            "/v1/minecraft/java",
+            query={"platform": platform, "major": major, "component": component},
+        )
+
 
 class ContentGateway(_Gateway):
     """A consumer's connection to one gateway."""
@@ -367,6 +378,13 @@ class ContentGateway(_Gateway):
     def loader_versions(self, loader: Loader, *, minecraft: str | None = None) -> LoaderVersions:
         """`GET /v1/minecraft/loaders/<loader>/versions`: a loader's builds, newest first."""
         return cast(LoaderVersions, self._send(self._loader_versions_request(loader, minecraft))[1])
+
+    def java_runtime(
+        self, platform: str, *, major: int | None = None, component: str | None = None
+    ) -> JavaRuntime:
+        """`GET /v1/minecraft/java`: a Java runtime Mojang ships for `platform`, by `major` or by `component`; `UNKNOWN_RUNTIME` raises."""
+        request = self._java_runtime_request(platform, major, component)
+        return cast(JavaRuntime, self._send(request)[1])
 
     def _passthrough(self, request: _Request) -> PassthroughAnswer:
         response, body = self._send(request)
@@ -538,6 +556,13 @@ class AsyncContentGateway(_Gateway):
         """`GET /v1/minecraft/loaders/<loader>/versions`: a loader's builds, newest first."""
         sent = await self._send(self._loader_versions_request(loader, minecraft))
         return cast(LoaderVersions, sent[1])
+
+    async def java_runtime(
+        self, platform: str, *, major: int | None = None, component: str | None = None
+    ) -> JavaRuntime:
+        """`GET /v1/minecraft/java`: a Java runtime Mojang ships for `platform`, by `major` or by `component`; `UNKNOWN_RUNTIME` raises."""
+        sent = await self._send(self._java_runtime_request(platform, major, component))
+        return cast(JavaRuntime, sent[1])
 
     async def _passthrough(self, request: _Request) -> PassthroughAnswer:
         response, body = await self._send(request)
