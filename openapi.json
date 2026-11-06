@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "content-gateway",
-    "description": "A gateway in front of the CurseForge and Modrinth APIs that holds the CurseForge key, caches answers for every consumer, counts the calls made on the key and holds every consumer off after a 429. `/v1/curseforge/{path}` mirrors `api.curseforge.com/v1/{path}` and `/v1/modrinth/{path}` mirrors `api.modrinth.com/v2/{path}`, answering their JSON as it came; `/v1/resolve` finds a download address per CurseForge file; `/v1/minecraft/*` lists Minecraft and mod loader versions from Mojang, NeoForge, Forge and Fabric; the other routes are the gateway's own. Every route but `/v1/healthz` and `/v1/openapi.json` needs a consumer's bearer token.",
+    "description": "A gateway in front of the CurseForge and Modrinth APIs that holds the CurseForge key, caches answers for every consumer, counts the calls made on the key and holds every consumer off after a 429. `/v1/curseforge/{path}` mirrors `api.curseforge.com/v1/{path}` and `/v1/modrinth/{path}` mirrors `api.modrinth.com/v2/{path}`, answering their JSON as it came; `/v1/resolve` finds a download address per CurseForge file; `/v1/minecraft/*` lists Minecraft and mod loader versions from Mojang, NeoForge, Forge and Fabric, and the Java runtimes Mojang ships; the other routes are the gateway's own. Every route but `/v1/healthz` and `/v1/openapi.json` needs a consumer's bearer token.",
     "license": {
       "name": "MIT"
     },
@@ -374,6 +374,114 @@
             }
           }
         }
+      }
+    },
+    "/v1/minecraft/java": {
+      "get": {
+        "tags": [
+          "minecraft"
+        ],
+        "summary": "A Java runtime Mojang ships with its launcher, from Mojang's list of runtimes kept an hour.",
+        "description": "`major` answers the newest runtime of that Java major, `component` the runtime of that name, as `javaComponent`\nof `GET /v1/minecraft/versions/{id}` names it. The answer points at Mojang's manifest of the runtime, which lists\nevery file with its address, SHA-1 and size; the files themselves never pass through the gateway.",
+        "operationId": "java_runtime",
+        "parameters": [
+          {
+            "name": "platform",
+            "in": "query",
+            "description": "Mojang's name for the platform: `linux`, `linux-i386`, `mac-os`, `mac-os-arm64`, `windows-x64`, `windows-x86` or `windows-arm64`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "major",
+            "in": "query",
+            "description": "The newest runtime Mojang ships of this Java major, such as 21.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "component",
+            "in": "query",
+            "description": "The runtime of this name, such as `java-runtime-delta`, as `javaComponent` of a version names it.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The runtime",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/JavaRuntime"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "`INVALID_QUERY`: no `platform`, or not exactly one of `major` and `component`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Mojang ships no such runtime for the platform, `UNKNOWN_RUNTIME`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "Mojang could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "504": {
+            "description": "Mojang did not answer in time, `UPSTREAM_TIMEOUT`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": []
+          }
+        ]
       }
     },
     "/v1/minecraft/loaders/{loader}/versions": {
@@ -1229,6 +1337,7 @@
           "INVALID_QUERY",
           "UNKNOWN_VERSION",
           "UNKNOWN_LOADER",
+          "UNKNOWN_RUNTIME",
           "UPSTREAM_TIMEOUT",
           "UPSTREAM_UNREACHABLE",
           "UPSTREAM_TOO_LARGE",
@@ -1278,6 +1387,46 @@
             "type": "string",
             "description": "The gateway's version, as released.",
             "example": "0.1.0"
+          }
+        }
+      },
+      "JavaRuntime": {
+        "type": "object",
+        "description": "What `GET /v1/minecraft/java` answers: one Java runtime Mojang ships for a platform.",
+        "required": [
+          "platform",
+          "component",
+          "major",
+          "version",
+          "manifest"
+        ],
+        "properties": {
+          "component": {
+            "type": "string",
+            "description": "Such as `java-runtime-delta`."
+          },
+          "major": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Such as 21.",
+            "minimum": 0
+          },
+          "manifest": {
+            "$ref": "#/components/schemas/RuntimeManifest"
+          },
+          "platform": {
+            "type": "string"
+          },
+          "released": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When Mojang released this build of the runtime, ISO 8601, or null when Mojang does not say."
+          },
+          "version": {
+            "type": "string",
+            "description": "The Java version Mojang lists, such as `21.0.7` or `8u202`."
           }
         }
       },
@@ -1396,6 +1545,13 @@
         "properties": {
           "id": {
             "type": "string"
+          },
+          "javaComponent": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Mojang's runtime for it, such as `java-runtime-delta`, the `component` of `GET /v1/minecraft/java`; null when Mojang does not say."
           },
           "javaMajor": {
             "type": [
@@ -1567,6 +1723,30 @@
           }
         }
       },
+      "RuntimeManifest": {
+        "type": "object",
+        "description": "Mojang's manifest of a runtime: every file to download, with its address, SHA-1 and size.",
+        "required": [
+          "url",
+          "sha1",
+          "size"
+        ],
+        "properties": {
+          "sha1": {
+            "type": "string",
+            "description": "The SHA-1 of the manifest itself."
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The size of the manifest in bytes.",
+            "minimum": 0
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
       "Source": {
         "type": "string",
         "description": "Where a readout's counts come from: `redis` when they are the stored ones, `memory` when no Redis is configured,\n`unavailable` when Redis did not answer, so the minute is this process's own count and the days hold only what\nis not written to Redis yet.",
@@ -1702,7 +1882,7 @@
     },
     {
       "name": "minecraft",
-      "description": "Minecraft and mod loader version lists"
+      "description": "Minecraft and mod loader version lists, and Mojang's Java runtimes"
     }
   ]
 }

@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
     Json,
@@ -28,6 +32,9 @@ const NEOFORGE_PATH: &str = "/api/maven/versions/releases/net/neoforged/neoforge
 const FORGE_PATH: &str = "/net/minecraftforge/forge/promotions_slim.json";
 const FABRIC_LOADER_PATH: &str = "/v2/versions/loader";
 const FABRIC_GAME_PATH: &str = "/v2/versions/game";
+const JAVA_RUNTIMES_PATH: &str =
+    "/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json";
+const SNAPSHOT_SUFFIX: &str = "-snapshot";
 const LIST_FRESH_MS: u64 = HOUR_MS;
 const FIRST_YEAR_VERSION: u32 = 26;
 const DETAILS_FRESH_MS: u64 = DAY_MS;
@@ -174,6 +181,45 @@ pub struct MinecraftVersionDetails {
     pub release_time: String,
     /// The major version of the Java the version runs on, such as 21, or null when Mojang does not say.
     pub java_major: Option<u32>,
+    /// Mojang's runtime for it, such as `java-runtime-delta`, the `component` of `GET /v1/minecraft/java`; null when Mojang does not say.
+    pub java_component: Option<String>,
+}
+
+/// The query of `GET /v1/minecraft/java`: a platform and either a Java major or a runtime component.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct JavaQuery {
+    /// Mojang's name for the platform: `linux`, `linux-i386`, `mac-os`, `mac-os-arm64`, `windows-x64`, `windows-x86` or `windows-arm64`.
+    pub platform: String,
+    /// The newest runtime Mojang ships of this Java major, such as 21.
+    pub major: Option<u32>,
+    /// The runtime of this name, such as `java-runtime-delta`, as `javaComponent` of a version names it.
+    pub component: Option<String>,
+}
+
+/// What `GET /v1/minecraft/java` answers: one Java runtime Mojang ships for a platform.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct JavaRuntime {
+    pub platform: String,
+    /// Such as `java-runtime-delta`.
+    pub component: String,
+    /// Such as 21.
+    pub major: u32,
+    /// The Java version Mojang lists, such as `21.0.7` or `8u202`.
+    pub version: String,
+    /// When Mojang released this build of the runtime, ISO 8601, or null when Mojang does not say.
+    pub released: Option<String>,
+    pub manifest: RuntimeManifest,
+}
+
+/// Mojang's manifest of a runtime: every file to download, with its address, SHA-1 and size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct RuntimeManifest {
+    pub url: String,
+    /// The SHA-1 of the manifest itself.
+    pub sha1: String,
+    /// The size of the manifest in bytes.
+    pub size: u64,
 }
 
 /// What `GET /v1/minecraft/loaders/{loader}/versions` answers.
@@ -231,6 +277,30 @@ struct VersionDocument {
 #[serde(rename_all = "camelCase")]
 struct JavaVersion {
     major_version: u32,
+    #[serde(default)]
+    component: Option<String>,
+}
+
+type RuntimeIndex = BTreeMap<String, BTreeMap<String, Vec<RuntimeListing>>>;
+
+#[derive(Deserialize)]
+struct RuntimeListing {
+    manifest: ListedManifest,
+    version: ListedRuntimeVersion,
+}
+
+#[derive(Deserialize)]
+struct ListedManifest {
+    url: String,
+    sha1: String,
+    size: u64,
+}
+
+#[derive(Deserialize)]
+struct ListedRuntimeVersion {
+    name: String,
+    #[serde(default)]
+    released: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -240,7 +310,7 @@ struct NeoForgeVersions {
 
 #[derive(Deserialize)]
 struct ForgePromotions {
-    promos: std::collections::BTreeMap<String, String>,
+    promos: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -566,7 +636,8 @@ pub async fn minecraft_version(
         id: version.id,
         kind: version.kind,
         release_time: version.release_time,
-        java_major: details.java_version.map(|java| java.major_version),
+        java_major: details.java_version.as_ref().map(|java| java.major_version),
+        java_component: details.java_version.and_then(|java| java.component),
     })
     .into_response()
 }
@@ -635,6 +706,119 @@ pub async fn loader_versions(
         versions,
     })
     .into_response()
+}
+
+enum Wanted {
+    Major(u32),
+    Component(String),
+}
+
+fn runtime_major(name: &str) -> Option<u32> {
+    let digits: String = name.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+fn pick(mut index: RuntimeIndex, platform: &str, wanted: &Wanted) -> Option<JavaRuntime> {
+    index
+        .remove(platform)?
+        .into_iter()
+        .filter_map(|(component, listings)| {
+            let listing = listings.into_iter().next()?;
+            let major = runtime_major(&listing.version.name)?;
+            Some((component, major, listing))
+        })
+        .filter(|(component, major, _)| match wanted {
+            Wanted::Major(wanted) => major == wanted && !component.ends_with(SNAPSHOT_SUFFIX),
+            Wanted::Component(wanted) => component == wanted,
+        })
+        .max_by(|a, b| {
+            version_order(&a.2.version.name)
+                .cmp(&version_order(&b.2.version.name))
+                .then_with(|| a.0.cmp(&b.0))
+        })
+        .map(|(component, major, listing)| JavaRuntime {
+            platform: platform.to_owned(),
+            component,
+            major,
+            version: listing.version.name,
+            released: listing.version.released,
+            manifest: RuntimeManifest {
+                url: listing.manifest.url,
+                sha1: listing.manifest.sha1,
+                size: listing.manifest.size,
+            },
+        })
+}
+
+/// A Java runtime Mojang ships with its launcher, from Mojang's list of runtimes kept an hour.
+///
+/// `major` answers the newest runtime of that Java major, `component` the runtime of that name, as `javaComponent`
+/// of `GET /v1/minecraft/versions/{id}` names it. The answer points at Mojang's manifest of the runtime, which lists
+/// every file with its address, SHA-1 and size; the files themselves never pass through the gateway.
+#[utoipa::path(
+    get,
+    path = "/v1/minecraft/java",
+    tag = "minecraft",
+    security(("bearer" = [])),
+    params(JavaQuery),
+    responses(
+        (status = 200, description = "The runtime", body = JavaRuntime),
+        (status = 400, description = "`INVALID_QUERY`: no `platform`, or not exactly one of `major` and `component`", body = ApiError),
+        (status = 401, description = "No valid consumer token", body = ApiError),
+        (status = 404, description = "Mojang ships no such runtime for the platform, `UNKNOWN_RUNTIME`", body = ApiError),
+        (status = 502, description = "Mojang could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`", body = ApiError),
+        (status = 504, description = "Mojang did not answer in time, `UPSTREAM_TIMEOUT`", body = ApiError),
+    )
+)]
+pub async fn java_runtime(
+    State(state): State<Arc<AppState>>,
+    query: Result<Query<JavaQuery>, QueryRejection>,
+) -> Response {
+    let (platform, wanted) = match query {
+        Ok(Query(JavaQuery {
+            platform,
+            major: Some(major),
+            component: None,
+        })) => (platform, Wanted::Major(major)),
+        Ok(Query(JavaQuery {
+            platform,
+            major: None,
+            component: Some(component),
+        })) => (platform, Wanted::Component(component)),
+        _ => {
+            return ApiError::invalid_query("`platform` with either `major` or `component`")
+                .into_response();
+        }
+    };
+    let url = format!("{}{JAVA_RUNTIMES_PATH}", state.meta.mojang);
+    let body = match document(&state, "minecraft:java", &url, "Mojang", LIST_FRESH_MS).await {
+        Ok(body) => body,
+        Err(failure) => return failed(failure, "Mojang"),
+    };
+    let index: RuntimeIndex = match serde_json::from_slice(&body) {
+        Ok(index) => index,
+        Err(_) => return failed(UpstreamFailure::Unreadable, "Mojang"),
+    };
+    let Some(runtime) = pick(index, &platform, &wanted) else {
+        let what = match wanted {
+            Wanted::Major(major) => format!("Java {major}"),
+            Wanted::Component(component) => format!("runtime {component:?}"),
+        };
+        return ApiError::unknown_runtime(&what, &platform).into_response();
+    };
+    if !runtime
+        .manifest
+        .url
+        .starts_with(&format!("{}/", state.meta.mojang))
+    {
+        tracing::warn!(
+            "Mojang's list of runtimes points {} outside its own host: {}",
+            runtime.component,
+            runtime.manifest.url
+        );
+        return failed(UpstreamFailure::Unreadable, "Mojang");
+    }
+    Json(runtime).into_response()
 }
 
 #[cfg(test)]
@@ -764,13 +948,14 @@ mod tests {
         assert_eq!(got.status, StatusCode::OK);
         assert_eq!(
             got.json(),
-            json!({ "id": "1.21.1", "type": "release", "releaseTime": "2024-08-08T00:00:00+00:00", "javaMajor": 21 })
+            json!({ "id": "1.21.1", "type": "release", "releaseTime": "2024-08-08T00:00:00+00:00", "javaMajor": 21, "javaComponent": "java-runtime-delta" })
         );
         get(&gateway.router, "/v1/minecraft/versions/1.21.1").await;
         assert_eq!(mock.calls(), 2);
 
         let old = get(&gateway.router, "/v1/minecraft/versions/b1.7.3").await;
         assert_eq!(old.json()["javaMajor"], Value::Null);
+        assert_eq!(old.json()["javaComponent"], Value::Null);
 
         let unknown = get(&gateway.router, "/v1/minecraft/versions/1.99").await;
         assert_eq!(unknown.status, StatusCode::NOT_FOUND);
@@ -913,6 +1098,154 @@ mod tests {
 
         let versions = get(&gateway.router, "/v1/minecraft/versions?loader=neoforge").await;
         assert_eq!(ids(&versions.json()), ["26.1.1", "26.1", "1.21.1"]);
+    }
+
+    fn runtime(base: &str, name: &str, sha1: &str) -> Value {
+        json!([{
+            "availability": { "group": 1, "progress": 100 },
+            "manifest": { "sha1": sha1, "size": 82843, "url": format!("{base}/v1/packages/{sha1}/manifest.json") },
+            "version": { "name": name, "released": "2025-05-19T08:30:12+00:00" }
+        }])
+    }
+
+    fn runtimes(_: usize, seen: &Seen) -> Reply {
+        let base = seen.base.as_str();
+        assert_eq!(seen.uri, JAVA_RUNTIMES_PATH);
+        reply(
+            200,
+            json!({
+                "gamecore": { "java-runtime-delta": [], "jre-legacy": [] },
+                "linux": {
+                    "java-runtime-alpha": runtime(base, "16.0.1.9.1", "a"),
+                    "java-runtime-beta": runtime(base, "17.0.15", "b"),
+                    "java-runtime-delta": runtime(base, "21.0.7", "d"),
+                    "java-runtime-gamma": runtime(base, "17.0.15", "g"),
+                    "java-runtime-gamma-snapshot": runtime(base, "17.0.16", "s"),
+                    "jre-legacy": runtime(base, "8u202", "l"),
+                    "minecraft-java-exe": []
+                },
+                "windows-x86": {
+                    "java-runtime-beta": runtime(base, "17.0.1.12.1", "wb"),
+                    "java-runtime-gamma": runtime(base, "17.0.8.1", "wg")
+                }
+            })
+            .to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_java_runtime_is_found_by_major_or_component_from_one_kept_list() {
+        let mock = Mock::start(Duration::ZERO, runtimes).await;
+        let gateway = gateway(&mock, 300, CF_TIMEOUT);
+
+        let got = get(
+            &gateway.router,
+            "/v1/minecraft/java?platform=linux&major=21",
+        )
+        .await;
+        assert_eq!(got.status, StatusCode::OK);
+        assert_eq!(
+            got.json(),
+            json!({
+                "platform": "linux",
+                "component": "java-runtime-delta",
+                "major": 21,
+                "version": "21.0.7",
+                "released": "2025-05-19T08:30:12+00:00",
+                "manifest": { "url": format!("{}/v1/packages/d/manifest.json", mock.base), "sha1": "d", "size": 82843 }
+            })
+        );
+
+        let legacy = get(&gateway.router, "/v1/minecraft/java?platform=linux&major=8").await;
+        assert_eq!(legacy.json()["component"], "jre-legacy");
+        assert_eq!(legacy.json()["version"], "8u202");
+        let seventeen = get(
+            &gateway.router,
+            "/v1/minecraft/java?platform=linux&major=17",
+        )
+        .await;
+        assert_eq!(seventeen.json()["component"], "java-runtime-gamma");
+        let older = get(
+            &gateway.router,
+            "/v1/minecraft/java?platform=windows-x86&major=17",
+        )
+        .await;
+        assert_eq!(older.json()["component"], "java-runtime-gamma");
+        assert_eq!(older.json()["version"], "17.0.8.1");
+
+        let named = get(
+            &gateway.router,
+            "/v1/minecraft/java?platform=linux&component=java-runtime-gamma-snapshot",
+        )
+        .await;
+        assert_eq!(named.json()["version"], "17.0.16");
+        assert_eq!(named.json()["major"], 17);
+        assert_eq!(mock.calls(), 1);
+
+        gateway.clock.advance(LIST_FRESH_MS + 1);
+        get(
+            &gateway.router,
+            "/v1/minecraft/java?platform=linux&major=21",
+        )
+        .await;
+        assert_eq!(mock.calls(), 2);
+        assert_eq!(gateway.state.budget.snapshot().await.days, []);
+    }
+
+    #[tokio::test]
+    async fn a_java_runtime_mojang_does_not_ship_or_a_bad_query_is_refused() {
+        let mock = Mock::start(Duration::ZERO, runtimes).await;
+        let gateway = gateway(&mock, 300, CF_TIMEOUT);
+
+        for missing in [
+            "/v1/minecraft/java?platform=linux&major=25",
+            "/v1/minecraft/java?platform=gamecore&major=21",
+            "/v1/minecraft/java?platform=solaris&major=21",
+            "/v1/minecraft/java?platform=linux&component=minecraft-java-exe",
+        ] {
+            let got = get(&gateway.router, missing).await;
+            assert_eq!(got.status, StatusCode::NOT_FOUND, "{missing}");
+            assert_eq!(got.json()["code"], "UNKNOWN_RUNTIME");
+        }
+
+        for bad in [
+            "/v1/minecraft/java?major=21",
+            "/v1/minecraft/java?platform=linux",
+            "/v1/minecraft/java?platform=linux&major=21&component=jre-legacy",
+            "/v1/minecraft/java?platform=linux&major=new",
+        ] {
+            let got = get(&gateway.router, bad).await;
+            assert_eq!(got.status, StatusCode::BAD_REQUEST, "{bad}");
+            assert_eq!(got.json()["code"], "INVALID_QUERY");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_java_runtime_manifest_is_taken_from_mojang_s_host_only() {
+        let mock = Mock::start(Duration::ZERO, |_, seen| {
+            let elsewhere = format!("{}.example.net", seen.base);
+            reply(
+                200,
+                json!({ "linux": { "java-runtime-delta": runtime(&elsewhere, "21.0.7", "d") } })
+                    .to_string(),
+            )
+        })
+        .await;
+        let gateway = gateway(&mock, 300, CF_TIMEOUT);
+        let got = get(
+            &gateway.router,
+            "/v1/minecraft/java?platform=linux&major=21",
+        )
+        .await;
+        assert_eq!(got.status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn reads_the_java_major_of_mojang_s_runtime_names() {
+        assert_eq!(runtime_major("21.0.7"), Some(21));
+        assert_eq!(runtime_major("8u202"), Some(8));
+        assert_eq!(runtime_major("16.0.1.9.1_3"), Some(16));
+        assert_eq!(runtime_major("jre"), None);
     }
 
     #[tokio::test]

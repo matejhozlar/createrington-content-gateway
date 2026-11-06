@@ -278,6 +278,23 @@ def test_version_routes(fake: FakeGateway, gateway: ContentGateway) -> None:
     assert str(fake.last.url) == f"{BASE_URL}/v1/minecraft/loaders/forge/versions"
 
 
+def test_java_runtime_by_major_or_component(fake: FakeGateway, gateway: ContentGateway) -> None:
+    fake.reply(200, {"platform": "linux", "component": "java-runtime-delta", "major": 21})
+    runtime = gateway.java_runtime("linux", major=21)
+    assert runtime["component"] == "java-runtime-delta"
+    assert str(fake.last.url) == f"{BASE_URL}/v1/minecraft/java?platform=linux&major=21"
+    fake.reply(200, {"platform": "mac-os-arm64", "component": "jre-legacy", "major": 8})
+    gateway.java_runtime("mac-os-arm64", component="jre-legacy")
+    assert (
+        str(fake.last.url)
+        == f"{BASE_URL}/v1/minecraft/java?platform=mac-os-arm64&component=jre-legacy"
+    )
+    with pytest.raises(ValueError, match="either major or component"):
+        gateway.java_runtime("linux")
+    with pytest.raises(ValueError, match="either major or component"):
+        gateway.java_runtime("linux", major=21, component="java-runtime-delta")
+
+
 def test_unknown_version_raises(fake: FakeGateway, gateway: ContentGateway) -> None:
     fake.reply(404, {"code": "UNKNOWN_VERSION", "message": "no such version"})
     with pytest.raises(ContentGatewayError) as raised:

@@ -1,6 +1,6 @@
 [project]
 name = "content-gateway-client"
-version = "0.1.0"
+version = "0.2.0"
 description = "Typed client for content-gateway: the gateway's own routes from its OpenAPI document and the CurseForge and Modrinth passthroughs with the budget's refusals handled."
 readme = "README.md"
 license = "MIT"

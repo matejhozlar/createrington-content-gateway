@@ -58,6 +58,12 @@ export type LoaderVersions = components["schemas"]["LoaderVersions"];
 
 export type LoaderVersion = components["schemas"]["LoaderVersion"];
 
+/** What `GET /v1/minecraft/java` answers. */
+export type JavaRuntime = components["schemas"]["JavaRuntime"];
+
+/** Mojang's manifest of a runtime's files. */
+export type RuntimeManifest = components["schemas"]["RuntimeManifest"];
+
 /** The JSON body of every error the gateway answers itself. */
 export type ApiError = components["schemas"]["ApiError"];
 

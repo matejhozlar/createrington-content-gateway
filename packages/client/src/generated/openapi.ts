@@ -62,6 +62,28 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  "/v1/minecraft/java": {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /**
+     * A Java runtime Mojang ships with its launcher, from Mojang's list of runtimes kept an hour.
+     * @description `major` answers the newest runtime of that Java major, `component` the runtime of that name, as `javaComponent`
+     *     of `GET /v1/minecraft/versions/{id}` names it. The answer points at Mojang's manifest of the runtime, which lists
+     *     every file with its address, SHA-1 and size; the files themselves never pass through the gateway.
+     */
+    get: operations["java_runtime"];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   "/v1/minecraft/loaders/{loader}/versions": {
     parameters: {
       query?: never;
@@ -281,6 +303,7 @@ export interface components {
       | "INVALID_QUERY"
       | "UNKNOWN_VERSION"
       | "UNKNOWN_LOADER"
+      | "UNKNOWN_RUNTIME"
       | "UPSTREAM_TIMEOUT"
       | "UPSTREAM_UNREACHABLE"
       | "UPSTREAM_TOO_LARGE"
@@ -308,6 +331,22 @@ export interface components {
        * @description The gateway's version, as released.
        * @example 0.1.0
        */
+      version: string;
+    };
+    /** @description What `GET /v1/minecraft/java` answers: one Java runtime Mojang ships for a platform. */
+    JavaRuntime: {
+      /** @description Such as `java-runtime-delta`. */
+      component: string;
+      /**
+       * Format: int32
+       * @description Such as 21.
+       */
+      major: number;
+      manifest: components["schemas"]["RuntimeManifest"];
+      platform: string;
+      /** @description When Mojang released this build of the runtime, ISO 8601, or null when Mojang does not say. */
+      released?: string | null;
+      /** @description The Java version Mojang lists, such as `21.0.7` or `8u202`. */
       version: string;
     };
     /** @description The newest release and snapshot Mojang names, whatever the filter. */
@@ -350,6 +389,8 @@ export interface components {
     /** @description What `GET /v1/minecraft/versions/{id}` answers: the version and the Java it needs. */
     MinecraftVersionDetails: {
       id: string;
+      /** @description Mojang's runtime for it, such as `java-runtime-delta`, the `component` of `GET /v1/minecraft/java`; null when Mojang does not say. */
+      javaComponent?: string | null;
       /**
        * Format: int32
        * @description The major version of the Java the version runs on, such as 21, or null when Mojang does not say.
@@ -422,6 +463,17 @@ export interface components {
        *     ]
        */
       fileIds: number[];
+    };
+    /** @description Mojang's manifest of a runtime: every file to download, with its address, SHA-1 and size. */
+    RuntimeManifest: {
+      /** @description The SHA-1 of the manifest itself. */
+      sha1: string;
+      /**
+       * Format: int64
+       * @description The size of the manifest in bytes.
+       */
+      size: number;
+      url: string;
     };
     /**
      * @description Where a readout's counts come from: `redis` when they are the stored ones, `memory` when no Redis is configured,
@@ -741,6 +793,78 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["Health"];
+        };
+      };
+    };
+  };
+  java_runtime: {
+    parameters: {
+      query: {
+        /** @description The runtime of this name, such as `java-runtime-delta`, as `javaComponent` of a version names it. */
+        component?: string;
+        /** @description The newest runtime Mojang ships of this Java major, such as 21. */
+        major?: number;
+        /** @description Mojang's name for the platform: `linux`, `linux-i386`, `mac-os`, `mac-os-arm64`, `windows-x64`, `windows-x86` or `windows-arm64`. */
+        platform: string;
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      /** @description The runtime */
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["JavaRuntime"];
+        };
+      };
+      /** @description `INVALID_QUERY`: no `platform`, or not exactly one of `major` and `component` */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description No valid consumer token */
+      401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Mojang ships no such runtime for the platform, `UNKNOWN_RUNTIME` */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Mojang could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE` */
+      502: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description Mojang did not answer in time, `UPSTREAM_TIMEOUT` */
+      504: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
         };
       };
     };
