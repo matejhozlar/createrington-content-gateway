@@ -71,7 +71,7 @@ export interface paths {
     };
     /**
      * A Java runtime Mojang ships with its launcher, from Mojang's list of runtimes kept an hour.
-     * @description `major` answers the newest runtime of that Java major, `component` the runtime of that name, as `javaComponent`
+     * @description `major` answers the newest runtime of that Java major (on equal versions the later released), `component` the runtime of that name, as `javaComponent`
      *     of `GET /v1/minecraft/versions/{id}` names it. The answer points at Mojang's manifest of the runtime, which lists
      *     every file with its address, SHA-1 and size; the files themselves never pass through the gateway.
      */

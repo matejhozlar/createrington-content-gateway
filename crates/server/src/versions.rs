@@ -741,6 +741,7 @@ fn pick(index: &RuntimeIndex, platform: &str, wanted: &Wanted) -> Option<JavaRun
         .max_by(|a, b| {
             version_order(&a.2.version.name)
                 .cmp(&version_order(&b.2.version.name))
+                .then_with(|| a.2.version.released.cmp(&b.2.version.released))
                 .then_with(|| a.0.cmp(&b.0))
         })
         .map(|(component, major, listing)| JavaRuntime {
@@ -759,7 +760,7 @@ fn pick(index: &RuntimeIndex, platform: &str, wanted: &Wanted) -> Option<JavaRun
 
 /// A Java runtime Mojang ships with its launcher, from Mojang's list of runtimes kept an hour.
 ///
-/// `major` answers the newest runtime of that Java major, `component` the runtime of that name, as `javaComponent`
+/// `major` answers the newest runtime of that Java major (on equal versions the later released), `component` the runtime of that name, as `javaComponent`
 /// of `GET /v1/minecraft/versions/{id}` names it. The answer points at Mojang's manifest of the runtime, which lists
 /// every file with its address, SHA-1 and size; the files themselves never pass through the gateway.
 #[utoipa::path(
@@ -1251,6 +1252,25 @@ mod tests {
         )
         .await;
         assert_eq!(got.status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn equal_runtime_versions_go_to_the_later_release_before_the_name() {
+        let listing = |sha1: &str, released: &str| {
+            json!([{
+                "manifest": { "sha1": sha1, "size": 1, "url": "x" },
+                "version": { "name": "21.0.7", "released": released }
+            }])
+        };
+        let index: RuntimeIndex = serde_json::from_value(json!({
+            "linux": {
+                "java-runtime-delta": listing("d", "2025-06-01T00:00:00+00:00"),
+                "java-runtime-gamma": listing("g", "2025-05-01T00:00:00+00:00")
+            }
+        }))
+        .unwrap();
+        let picked = pick(&index, "linux", &Wanted::Major(21)).unwrap();
+        assert_eq!(picked.component, "java-runtime-delta");
     }
 
     #[test]
