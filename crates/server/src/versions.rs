@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
@@ -281,7 +282,7 @@ struct JavaVersion {
     component: Option<String>,
 }
 
-type RuntimeIndex = BTreeMap<String, BTreeMap<String, Vec<RuntimeListing>>>;
+type RuntimeIndex = BTreeMap<String, Box<RawValue>>;
 
 #[derive(Deserialize)]
 struct RuntimeListing {
@@ -718,12 +719,18 @@ fn runtime_major(name: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
-fn pick(mut index: RuntimeIndex, platform: &str, wanted: &Wanted) -> Option<JavaRuntime> {
-    index
-        .remove(platform)?
+fn first_listing(listings: &RawValue) -> Option<RuntimeListing> {
+    let listings: Vec<&RawValue> = serde_json::from_str(listings.get()).ok()?;
+    serde_json::from_str(listings.first()?.get()).ok()
+}
+
+fn pick(index: &RuntimeIndex, platform: &str, wanted: &Wanted) -> Option<JavaRuntime> {
+    let components: BTreeMap<String, &RawValue> =
+        serde_json::from_str(index.get(platform)?.get()).ok()?;
+    components
         .into_iter()
         .filter_map(|(component, listings)| {
-            let listing = listings.into_iter().next()?;
+            let listing = first_listing(listings)?;
             let major = runtime_major(&listing.version.name)?;
             Some((component, major, listing))
         })
@@ -799,7 +806,7 @@ pub async fn java_runtime(
         Ok(index) => index,
         Err(_) => return failed(UpstreamFailure::Unreadable, "Mojang"),
     };
-    let Some(runtime) = pick(index, &platform, &wanted) else {
+    let Some(runtime) = pick(&index, &platform, &wanted) else {
         let what = match wanted {
             Wanted::Major(major) => format!("Java {major}"),
             Wanted::Component(component) => format!("runtime {component:?}"),
@@ -1122,8 +1129,11 @@ mod tests {
                     "java-runtime-gamma": runtime(base, "17.0.15", "g"),
                     "java-runtime-gamma-snapshot": runtime(base, "17.0.16", "s"),
                     "jre-legacy": runtime(base, "8u202", "l"),
+                    "java-runtime-zeta": [{ "manifest": { "size": "large" }, "version": { "name": "21.0.9" } }],
                     "minecraft-java-exe": []
                 },
+                "windows-x64": { "java-runtime-delta": [{ "version": { "name": "21.0.7" } }] },
+                "broken": 5,
                 "windows-x86": {
                     "java-runtime-beta": runtime(base, "17.0.1.12.1", "wb"),
                     "java-runtime-gamma": runtime(base, "17.0.8.1", "wg")
@@ -1202,6 +1212,9 @@ mod tests {
             "/v1/minecraft/java?platform=gamecore&major=21",
             "/v1/minecraft/java?platform=solaris&major=21",
             "/v1/minecraft/java?platform=linux&component=minecraft-java-exe",
+            "/v1/minecraft/java?platform=linux&component=java-runtime-zeta",
+            "/v1/minecraft/java?platform=windows-x64&major=21",
+            "/v1/minecraft/java?platform=broken&major=21",
         ] {
             let got = get(&gateway.router, missing).await;
             assert_eq!(got.status, StatusCode::NOT_FOUND, "{missing}");
