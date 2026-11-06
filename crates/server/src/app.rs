@@ -125,6 +125,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/v1/minecraft/loaders/{loader}/versions",
             get(versions::loader_versions),
         )
+        .route("/v1/minecraft/java", get(versions::java_runtime))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,

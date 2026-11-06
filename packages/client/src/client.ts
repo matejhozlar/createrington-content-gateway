@@ -3,6 +3,7 @@ import type {
   BudgetSnapshot,
   ErrorCode,
   Health,
+  JavaRuntime,
   Loader,
   LoaderVersions,
   MinecraftVersionDetails,
@@ -87,6 +88,20 @@ export interface LoaderVersionsOptions {
   minecraft?: string;
   signal?: AbortSignal;
 }
+
+/** What `javaRuntime()` asks for: a Java major or a runtime component, not both. */
+export type JavaRuntimeOptions = (
+  | {
+      /** The newest runtime Mojang ships of this Java major, such as 21. */
+      major: number;
+      component?: never;
+    }
+  | {
+      /** The runtime of this name, such as `java-runtime-delta`, as `javaComponent` of `minecraftVersion()` names it. */
+      component: string;
+      major?: never;
+    }
+) & { signal?: AbortSignal };
 
 /** How the gateway answered a passthrough call, from `X-Cache`. */
 export type CacheStatus = (typeof CACHE_STATUSES)[number];
@@ -324,6 +339,25 @@ export class ContentGateway {
       signal: options.signal,
     });
     return body as LoaderVersions;
+  }
+
+  /** `GET /v1/minecraft/java`: a Java runtime Mojang ships for `platform` (Mojang's name, such as `linux` or `windows-x64`), with the address of its manifest of files. Throws `UNKNOWN_RUNTIME` as a `ContentGatewayError`. */
+  async javaRuntime(
+    platform: string,
+    options: JavaRuntimeOptions,
+  ): Promise<JavaRuntime> {
+    const { body } = await this.send({
+      method: "GET",
+      path: "/v1/minecraft/java",
+      query: {
+        platform,
+        major: options.major,
+        component: options.component,
+      },
+      authenticated: true,
+      signal: options.signal,
+    });
+    return body as JavaRuntime;
   }
 
   private async passthrough(options: SendOptions): Promise<PassthroughAnswer> {

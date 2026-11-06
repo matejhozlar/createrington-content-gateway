@@ -283,6 +283,42 @@ describe("the CurseForge passthrough", () => {
     expect(error.code).toBe("UNKNOWN_VERSION");
   });
 
+  it("asks for a Java runtime by major or by component", async () => {
+    const runtime = {
+      platform: "linux",
+      component: "java-runtime-delta",
+      major: 21,
+      version: "21.0.7",
+      released: "2025-05-19T08:30:12+00:00",
+      manifest: {
+        url: "https://example.com/manifest.json",
+        sha1: "d",
+        size: 1,
+      },
+    };
+    gateway.reply(json(200, runtime));
+    expect(await client().javaRuntime("linux", { major: 21 })).toEqual(runtime);
+    expect(gateway.seen[0]?.url).toBe(
+      "/v1/minecraft/java?platform=linux&major=21",
+    );
+
+    gateway.reply(json(200, runtime));
+    await client().javaRuntime("windows-x64", {
+      component: "java-runtime-delta",
+    });
+    expect(gateway.seen[1]?.url).toBe(
+      "/v1/minecraft/java?platform=windows-x64&component=java-runtime-delta",
+    );
+
+    gateway.reply(
+      json(404, { code: "UNKNOWN_RUNTIME", message: "no such runtime" }),
+    );
+    const error = (await client()
+      .javaRuntime("linux", { major: 25 })
+      .catch((error: unknown) => error)) as ContentGatewayError;
+    expect(error.code).toBe("UNKNOWN_RUNTIME");
+  });
+
   it("refuses a GET with a body before sending anything", async () => {
     const request = { method: "GET", body: { modIds: [1] } } as const;
     const error = (await client()

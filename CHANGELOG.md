@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.1.6 (2026-11-06)
+
+- [add] Add `GET /v1/minecraft/java?platform=<platform>&major=<n>` (or `&component=<name>`), serving the Java runtimes Mojang ships with its launcher for a platform (`linux`, `linux-i386`, `mac-os`, `mac-os-arm64`, `windows-x64`, `windows-x86`, `windows-arm64`): the runtime's `component`, `major`, `version` and release date, and the `url`, `sha1` and `size` of Mojang's manifest of its files. `major` picks the newest non-snapshot runtime of that Java major (the later released one on equal versions), `component` names one exactly, and `404 UNKNOWN_RUNTIME` answers when Mojang ships no such runtime for the platform. Mojang's list is cached and served stale like the other version lists, draws on no budget, and the runtime's files never pass through the gateway
+- [add] Answer `javaComponent` from `GET /v1/minecraft/versions/{id}`, the name of Mojang's Java runtime the version runs on, which `GET /v1/minecraft/java` accepts as `component`
+
 ## v0.1.5 (2026-11-05)
 
 - [fix] Make the GitHub release workflow build from the commit the tag push carries and point the GitHub release at that commit, and stop waiting for the new tag to show up in the remote's tags: the pushed tag is counted when deciding which release is the latest, and the workflow retries only when the remote's tags cannot be read at all

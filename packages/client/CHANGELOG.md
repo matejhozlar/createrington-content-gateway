@@ -1,5 +1,11 @@
 # @createrington/content-gateway-client
 
+## 0.3.0
+
+### Minor Changes
+
+- ba90268: `javaRuntime(platform, { major } | { component })` reads `GET /v1/minecraft/java`: a Java runtime Mojang ships for a platform, with the address, SHA-1 and size of Mojang's manifest of its files, typed as `JavaRuntime`. `minecraftVersion(id)` answers `javaComponent`, the runtime the version runs on. New error code `UNKNOWN_RUNTIME`.
+
 ## 0.2.1
 
 ### Patch Changes

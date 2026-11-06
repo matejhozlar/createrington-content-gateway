@@ -34,6 +34,7 @@ ErrorCode: TypeAlias = Literal[
     "INVALID_QUERY",
     "UNKNOWN_VERSION",
     "UNKNOWN_LOADER",
+    "UNKNOWN_RUNTIME",
     "UPSTREAM_TIMEOUT",
     "UPSTREAM_UNREACHABLE",
     "UPSTREAM_TOO_LARGE",
@@ -97,6 +98,12 @@ class ResolvedFile(TypedDict):
     url: NotRequired[str | None]
 
 
+class RuntimeManifest(TypedDict):
+    sha1: str
+    size: int
+    url: str
+
+
 Source: TypeAlias = Literal["redis", "memory", "unavailable"]
 
 
@@ -135,6 +142,15 @@ class BudgetSnapshot(TypedDict):
     source: Source
 
 
+class JavaRuntime(TypedDict):
+    component: str
+    major: int
+    manifest: RuntimeManifest
+    platform: str
+    released: NotRequired[str | None]
+    version: str
+
+
 class MinecraftVersion(TypedDict):
     id: str
     releaseTime: str
@@ -143,6 +159,7 @@ class MinecraftVersion(TypedDict):
 
 class MinecraftVersionDetails(TypedDict):
     id: str
+    javaComponent: NotRequired[str | None]
     javaMajor: NotRequired[int | None]
     releaseTime: str
     type: VersionType
