@@ -388,7 +388,8 @@ fn parsed<T: DeserializeOwned>(body: &[u8], origin: Origin, url: &str) -> Result
 }
 
 /// The list at `url` read as `T`, from the cache while fresh. A body is kept only once it reads as `T`, and the old
-/// copy answers while the source fails.
+/// copy answers while the source fails. A kept copy that does not read, such as one an older gateway kept in Redis,
+/// counts as no copy. A fetched body is read twice, once to decide it is kept and once for each waiting request.
 async fn document<T: DeserializeOwned + 'static>(
     state: &Arc<AppState>,
     key: &str,
@@ -398,8 +399,10 @@ async fn document<T: DeserializeOwned + 'static>(
 ) -> Result<T, ListFailure> {
     let now = state.clock.now_ms();
     let cached = state.cache.lookup(key, now).await;
-    if let Some(entry) = cached.as_ref().filter(|entry| entry.is_fresh(now)) {
-        return parsed(&entry.answer.body, origin, url);
+    if let Some(entry) = cached.as_ref().filter(|entry| entry.is_fresh(now))
+        && let Ok(kept) = serde_json::from_slice(&entry.answer.body)
+    {
+        return Ok(kept);
     }
     let (waiting, finisher) = state.cache.join(key);
     if let Some(finisher) = finisher {
@@ -432,12 +435,10 @@ async fn document<T: DeserializeOwned + 'static>(
         Some(Err(LoadFailure::Upstream(failure))) => failure,
         _ => UpstreamFailure::Unreachable,
     };
-    match cached {
-        Some(entry) if entry.can_stand_in(state.clock.now_ms()) => {
-            parsed(&entry.answer.body, origin, url)
-        }
-        _ => Err(ListFailure { origin, failure }),
-    }
+    cached
+        .filter(|entry| entry.can_stand_in(state.clock.now_ms()))
+        .and_then(|entry| serde_json::from_slice(&entry.answer.body).ok())
+        .ok_or(ListFailure { origin, failure })
 }
 
 async fn manifest(state: &Arc<AppState>) -> Result<Manifest, ListFailure> {
@@ -1379,6 +1380,45 @@ mod tests {
             assert_eq!(stale.json(), fresh.json());
         }
         assert_eq!(mock.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_kept_copy_that_does_not_read_counts_as_no_copy() {
+        let (mock, _never) = Mock::held_when(|seen| seen.uri == NEOFORGE_PATH, sources).await;
+        let gateway = gateway_with(
+            &mock,
+            GatewayWith {
+                timeouts: Timeouts {
+                    meta: Duration::from_millis(50),
+                    ..Timeouts::default()
+                },
+                ..GatewayWith::default()
+            },
+        );
+        let unreadable = |fresh_ms| {
+            Arc::new(Entry::new(
+                Answer {
+                    status: StatusCode::OK,
+                    content_type: None,
+                    body: Bytes::from_static(b"not json"),
+                },
+                NOV_3_2026_20H,
+                fresh_ms,
+            ))
+        };
+        gateway
+            .state
+            .cache
+            .insert("loader:forge", unreadable(LIST_FRESH_MS));
+        let fresh = get(&gateway.router, "/v1/minecraft/loaders/forge/versions").await;
+        assert_eq!(fresh.status, StatusCode::OK);
+        assert_eq!(mock.calls(), 1);
+
+        gateway.state.cache.insert("loader:neoforge", unreadable(0));
+        let failed = get(&gateway.router, "/v1/minecraft/loaders/neoforge/versions").await;
+        assert_eq!(failed.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(failed.json()["code"], "UPSTREAM_TIMEOUT");
+        assert_eq!(mock.calls(), 2);
     }
 
     #[tokio::test]
