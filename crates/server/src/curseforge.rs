@@ -570,7 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_curseforge_that_does_not_answer_in_time_is_a_504() {
-        let mock = Mock::start(Duration::from_millis(500), |_, _| reply(200, "{}")).await;
+        let (mock, _never) = Mock::held(|_, _| reply(200, "{}")).await;
         let gateway = gateway_with(
             &mock,
             GatewayWith {

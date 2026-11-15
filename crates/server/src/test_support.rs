@@ -81,6 +81,12 @@ pub(crate) struct Mock {
 
 pub(crate) struct Gate(Arc<Semaphore>);
 
+#[derive(Clone)]
+struct Hold {
+    gate: Arc<Semaphore>,
+    held: Arc<dyn Fn(&Seen) -> bool + Send + Sync>,
+}
+
 impl Gate {
     pub(crate) fn open(&self) {
         self.0.close();
@@ -98,14 +104,25 @@ impl Mock {
     pub(crate) async fn held(
         answer: impl Fn(usize, &Seen) -> Reply + Send + Sync + 'static,
     ) -> (Self, Gate) {
+        Self::held_when(|_| true, answer).await
+    }
+
+    pub(crate) async fn held_when(
+        held: impl Fn(&Seen) -> bool + Send + Sync + 'static,
+        answer: impl Fn(usize, &Seen) -> Reply + Send + Sync + 'static,
+    ) -> (Self, Gate) {
         let gate = Arc::new(Semaphore::new(0));
-        let mock = Self::serve(Duration::ZERO, Some(gate.clone()), answer).await;
+        let hold = Hold {
+            gate: gate.clone(),
+            held: Arc::new(held),
+        };
+        let mock = Self::serve(Duration::ZERO, Some(hold), answer).await;
         (mock, Gate(gate))
     }
 
     async fn serve(
         delay: Duration,
-        gate: Option<Arc<Semaphore>>,
+        hold: Option<Hold>,
         answer: impl Fn(usize, &Seen) -> Reply + Send + Sync + 'static,
     ) -> Self {
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
@@ -117,7 +134,7 @@ impl Mock {
         let served = base.clone();
         let mock = Router::new().fallback(move |request: Request<Body>| {
             let (recorded, answer, calls) = (recorded.clone(), answer.clone(), calls.clone());
-            let (base, gate) = (served.clone(), gate.clone());
+            let (base, hold) = (served.clone(), hold.clone());
             async move {
                 let (parts, body) = request.into_parts();
                 let body = body.collect().await.unwrap().to_bytes();
@@ -137,8 +154,8 @@ impl Mock {
                 };
                 recorded.lock().unwrap().push(seen.clone());
                 tokio::time::sleep(delay).await;
-                if let Some(gate) = gate {
-                    let _closed = gate.acquire().await;
+                if let Some(hold) = hold.filter(|hold| (hold.held)(&seen)) {
+                    let _closed = hold.gate.acquire().await;
                 }
                 let reply = answer(calls.fetch_add(1, Ordering::SeqCst), &seen);
                 let mut response = Response::builder().status(reply.status);

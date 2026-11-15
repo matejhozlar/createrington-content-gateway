@@ -1318,7 +1318,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_source_that_does_not_answer_in_time_is_a_504() {
-        let mock = Mock::start(Duration::from_millis(500), sources).await;
+        let (mock, _never) = Mock::held(sources).await;
         let gateway = gateway_with(
             &mock,
             GatewayWith {

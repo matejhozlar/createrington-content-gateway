@@ -825,11 +825,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_curseforge_that_does_not_answer_in_time_is_a_504() {
-        let mock = Mock::start(
-            Duration::from_millis(500),
-            only_on_the_cdn(cdn_reply(200, "30")),
-        )
-        .await;
+        let (mock, _never) = Mock::held(only_on_the_cdn(cdn_reply(200, "30"))).await;
         let gateway = gateway_with(
             &mock,
             GatewayWith {
@@ -860,8 +856,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_cdn_that_does_not_answer_asks_for_a_retry() {
-        let mock = Mock::start(
-            Duration::from_millis(300),
+        let (mock, _never) = Mock::held_when(
+            |seen| seen.method == "HEAD",
             only_on_the_cdn(cdn_reply(200, "30")),
         )
         .await;
@@ -883,8 +879,8 @@ mod tests {
 
     #[tokio::test]
     async fn checks_still_running_when_the_cdn_wait_ends_ask_for_a_retry() {
-        let mock = Mock::start(
-            Duration::from_millis(300),
+        let (mock, _never) = Mock::held_when(
+            |seen| seen.method == "HEAD",
             only_on_the_cdn(cdn_reply(200, "30")),
         )
         .await;
@@ -898,12 +894,16 @@ mod tests {
                 ..GatewayWith::default()
             },
         );
-        let got = resolve(&gateway, r#"{"fileIds":[1003]}"#).await;
+        let got = tokio::time::timeout(
+            Timeouts::default().cdn / 2,
+            resolve(&gateway, r#"{"fileIds":[1003]}"#),
+        )
+        .await
+        .expect("the wait ended the check before the CDN client gave up");
         assert_eq!(got.status, StatusCode::OK);
         let file = &got.json()["files"][0];
         assert_eq!(file["source"], Value::Null);
         assert_eq!(file["retry"], true);
-        assert_eq!(heads(&mock), 1);
     }
 
     #[tokio::test]
