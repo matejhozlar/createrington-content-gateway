@@ -668,7 +668,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_a_bad_hash_body_or_algorithm() {
+    async fn refuses_a_bad_hash_or_body() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "{}")).await;
         let gateway = gateway(&mock, 300, TIMEOUT);
 
