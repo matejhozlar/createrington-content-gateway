@@ -324,6 +324,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_upstream_failure_names_the_upstream_and_what_went_wrong() {
+        let cases = [
+            (
+                UpstreamFailure::Timeout,
+                StatusCode::GATEWAY_TIMEOUT,
+                "UPSTREAM_TIMEOUT",
+                "Modrinth did not answer in time",
+            ),
+            (
+                UpstreamFailure::Unreachable,
+                StatusCode::BAD_GATEWAY,
+                "UPSTREAM_UNREACHABLE",
+                "Modrinth could not be reached",
+            ),
+            (
+                UpstreamFailure::TooLarge,
+                StatusCode::BAD_GATEWAY,
+                "UPSTREAM_TOO_LARGE",
+                "Modrinth answered with more than the gateway keeps",
+            ),
+            (
+                UpstreamFailure::Unreadable,
+                StatusCode::BAD_GATEWAY,
+                "UPSTREAM_UNREADABLE",
+                "Modrinth answered with something the gateway cannot read",
+            ),
+        ];
+        for (failure, status, code, message) in cases {
+            let (got_status, headers, body) = parts(ApiError::upstream(failure, "Modrinth")).await;
+            assert_eq!(got_status, status, "{failure:?}");
+            assert!(headers.get(header::RETRY_AFTER).is_none(), "{failure:?}");
+            assert_eq!(
+                body,
+                json!({ "code": code, "message": message }),
+                "{failure:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_pool_names_the_pool_asked_for_and_the_ones_allowed() {
+        let (status, _, body) = parts(ApiError::unknown_pool("jobs", &["launcher", "app"])).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            json!({
+                "code": "UNKNOWN_POOL",
+                "message": "this token cannot draw from pool \"jobs\", only from: launcher, app",
+                "pool": "jobs",
+            })
+        );
+    }
+
+    #[tokio::test]
     async fn retry_after_is_at_least_one_second() {
         let (_, headers, body) = parts(ApiError::refused(
             Refusal::Hold { retry_after_ms: 40 },

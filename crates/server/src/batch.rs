@@ -822,14 +822,25 @@ mod tests {
 
     #[tokio::test]
     async fn a_batch_joins_a_single_lookup_already_running() {
-        let mock = Mock::start(Duration::from_millis(200), curseforge).await;
+        let (mock, gate) = Mock::held(curseforge).await;
         let gateway = gateway(&mock);
         let single = {
             let router = gateway.router.clone();
             tokio::spawn(async move { get(&router, "/v1/curseforge/mods/1").await })
         };
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let got = post_json(&gateway.router, "/v1/curseforge/mods", r#"{"modIds":[1]}"#).await;
+        until("the single lookup to reach CurseForge", || {
+            mock.calls() == 1
+        })
+        .await;
+        let batch = {
+            let router = gateway.router.clone();
+            tokio::spawn(async move {
+                post_json(&router, "/v1/curseforge/mods", r#"{"modIds":[1]}"#).await
+            })
+        };
+        until("the batch joining it", || gateway.state.cache.joined() == 1).await;
+        gate.open();
+        let got = batch.await.unwrap();
         single.await.unwrap();
         assert_eq!(got.header("x-cache"), Some("hit"));
         assert_eq!(got.body, format!(r#"{{"data":[{}]}}"#, mod_row(1)));
@@ -927,17 +938,25 @@ mod tests {
 
     #[tokio::test]
     async fn a_joined_answer_without_a_row_fails_the_batch_instead_of_dropping_the_id() {
-        let mock = Mock::start(Duration::from_millis(200), |_, _| {
-            reply(200, r#"{"error":"not a project"}"#)
-        })
-        .await;
+        let (mock, gate) = Mock::held(|_, _| reply(200, r#"{"error":"not a project"}"#)).await;
         let gateway = gateway(&mock);
         let single = {
             let router = gateway.router.clone();
             tokio::spawn(async move { get(&router, "/v1/curseforge/mods/1").await })
         };
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let got = post_json(&gateway.router, "/v1/curseforge/mods", r#"{"modIds":[1]}"#).await;
+        until("the single lookup to reach CurseForge", || {
+            mock.calls() == 1
+        })
+        .await;
+        let batch = {
+            let router = gateway.router.clone();
+            tokio::spawn(async move {
+                post_json(&router, "/v1/curseforge/mods", r#"{"modIds":[1]}"#).await
+            })
+        };
+        until("the batch joining it", || gateway.state.cache.joined() == 1).await;
+        gate.open();
+        let got = batch.await.unwrap();
         assert_eq!(single.await.unwrap().status, StatusCode::OK);
         assert_eq!(got.status, StatusCode::BAD_GATEWAY);
         assert_eq!(got.json()["code"], "UPSTREAM_UNREADABLE");

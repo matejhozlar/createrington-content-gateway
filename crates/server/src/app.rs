@@ -94,7 +94,12 @@ impl AppState {
                 &config.user_agent,
                 timeouts.modrinth,
             )?,
-            cdn: Cdn::new(&addresses.curseforge_cdn, &config.user_agent, timeouts.cdn)?,
+            cdn: Cdn::new(
+                &addresses.curseforge_cdn,
+                &config.user_agent,
+                timeouts.cdn,
+                timeouts.cdn_wait,
+            )?,
             meta: Meta::new(
                 &addresses.mojang_meta,
                 &addresses.neoforge_maven,
@@ -135,12 +140,13 @@ impl Default for Addresses {
     }
 }
 
-/// How long each upstream client waits for an answer.
+/// How long each upstream client waits for an answer, and how long `resolve` waits for all its CDN checks.
 #[derive(Debug, Clone, Copy)]
 pub struct Timeouts {
     pub curseforge: Duration,
     pub modrinth: Duration,
     pub cdn: Duration,
+    pub cdn_wait: Duration,
     pub meta: Duration,
 }
 
@@ -150,6 +156,7 @@ impl Default for Timeouts {
             curseforge: curseforge::TIMEOUT,
             modrinth: modrinth::TIMEOUT,
             cdn: resolve::CDN_TIMEOUT,
+            cdn_wait: resolve::CDN_WAIT,
             meta: versions::TIMEOUT,
         }
     }

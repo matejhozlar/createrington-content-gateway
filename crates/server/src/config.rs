@@ -748,6 +748,31 @@ mod tests {
     }
 
     #[test]
+    fn names_may_be_at_most_64_characters() {
+        let longest = "a".repeat(64);
+        let longer = "a".repeat(65);
+        let consumers = |name: &str, pool: &str| {
+            consumers_from(&format!(
+                r#"[{{"name":"{name}","token":"{TOKEN}","pools":["{pool}"]}}]"#
+            ))
+        };
+        assert!(consumers(&longest, &longest).is_ok());
+        assert_eq!(
+            consumers(&longer, "app"),
+            Err(ConfigError::ConsumerName {
+                name: longer.clone()
+            })
+        );
+        assert_eq!(
+            consumers("app", &longer),
+            Err(ConfigError::PoolName {
+                consumer: "app".to_owned(),
+                pool: longer.clone(),
+            })
+        );
+    }
+
+    #[test]
     fn rejects_short_and_shared_tokens() {
         assert_eq!(
             config_from(&[(TOKEN_ENV, "too-short")]),

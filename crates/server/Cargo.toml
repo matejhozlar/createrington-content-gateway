@@ -32,7 +32,7 @@ utoipa = { version = "6.0.0", default-features = false, features = ["macros"] }
 
 [dev-dependencies]
 http-body-util.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "test-util"] }
 tower.workspace = true
 
 [lints]

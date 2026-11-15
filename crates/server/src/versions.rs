@@ -836,7 +836,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::test_support::*;
+    use crate::{app::Timeouts, test_support::*};
 
     fn manifest_body(base: &str) -> String {
         json!({
@@ -1304,5 +1304,94 @@ mod tests {
         let got = get(&gateway.router, "/v1/minecraft/versions/1.21.1").await;
         assert_eq!(got.status, StatusCode::BAD_GATEWAY);
         assert_eq!(mock.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_source_answering_200_with_something_unreadable_is_a_502() {
+        let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "not json")).await;
+        let gateway = gateway(&mock);
+        let got = get(&gateway.router, "/v1/minecraft/versions").await;
+        assert_eq!(got.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(got.json()["code"], "UPSTREAM_UNREADABLE");
+        assert!(got.json()["message"].as_str().unwrap().contains("Mojang"));
+    }
+
+    #[tokio::test]
+    async fn a_source_that_does_not_answer_in_time_is_a_504() {
+        let mock = Mock::start(Duration::from_millis(500), sources).await;
+        let gateway = gateway_with(
+            &mock,
+            GatewayWith {
+                timeouts: Timeouts {
+                    meta: Duration::from_millis(50),
+                    ..Timeouts::default()
+                },
+                ..GatewayWith::default()
+            },
+        );
+        let got = get(&gateway.router, "/v1/minecraft/loaders/neoforge/versions").await;
+        assert_eq!(got.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(got.json()["code"], "UPSTREAM_TIMEOUT");
+    }
+
+    #[tokio::test]
+    async fn requests_for_a_list_already_being_fetched_wait_for_it() {
+        let (mock, gate) = Mock::held(sources).await;
+        let gateway = gateway(&mock);
+        let first = {
+            let router = gateway.router.clone();
+            tokio::spawn(async move { get(&router, "/v1/minecraft/versions").await })
+        };
+        until("the manifest call to reach Mojang", || mock.calls() == 1).await;
+        let second = {
+            let router = gateway.router.clone();
+            tokio::spawn(async move { get(&router, "/v1/minecraft/versions?type=all").await })
+        };
+        until("the second request joining it", || {
+            gateway.state.cache.joined() == 1
+        })
+        .await;
+        gate.open();
+
+        assert_eq!(first.await.unwrap().status, StatusCode::OK);
+        let second = second.await.unwrap();
+        assert_eq!(second.status, StatusCode::OK);
+        assert_eq!(ids(&second.json()).len(), 5);
+        assert_eq!(mock.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_loader_list_is_answered_old_when_its_source_fails() {
+        let mock = Mock::start(Duration::ZERO, |call, seen| {
+            if call >= 1 {
+                reply(503, "")
+            } else {
+                sources(call, seen)
+            }
+        })
+        .await;
+        let gateway = gateway(&mock);
+        let fresh = get(&gateway.router, "/v1/minecraft/loaders/neoforge/versions").await;
+
+        gateway.clock.advance(LIST_FRESH_MS + 1);
+        let stale = get(&gateway.router, "/v1/minecraft/loaders/neoforge/versions").await;
+        assert_eq!(stale.status, StatusCode::OK);
+        assert_eq!(stale.json(), fresh.json());
+        assert_eq!(mock.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_empty_minecraft_version_lists_every_build() {
+        let mock = Mock::start(Duration::ZERO, sources).await;
+        let gateway = gateway(&mock);
+        let every = get(&gateway.router, "/v1/minecraft/loaders/forge/versions").await;
+        let empty = get(
+            &gateway.router,
+            "/v1/minecraft/loaders/forge/versions?minecraft=",
+        )
+        .await;
+        assert_eq!(empty.status, StatusCode::OK);
+        assert_eq!(empty.json()["minecraft"], Value::Null);
+        assert_eq!(empty.json(), every.json());
     }
 }

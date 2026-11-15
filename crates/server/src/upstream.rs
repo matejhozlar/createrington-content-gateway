@@ -180,3 +180,32 @@ pub fn failure(error: reqwest::Error, name: &'static str) -> UpstreamFailure {
         UpstreamFailure::Unreachable
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(length: Option<&str>, body: Vec<u8>) -> reqwest::Response {
+        let mut response = axum::http::Response::builder().status(200);
+        if let Some(length) = length {
+            response = response.header(CONTENT_LENGTH, length);
+        }
+        reqwest::Response::from(response.body(body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn an_answer_announced_larger_than_the_gateway_keeps_is_not_read() {
+        let announced = (MAX_ANSWER_BYTES + 1).to_string();
+        let got = read(response(Some(&announced), Vec::new()), "CurseForge").await;
+        assert_eq!(got.err(), Some(UpstreamFailure::TooLarge));
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_grows_past_what_the_gateway_keeps_is_dropped() {
+        let got = read(response(None, vec![b'x'; MAX_ANSWER_BYTES + 1]), "Modrinth").await;
+        assert_eq!(got.err(), Some(UpstreamFailure::TooLarge));
+
+        let kept = read(response(None, vec![b'x'; MAX_ANSWER_BYTES]), "Modrinth").await;
+        assert_eq!(kept.unwrap().answer.body.len(), MAX_ANSWER_BYTES);
+    }
+}

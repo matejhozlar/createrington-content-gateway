@@ -15,7 +15,7 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use serde_json::Value;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Semaphore};
 use tower::ServiceExt;
 
 use crate::{
@@ -79,9 +79,33 @@ pub(crate) struct Mock {
     pub(crate) seen: Arc<Mutex<Vec<Seen>>>,
 }
 
+pub(crate) struct Gate(Arc<Semaphore>);
+
+impl Gate {
+    pub(crate) fn open(&self) {
+        self.0.close();
+    }
+}
+
 impl Mock {
     pub(crate) async fn start(
         delay: Duration,
+        answer: impl Fn(usize, &Seen) -> Reply + Send + Sync + 'static,
+    ) -> Self {
+        Self::serve(delay, None, answer).await
+    }
+
+    pub(crate) async fn held(
+        answer: impl Fn(usize, &Seen) -> Reply + Send + Sync + 'static,
+    ) -> (Self, Gate) {
+        let gate = Arc::new(Semaphore::new(0));
+        let mock = Self::serve(Duration::ZERO, Some(gate.clone()), answer).await;
+        (mock, Gate(gate))
+    }
+
+    async fn serve(
+        delay: Duration,
+        gate: Option<Arc<Semaphore>>,
         answer: impl Fn(usize, &Seen) -> Reply + Send + Sync + 'static,
     ) -> Self {
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
@@ -93,7 +117,7 @@ impl Mock {
         let served = base.clone();
         let mock = Router::new().fallback(move |request: Request<Body>| {
             let (recorded, answer, calls) = (recorded.clone(), answer.clone(), calls.clone());
-            let base = served.clone();
+            let (base, gate) = (served.clone(), gate.clone());
             async move {
                 let (parts, body) = request.into_parts();
                 let body = body.collect().await.unwrap().to_bytes();
@@ -113,6 +137,9 @@ impl Mock {
                 };
                 recorded.lock().unwrap().push(seen.clone());
                 tokio::time::sleep(delay).await;
+                if let Some(gate) = gate {
+                    let _closed = gate.acquire().await;
+                }
                 let reply = answer(calls.fetch_add(1, Ordering::SeqCst), &seen);
                 let mut response = Response::builder().status(reply.status);
                 for (name, value) in reply.headers {
@@ -137,6 +164,16 @@ impl Mock {
     pub(crate) fn seen(&self) -> Vec<Seen> {
         self.seen.lock().unwrap().clone()
     }
+}
+
+pub(crate) async fn until(what: &str, condition: impl Fn() -> bool) {
+    for _ in 0..5_000 {
+        if condition() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("waited 5 s for {what}");
 }
 
 pub(crate) fn addresses_at(base: &str) -> Addresses {

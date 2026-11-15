@@ -136,3 +136,126 @@ impl RedisStore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct Logs(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Logs {
+        fn capture(&self) -> tracing::subscriber::DefaultGuard {
+            let logs = self.clone();
+            tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_writer(move || logs.clone())
+                    .finish(),
+            )
+        }
+
+        fn lines(&self) -> Vec<String> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    fn store() -> RedisStore {
+        RedisStore::open("redis://127.0.0.1:1", "content-gateway-test").unwrap()
+    }
+
+    async fn fail(store: &RedisStore) -> Option<()> {
+        store
+            .run(|_| async { Err(io::Error::other("refused").into()) })
+            .await
+    }
+
+    async fn answer(store: &RedisStore) -> (Option<u8>, bool) {
+        let asked = AtomicBool::new(false);
+        let answered = store
+            .run(|_| async {
+                asked.store(true, Ordering::SeqCst);
+                Ok(7)
+            })
+            .await;
+        (answered, asked.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn a_failure_skips_redis_until_the_pause_ends() {
+        let store = store();
+        assert_eq!(answer(&store).await, (Some(7), true));
+        assert_eq!(fail(&store).await, None);
+        assert_eq!(store.link().state, LinkState::Down);
+
+        assert_eq!(answer(&store).await, (None, false));
+
+        store.link().paused_until = Some(Instant::now() - Duration::from_millis(1));
+        assert_eq!(answer(&store).await, (Some(7), true));
+        let link = store.link();
+        assert_eq!((link.state, link.paused_until), (LinkState::Up, None));
+    }
+
+    #[tokio::test]
+    async fn says_once_when_redis_fails_and_once_when_it_answers_again() {
+        let logs = Logs::default();
+        let _logging = logs.capture();
+        let store = store();
+        answer(&store).await;
+        for _ in 0..2 {
+            fail(&store).await;
+            store.link().paused_until = None;
+        }
+        answer(&store).await;
+        answer(&store).await;
+
+        let lines = logs.lines();
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(lines[0].contains("Redis connected"), "{lines:#?}");
+        assert!(
+            lines[1].contains(
+                "Redis failed, the budget and the cache use memory until it answers again: refused"
+            ),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[2].contains("Redis answers again, the budget and the cache use it again"),
+            "{lines:#?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_operation_without_an_answer_within_a_second_counts_as_a_failure() {
+        let logs = Logs::default();
+        let _logging = logs.capture();
+        let store = store();
+        let answered: Option<()> = store.run_even_if_paused(|_| std::future::pending()).await;
+        assert_eq!(answered, None);
+        assert_eq!(store.link().state, LinkState::Down);
+        assert!(store.link().paused_until.is_some());
+        assert!(logs.lines()[0].ends_with("no answer within 1 s"));
+    }
+}
