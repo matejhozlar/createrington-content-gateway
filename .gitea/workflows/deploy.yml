@@ -140,7 +140,7 @@ jobs:
           fi
           exit 1
 
-      - name: Put the previous build back when the new one did not answer
+      - name: Put back what this run replaced when the gateway did not answer
         if: failure()
         shell: bash
         run: |
