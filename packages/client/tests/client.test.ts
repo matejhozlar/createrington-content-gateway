@@ -98,11 +98,13 @@ describe("the gateway's own routes", () => {
       },
       { status: 200, body: "" },
       json(200, [1, 2]),
+      json(200, { loader: "fabric", versions: [] }, "warm"),
     );
     for (const call of [
       () => client().health(),
       () => client().budget(),
       () => client().minecraftVersions(),
+      () => client().loaderVersions("fabric"),
     ]) {
       const error = (await call().catch(
         (error: unknown) => error,
@@ -115,7 +117,9 @@ describe("the gateway's own routes", () => {
   });
 
   it("throws CurseForge's failure that resolve passes on", async () => {
-    gateway.reply(json(500, { error: "boom" }, "miss"));
+    gateway.reply(
+      json(500, { code: "NOT_FOUND", message: "CurseForge says no" }, "miss"),
+    );
     const error = (await client()
       .resolve([1])
       .catch((error: unknown) => error)) as ContentGatewayError;

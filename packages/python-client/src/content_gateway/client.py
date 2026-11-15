@@ -150,10 +150,10 @@ class _Gateway:
         answered = f"{response.status_code} answer to {request.method} {request.path}"
         raise ContentGatewayError(
             response.status_code,
-            _as_api_error(body),
-            f"the {answered} is not the gateway's JSON"
-            if cache is None
-            else f"the {answered} is an upstream's, passed on by the gateway (X-Cache: {cache})",
+            None,
+            f"the {answered} is an upstream's, passed on by the gateway (X-Cache: {cache})"
+            if cache in _CACHE_STATUSES
+            else f"the {answered} is not the gateway's JSON",
         )
 
     @staticmethod

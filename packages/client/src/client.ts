@@ -369,10 +369,10 @@ export class ContentGateway {
     const answered = `${response.status} answer to ${options.method} ${options.path}`;
     throw new ContentGatewayError(
       response.status,
-      asApiError(body),
-      cache === null
-        ? `the ${answered} is not the gateway's JSON`
-        : `the ${answered} is an upstream's, passed on by the gateway (X-Cache: ${cache})`,
+      null,
+      isCacheStatus(cache)
+        ? `the ${answered} is an upstream's, passed on by the gateway (X-Cache: ${cache})`
+        : `the ${answered} is not the gateway's JSON`,
     );
   }
 
