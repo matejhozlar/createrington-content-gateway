@@ -5,7 +5,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     app::{self, Addresses, AppState, Timeouts},
-    budget::SystemClock,
+    clock::SystemClock,
     config::{self, Config, DEFAULT_LOG},
     openapi,
     redis_store::{self, RedisStore},
@@ -106,7 +106,7 @@ pub async fn run() -> ExitCode {
         SHUTDOWN_GRACE,
     )
     .await;
-    state.budget.write_days_at_exit().await;
+    state.curseforge_budget.write_days_at_exit().await;
     state.modrinth_budget.write_days_at_exit().await;
     match stopped {
         Ok(Stopped::Drained) => {

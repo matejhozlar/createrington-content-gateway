@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     body::Bytes,
     http::{
-        HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
+        HeaderMap, HeaderName, Method, StatusCode, Uri,
         header::{CACHE_CONTROL, CONTENT_TYPE},
     },
     response::{IntoResponse, Response},
@@ -14,16 +14,13 @@ use crate::{
     auth::Pool,
     batch::{self, Batch},
     budget::{self, Refusal},
-    cache::{Answer, AnswerCache, Entry, Finisher, LoadFailure, Outcome},
+    cache::{Answer, AnswerCache, CacheStatus, Entry, Finisher, LoadFailure, Outcome, load_key},
     curseforge::{self, Share},
     error::ApiError,
     modrinth,
     upstream::{Source, UpstreamFailure},
 };
 
-pub const MINUTE_MS: u64 = 60_000;
-pub const HOUR_MS: u64 = 60 * MINUTE_MS;
-pub const DAY_MS: u64 = 24 * HOUR_MS;
 const X_CACHE: HeaderName = HeaderName::from_static("x-cache");
 
 /// How long an answer of a route stays fresh, found and (when a 404 is kept) not found.
@@ -48,6 +45,14 @@ fn valid_segment(source: Source, segment: &str) -> bool {
         && segment.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || slug_byte(byte)
         })
+}
+
+pub const SHA1_LENGTH: usize = 40;
+
+/// A lowercase SHA-1, or none when the text is not one.
+pub fn sha1_of(text: &str) -> Option<String> {
+    (text.len() == SHA1_LENGTH && text.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| text.to_ascii_lowercase())
 }
 
 pub fn is_id(segment: &str) -> bool {
@@ -139,7 +144,7 @@ pub async fn passthrough(state: Arc<AppState>, source: Source, request: Request)
             })
         };
         return match call.await {
-            Ok(Ok(answer)) => respond(&answer, "miss"),
+            Ok(Ok(answer)) => respond(&answer, CacheStatus::Miss),
             Ok(Err(failure)) => failed(failure, &pool, source),
             Err(_) => failed(
                 LoadFailure::Upstream(UpstreamFailure::Unreachable),
@@ -179,18 +184,14 @@ pub async fn passthrough(state: Arc<AppState>, source: Source, request: Request)
         })
     {
         budget.record_hit(&pool.consumer, &pool.name);
-        return respond(&entry.answer, "hit");
+        return respond(&entry.answer, CacheStatus::Hit);
     }
     if !forced && let Some(entry) = cached.as_ref().filter(|entry| entry.is_fresh(now)) {
         budget.record_hit(&pool.consumer, &pool.name);
-        return respond(&entry.answer, "hit");
+        return respond(&entry.answer, CacheStatus::Hit);
     }
 
-    let load_key = if forced {
-        format!("{key} no-cache")
-    } else {
-        key.clone()
-    };
+    let load_key = load_key(key.clone(), forced);
     let (waiting, finisher) = state.cache.join(&load_key);
     let started = finisher.is_some();
     if let Some(finisher) = finisher {
@@ -208,26 +209,27 @@ pub async fn passthrough(state: Arc<AppState>, source: Source, request: Request)
         };
         tokio::spawn(load.run(finisher));
     }
-    let outcome = AnswerCache::wait(waiting).await.unwrap_or(Outcome {
-        loaded: Err(LoadFailure::Upstream(UpstreamFailure::Unreachable)),
-        called: false,
-    });
+    let outcome = AnswerCache::wait(waiting)
+        .await
+        .unwrap_or(Outcome::not_called(Err(LoadFailure::Upstream(
+            UpstreamFailure::Unreachable,
+        ))));
 
     match outcome.loaded {
         Ok(entry) => {
             if started && outcome.called {
-                respond(&entry.answer, "miss")
+                respond(&entry.answer, CacheStatus::Miss)
             } else {
                 budget.record_hit(&pool.consumer, &pool.name);
-                respond(&entry.answer, "hit")
+                respond(&entry.answer, CacheStatus::Hit)
             }
         }
         Err(failure) => {
-            let stale = cached.filter(|entry| entry.is_stale(state.clock.now_ms()));
+            let stale = cached.filter(|entry| entry.can_stand_in(state.clock.now_ms()));
             match stale {
-                Some(entry) if batch::failed_upstream(&failure) => {
+                Some(entry) if failure.allows_stale() => {
                     budget.record_hit(&pool.consumer, &pool.name);
-                    respond(&entry.answer, "stale")
+                    respond(&entry.answer, CacheStatus::Stale)
                 }
                 _ => failed(failure, &pool, source),
             }
@@ -262,10 +264,7 @@ impl Load {
                 .get(&self.key)
                 .filter(|entry| entry.is_fresh(state.clock.now_ms()))
         {
-            return Outcome {
-                loaded: Ok(entry),
-                called: false,
-            };
+            return Outcome::not_called(Ok(entry));
         }
         let answer = match call(
             state,
@@ -280,10 +279,7 @@ impl Load {
         {
             Ok(answer) => answer,
             Err(failure) => {
-                return Outcome {
-                    loaded: Err(failure),
-                    called: true,
-                };
+                return Outcome::called(Err(failure));
             }
         };
         let fresh_ms = match answer.status {
@@ -292,10 +288,7 @@ impl Load {
             _ => None,
         };
         let Some(fresh_ms) = fresh_ms else {
-            return Outcome {
-                loaded: Err(LoadFailure::Answered(answer)),
-                called: true,
-            };
+            return Outcome::called(Err(LoadFailure::Answered(answer)));
         };
         let found = answer.status == StatusCode::OK;
         let mut entry = Entry::new(answer, state.clock.now_ms(), fresh_ms);
@@ -314,10 +307,7 @@ impl Load {
         {
             state.cache.insert(&Batch::Files.key(file), entry.clone());
         }
-        Outcome {
-            loaded: Ok(entry),
-            called: true,
-        }
+        Outcome::called(Ok(entry))
     }
 }
 
@@ -380,7 +370,7 @@ pub async fn send_recorded(
     }
 }
 
-pub fn respond(answer: &Answer, cache: &'static str) -> Response {
+pub fn respond(answer: &Answer, cache: CacheStatus) -> Response {
     let mut response = (answer.status, answer.body.clone()).into_response();
     let headers = response.headers_mut();
     match &answer.content_type {
@@ -391,13 +381,13 @@ pub fn respond(answer: &Answer, cache: &'static str) -> Response {
             headers.remove(CONTENT_TYPE);
         }
     }
-    headers.insert(X_CACHE, HeaderValue::from_static(cache));
+    headers.insert(X_CACHE, cache.header());
     response
 }
 
 pub fn failed(failure: LoadFailure, pool: &Pool, source: Source) -> Response {
     match failure {
-        LoadFailure::Answered(answer) => respond(&answer, "miss"),
+        LoadFailure::Answered(answer) => respond(&answer, CacheStatus::Miss),
         LoadFailure::Refused(refusal) => {
             ApiError::refused(refusal, &pool.name, source.name()).into_response()
         }

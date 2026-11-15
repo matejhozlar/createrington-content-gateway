@@ -7,7 +7,7 @@ use std::{
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode, Uri},
+    http::{HeaderMap, Method, StatusCode, Uri},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -17,10 +17,12 @@ use utoipa::ToSchema;
 use crate::{
     app::AppState,
     auth::Pool,
-    batch,
-    cache::{Answer, AnswerCache, Entry, Finisher, LoadFailure, Outcome, Waiting},
+    cache::{
+        Answer, AnswerCache, CacheStatus, Entry, Finisher, LoadFailure, Outcome, Waiting, load_key,
+    },
+    clock::{DAY_MS, HOUR_MS, MINUTE_MS},
     error::ApiError,
-    passthrough::{self, DAY_MS, Freshness, HOUR_MS, MINUTE_MS, fresh},
+    passthrough::{self, Freshness, SHA1_LENGTH, fresh, sha1_of},
     upstream::{Source, UpstreamFailure},
 };
 
@@ -30,7 +32,6 @@ const MOST_HASHES: usize = 1000;
 const HASHES_PER_CALL: usize = 100;
 const FOUND_MS: u64 = HOUR_MS;
 const NOT_FOUND_MS: u64 = 10 * MINUTE_MS;
-const SHA1_LENGTH: usize = 40;
 
 /// The cache table of the Modrinth routes.
 pub fn freshness(segments: &[&str]) -> Option<Freshness> {
@@ -103,7 +104,7 @@ pub struct Known {
 /// The versions of the kept hashes, and whether Modrinth was asked, found as `hit`, `miss` or `stale`.
 pub struct Looked {
     pub known: Vec<Known>,
-    pub cache: &'static str,
+    pub cache: CacheStatus,
 }
 
 enum Slot {
@@ -121,16 +122,6 @@ fn key(hash: &str) -> String {
     format!("modrinth:sha1:{hash}")
 }
 
-/// A lowercase SHA-1, or none when the text is not one.
-pub fn sha1_of(text: &str) -> Option<String> {
-    (text.len() == SHA1_LENGTH && text.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| text.to_ascii_lowercase())
-}
-
-fn usable(entry: &Entry) -> bool {
-    entry.answer.status == StatusCode::NOT_FOUND || entry.row.is_some()
-}
-
 /// Modrinth's version for each lowercase SHA-1 from the cache while fresh, the rest asked for 100 per call.
 pub async fn lookup(
     state: &Arc<AppState>,
@@ -144,16 +135,12 @@ pub async fn lookup(
     let mut slots = Vec::with_capacity(hashes.len());
     let mut mine = Vec::new();
     for ((hash, key), kept) in hashes.into_iter().zip(keys).zip(found) {
-        let kept = kept.filter(|entry| usable(entry));
+        let kept = kept.filter(|entry| entry.fits_a_batch());
         if !forced && let Some(entry) = kept.clone().filter(|entry| entry.is_fresh(now)) {
             slots.push((hash, kept, Slot::Kept(entry)));
             continue;
         }
-        let load_key = if forced {
-            format!("{key} no-cache")
-        } else {
-            key
-        };
+        let load_key = load_key(key, forced);
         let (waiting, finisher) = state.cache.join(&load_key);
         let started = finisher.is_some();
         if let Some(finisher) = finisher {
@@ -185,12 +172,12 @@ pub async fn lookup(
             },
         };
         let entry = match loaded {
-            Ok(entry) if usable(&entry) => entry,
+            Ok(entry) if entry.fits_a_batch() => entry,
             Ok(_) => return Err(LoadFailure::Upstream(UpstreamFailure::Unreadable)),
             Err(failure) => {
                 let now = state.clock.now_ms();
-                match kept.filter(|entry| entry.is_stale(now)) {
-                    Some(entry) if batch::failed_upstream(&failure) => {
+                match kept.filter(|entry| entry.can_stand_in(now)) {
+                    Some(entry) if failure.allows_stale() => {
                         stale = true;
                         entry
                     }
@@ -208,29 +195,19 @@ pub async fn lookup(
     }
     Ok(Looked {
         known,
-        cache: if stale {
-            "stale"
-        } else if called {
-            "miss"
-        } else {
-            "hit"
-        },
+        cache: CacheStatus::of(stale, called),
     })
 }
 
 async fn fetch(state: Arc<AppState>, pool: Pool, mine: Vec<Mine>, forced: bool) {
     let mut missing = Vec::with_capacity(mine.len());
     for load in mine {
-        let kept = state
-            .cache
-            .get(&key(&load.hash))
-            .filter(|entry| !forced && usable(entry) && entry.is_fresh(state.clock.now_ms()));
+        let kept = state.cache.get(&key(&load.hash)).filter(|entry| {
+            !forced && entry.fits_a_batch() && entry.is_fresh(state.clock.now_ms())
+        });
         match kept {
             Some(entry) => {
-                let outcome = Outcome {
-                    loaded: Ok(entry),
-                    called: false,
-                };
+                let outcome = Outcome::not_called(Ok(entry));
                 state.cache.finish(&load.load_key, load.finisher, outcome);
             }
             None => missing.push(load),
@@ -246,10 +223,7 @@ async fn fetch(state: Arc<AppState>, pool: Pool, mine: Vec<Mine>, forced: bool) 
         .await
     {
         for load in missing {
-            let outcome = Outcome {
-                loaded: Err(LoadFailure::Refused(refusal)),
-                called: false,
-            };
+            let outcome = Outcome::not_called(Err(LoadFailure::Refused(refusal)));
             state.cache.finish(&load.load_key, load.finisher, outcome);
         }
         return;
@@ -289,27 +263,11 @@ async fn fetch_chunk(state: Arc<AppState>, pool: Pool, chunk: Vec<Mine>) {
             Ok(versions) => {
                 let entry = match versions.get(&load.hash) {
                     Some(version) => {
-                        let mut entry = Entry::new(
-                            Answer {
-                                status: StatusCode::OK,
-                                content_type: Some(json()),
-                                body: version.clone(),
-                            },
-                            now,
-                            FOUND_MS,
-                        );
+                        let mut entry = Entry::new(Answer::json(version.clone()), now, FOUND_MS);
                         entry.row = Some(version.clone());
                         entry
                     }
-                    None => Entry::new(
-                        Answer {
-                            status: StatusCode::NOT_FOUND,
-                            content_type: None,
-                            body: Bytes::new(),
-                        },
-                        now,
-                        NOT_FOUND_MS,
-                    ),
+                    None => Entry::new(Answer::not_found(), now, NOT_FOUND_MS),
                 };
                 let entry = Arc::new(entry);
                 state.cache.insert(&key(&load.hash), entry.clone());
@@ -317,10 +275,7 @@ async fn fetch_chunk(state: Arc<AppState>, pool: Pool, chunk: Vec<Mine>) {
             }
             Err(failure) => Err(failure.clone()),
         };
-        let outcome = Outcome {
-            loaded,
-            called: true,
-        };
+        let outcome = Outcome::called(loaded);
         state.cache.finish(&load.load_key, load.finisher, outcome);
     }
 }
@@ -338,10 +293,6 @@ fn split(answer: &Answer) -> Option<HashMap<String, Bytes>> {
             })
             .collect(),
     )
-}
-
-fn json() -> HeaderValue {
-    HeaderValue::from_static("application/json; charset=utf-8")
 }
 
 /// What `GET api.modrinth.com/v2/{path}` answers, from the cache while it is fresh.
@@ -460,22 +411,8 @@ pub async fn version_file(state: Arc<AppState>, pool: Pool, hash: &str, forced: 
         .next()
         .and_then(|known| known.version)
     {
-        Some(version) => passthrough::respond(
-            &Answer {
-                status: StatusCode::OK,
-                content_type: Some(json()),
-                body: version,
-            },
-            looked.cache,
-        ),
-        None => passthrough::respond(
-            &Answer {
-                status: StatusCode::NOT_FOUND,
-                content_type: None,
-                body: Bytes::new(),
-            },
-            looked.cache,
-        ),
+        Some(version) => passthrough::respond(&Answer::json(version), looked.cache),
+        None => passthrough::respond(&Answer::not_found(), looked.cache),
     }
 }
 
@@ -535,14 +472,7 @@ pub async fn version_files(
         }
     }
     body.push(b'}');
-    passthrough::respond(
-        &Answer {
-            status: StatusCode::OK,
-            content_type: Some(json()),
-            body: body.into(),
-        },
-        looked.cache,
-    )
+    passthrough::respond(&Answer::json(body), looked.cache)
 }
 
 #[cfg(test)]
@@ -550,7 +480,7 @@ mod tests {
     use axum::http::Request;
 
     use super::*;
-    use crate::{app::Timeouts, passthrough::MINUTE_MS, test_support::*};
+    use crate::{app::Timeouts, test_support::*};
 
     const JEI: &str = "3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e";
     const SODIUM: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -593,7 +523,7 @@ mod tests {
         .await;
         assert_eq!(again.header("x-cache"), Some("hit"));
         assert_eq!(mock.calls(), 1);
-        assert_eq!(gateway.state.budget.snapshot().await.used, 0);
+        assert_eq!(gateway.state.curseforge_budget.snapshot().await.used, 0);
         let modrinth = gateway.state.modrinth_budget.snapshot().await;
         assert_eq!(modrinth.used, 1);
         assert_eq!(modrinth.days[0].pools[0].counts.calls, 1);
@@ -784,7 +714,7 @@ mod tests {
         let modrinth = gateway.state.modrinth_budget.snapshot().await;
         assert_eq!(modrinth.days[0].pools[0].counts.calls, 2);
         assert_eq!(modrinth.days[0].pools[0].counts.hits, 1);
-        assert_eq!(gateway.state.budget.snapshot().await.days, []);
+        assert_eq!(gateway.state.curseforge_budget.snapshot().await.days, []);
     }
 
     #[tokio::test]

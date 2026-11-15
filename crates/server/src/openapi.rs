@@ -6,7 +6,7 @@ use utoipa::{
 
 use crate::{
     budget::{
-        self, BudgetSnapshot, DayCounts, DayPoolSnapshot, DaySnapshot, PoolSnapshot, Source,
+        self, BudgetSnapshot, CountSource, DayCounts, DayPoolSnapshot, DaySnapshot, PoolSnapshot,
         UpstreamBudget,
     },
     curseforge,
@@ -61,7 +61,7 @@ pub const API_VERSION: &str = "1";
         DaySnapshot,
         DayPoolSnapshot,
         DayCounts,
-        Source,
+        CountSource,
         VersionFilesRequest,
         ResolveRequest,
         Resolved,

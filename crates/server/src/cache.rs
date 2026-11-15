@@ -25,6 +25,55 @@ pub struct Answer {
     pub body: Bytes,
 }
 
+impl Answer {
+    /// A 404 without a body, as CurseForge and Modrinth answer for something they do not know.
+    pub fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            content_type: None,
+            body: Bytes::new(),
+        }
+    }
+
+    /// A 200 with a JSON body.
+    pub fn json(body: impl Into<Bytes>) -> Self {
+        Self {
+            status: StatusCode::OK,
+            content_type: Some(HeaderValue::from_static("application/json; charset=utf-8")),
+            body: body.into(),
+        }
+    }
+}
+
+/// Where an answer came from, sent as `X-Cache`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheStatus {
+    Hit,
+    Miss,
+    Stale,
+}
+
+impl CacheStatus {
+    /// `stale` when a kept answer stood in for a failure, else `miss` when the upstream was called, else `hit`.
+    pub fn of(stale: bool, called: bool) -> Self {
+        if stale {
+            Self::Stale
+        } else if called {
+            Self::Miss
+        } else {
+            Self::Hit
+        }
+    }
+
+    pub fn header(self) -> HeaderValue {
+        HeaderValue::from_static(match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Stale => "stale",
+        })
+    }
+}
+
 /// A cached answer with its fresh and stale times in milliseconds since the Unix epoch; a fingerprint entry is
 /// not JSON on its own and is only ever joined into a rebuilt answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,8 +103,14 @@ impl Entry {
         self.fresh_until_ms > now_ms
     }
 
-    pub fn is_stale(&self, now_ms: u64) -> bool {
+    /// Whether the entry may still be given in place of an answer the upstream could not give.
+    pub fn can_stand_in(&self, now_ms: u64) -> bool {
         self.stale_until_ms > now_ms
+    }
+
+    /// Whether a per-id entry can go into a joined answer: it has its row, or it is a kept 404.
+    pub fn fits_a_batch(&self) -> bool {
+        self.answer.status == StatusCode::NOT_FOUND || self.row.is_some()
     }
 }
 
@@ -77,6 +132,22 @@ pub struct Outcome {
     pub called: bool,
 }
 
+impl Outcome {
+    pub fn called(loaded: Loaded) -> Self {
+        Self {
+            loaded,
+            called: true,
+        }
+    }
+
+    pub fn not_called(loaded: Loaded) -> Self {
+        Self {
+            loaded,
+            called: false,
+        }
+    }
+}
+
 pub type Waiting = watch::Receiver<Option<Outcome>>;
 pub type Finisher = watch::Sender<Option<Outcome>>;
 
@@ -86,6 +157,25 @@ pub enum LoadFailure {
     Answered(Answer),
     Refused(crate::budget::Refusal),
     Upstream(crate::upstream::UpstreamFailure),
+}
+
+impl LoadFailure {
+    /// Whether a kept answer may stand in: the call was refused or failed, or the upstream answered a 5xx.
+    pub fn allows_stale(&self) -> bool {
+        match self {
+            Self::Answered(answer) => answer.status.is_server_error(),
+            Self::Refused(_) | Self::Upstream(_) => true,
+        }
+    }
+}
+
+/// The key a load runs under: a `no-cache` load runs apart, so it never joins one that may answer from the cache.
+pub fn load_key(key: String, forced: bool) -> String {
+    if forced {
+        format!("{key} no-cache")
+    } else {
+        key
+    }
 }
 
 #[derive(Clone)]
@@ -191,7 +281,7 @@ impl AnswerCache {
         for (index, bytes) in missing.into_iter().zip(stored) {
             if let Some(entry) = bytes
                 .and_then(decode)
-                .filter(|entry| entry.is_stale(now_ms))
+                .filter(|entry| entry.can_stand_in(now_ms))
             {
                 let entry = Arc::new(entry);
                 self.entries.insert(
@@ -408,10 +498,7 @@ mod tests {
     }
 
     fn outcome(body: &'static str) -> Outcome {
-        Outcome {
-            loaded: Ok(entry(body)),
-            called: true,
-        }
+        Outcome::called(Ok(entry(body)))
     }
 
     #[tokio::test]

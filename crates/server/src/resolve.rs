@@ -20,9 +20,9 @@ use crate::{
     auth::Pool,
     batch::{self, Batch},
     cache::{Answer, Entry},
+    clock::{HOUR_MS, MINUTE_MS},
     error::ApiError,
-    modrinth,
-    passthrough::{self, HOUR_MS, MINUTE_MS},
+    modrinth, passthrough,
 };
 
 pub const CURSEFORGE_CDN: &str = "https://mediafilez.forgecdn.net";
@@ -179,7 +179,7 @@ struct VersionHashes {
     sha1: Option<String>,
 }
 
-struct Known {
+struct ListedFile {
     file_id: u64,
     file_name: Option<String>,
     size: Option<u64>,
@@ -264,14 +264,14 @@ pub async fn resolve(
         Ok(rows) => rows,
         Err(response) => return *response,
     };
-    let known: HashMap<u64, Known> = rows
+    let known: HashMap<u64, ListedFile> = rows
         .rows
         .iter()
         .filter_map(|(id, row)| {
             let row: FileRow = serde_json::from_slice(row).ok()?;
             Some((
                 *id,
-                Known {
+                ListedFile {
                     file_id: row.id,
                     file_name: row.file_name,
                     size: row.file_length,
@@ -279,14 +279,14 @@ pub async fn resolve(
                         .hashes
                         .iter()
                         .find(|hash| hash.algo == SHA1_ALGO)
-                        .and_then(|hash| modrinth::sha1_of(&hash.value)),
+                        .and_then(|hash| passthrough::sha1_of(&hash.value)),
                     download_url: row.download_url,
                 },
             ))
         })
         .collect();
 
-    let wanted: Vec<&Known> = ids
+    let wanted: Vec<&ListedFile> = ids
         .iter()
         .filter_map(|id| known.get(id))
         .filter(|file| file.download_url.is_none())
@@ -497,14 +497,7 @@ async fn head(
             },
             CDN_FOUND_MS,
         ),
-        None => (
-            Answer {
-                status: StatusCode::NOT_FOUND,
-                content_type: None,
-                body: Bytes::new(),
-            },
-            CDN_NOT_FOUND_MS,
-        ),
+        None => (Answer::not_found(), CDN_NOT_FOUND_MS),
     };
     state.cache.insert(
         &cdn_key(file_id, size),
@@ -644,7 +637,7 @@ mod tests {
                 .iter()
                 .all(|head| head.user_agent.as_deref() == Some(USER_AGENT))
         );
-        assert_eq!(gateway.state.budget.snapshot().await.used, 1);
+        assert_eq!(gateway.state.curseforge_budget.snapshot().await.used, 1);
 
         let again = resolve(&gateway, r#"{"fileIds":[1003,1004]}"#).await;
         assert_eq!(again.json()["files"][0]["source"], "curseforge-cdn");

@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -13,10 +12,14 @@ use redis::{Script, Value, aio::ConnectionManager};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::{app::AppState, error::ApiError, redis_store::RedisStore, upstream};
+use crate::{
+    app::AppState,
+    clock::{Clock, DAY_MS, MINUTE_MS},
+    error::ApiError,
+    redis_store::RedisStore,
+    upstream,
+};
 
-const MINUTE_MS: u64 = 60_000;
-const DAY_MS: u64 = 24 * 60 * MINUTE_MS;
 const HOLD_WHEN_NOT_TOLD_MS: u64 = 30_000;
 const SHORTEST_HOLD_MS: u64 = 1_000;
 const LONGEST_HOLD_MS: u64 = 10 * MINUTE_MS;
@@ -68,23 +71,6 @@ if tonumber(ARGV[1]) > held then
 end
 return 0
 ";
-
-/// Milliseconds since the Unix epoch. Swapped for a fixed clock in tests.
-pub trait Clock: Send + Sync {
-    fn now_ms(&self) -> u64;
-}
-
-pub struct SystemClock;
-
-impl Clock for SystemClock {
-    fn now_ms(&self) -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| {
-                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
-            })
-    }
-}
 
 /// Why calls were not let through: the minute's budget is spent, the upstream answered 429 and the hold has not ended,
 /// or the request needs more calls than a whole minute allows, which no retry can fix.
@@ -153,7 +139,8 @@ pub struct DayCounts {
 /// is not written to Redis yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
-pub enum Source {
+#[schema(as = Source)]
+pub enum CountSource {
     Redis,
     Memory,
     Unavailable,
@@ -165,7 +152,7 @@ pub enum Source {
 pub struct BudgetSnapshot {
     /// UTC days of daily counts the gateway keeps, the most `days` can cover.
     pub history_days: u32,
-    pub source: Source,
+    pub source: CountSource,
     /// The budget of calls on the CurseForge key.
     pub curseforge: UpstreamBudget,
     /// The budget of calls to Modrinth, which rate-limits the gateway's address.
@@ -193,7 +180,7 @@ pub struct UpstreamBudget {
     pub held_until: Option<String>,
     #[serde(skip)]
     #[schema(ignore)]
-    source: Source,
+    source: CountSource,
     /// Every pool of every consumer, this minute.
     pub pools: Vec<PoolSnapshot>,
     /// The UTC days asked for, today first; a day without a single count is left out.
@@ -380,10 +367,10 @@ impl Budget {
             None => None,
         };
         let (source, stored) = match &self.redis {
-            None => (Source::Memory, None),
+            None => (CountSource::Memory, None),
             Some(redis) => match self.read_redis(redis, now, &dates).await {
-                Some(stored) => (Source::Redis, Some(stored)),
-                None => (Source::Unavailable, None),
+                Some(stored) => (CountSource::Redis, Some(stored)),
+                None => (CountSource::Unavailable, None),
             },
         };
 
@@ -791,7 +778,7 @@ pub async fn readout(
         Ok(Query(HistoryQuery { days: Some(0) })) | Err(_) => return Err(ApiError::invalid_days()),
         Ok(Query(HistoryQuery { days })) => days.unwrap_or(DEFAULT_SNAPSHOT_DAYS),
     };
-    let curseforge = state.budget.history(days).await;
+    let curseforge = state.curseforge_budget.history(days).await;
     let modrinth = state.modrinth_budget.history(days).await;
     Ok(Json(BudgetSnapshot {
         history_days: curseforge.history_days,
@@ -893,13 +880,16 @@ fn utc_date(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{NOV_3_2026_20H, TestClock, TestRedis};
+    use crate::{
+        clock::TestClock,
+        test_support::{NOV_3_2026_20H, TestRedis},
+    };
 
     const POOLS: [(&str, &str); 3] = [("app", "launcher"), ("app", "app"), ("sandbox", "jobs")];
 
     struct Backends {
         redis: Option<TestRedis>,
-        budgets: Vec<(Source, Budget)>,
+        budgets: Vec<(CountSource, Budget)>,
     }
 
     impl Backends {
@@ -909,7 +899,7 @@ mod tests {
 
         fn keeping_days(limit: u32, clock: &Arc<TestClock>, days: u32) -> Self {
             let mut budgets = vec![(
-                Source::Memory,
+                CountSource::Memory,
                 Budget::new(
                     upstream::Source::CurseForge,
                     limit,
@@ -922,7 +912,7 @@ mod tests {
             let redis = TestRedis::from_env();
             if let Some(redis) = &redis {
                 budgets.push((
-                    Source::Redis,
+                    CountSource::Redis,
                     Budget::new(
                         upstream::Source::CurseForge,
                         limit,
@@ -1280,7 +1270,7 @@ mod tests {
 
         let after = open();
         let snapshot = after.snapshot().await;
-        assert_eq!(snapshot.source, Source::Redis);
+        assert_eq!(snapshot.source, CountSource::Redis);
         assert_eq!(snapshot.used, 3);
         assert_eq!(snapshot.pools[0].used, 3);
         assert_eq!(snapshot.held_until.as_deref(), Some("2026-11-03T20:01:00Z"));
@@ -1353,7 +1343,7 @@ mod tests {
             Some(redis.open()),
         );
         let snapshot = after.snapshot().await;
-        assert_eq!(snapshot.source, Source::Redis);
+        assert_eq!(snapshot.source, CountSource::Redis);
         assert_eq!(snapshot.days[0].pools[0].counts.calls, 1);
         redis.forget().await;
     }
@@ -1549,7 +1539,7 @@ mod tests {
         assert_eq!(budget.admit("app", "app", 1).await, Ok(()));
 
         let snapshot = budget.snapshot().await;
-        assert_eq!(snapshot.source, Source::Unavailable);
+        assert_eq!(snapshot.source, CountSource::Unavailable);
         assert_eq!(snapshot.used, 1);
         assert_eq!(
             snapshot.days[0].pools[0].counts,

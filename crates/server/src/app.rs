@@ -7,8 +7,9 @@ use axum::{
 
 use crate::{
     auth,
-    budget::{self, Budget, Clock},
+    budget::{self, Budget},
     cache::AnswerCache,
+    clock::Clock,
     config::{Config, Consumer},
     curseforge::{self, CURSEFORGE_API},
     health,
@@ -23,10 +24,10 @@ use crate::{
 pub struct AppState {
     pub consumers: Vec<Consumer>,
     /// The budget of calls on the CurseForge key.
-    pub budget: Budget,
+    pub curseforge_budget: Budget,
     /// The budget of calls to Modrinth.
     pub modrinth_budget: Budget,
-    pub upstream: Upstream,
+    pub curseforge: Upstream,
     pub modrinth: Upstream,
     pub cdn: Cdn,
     pub meta: Meta,
@@ -37,14 +38,14 @@ pub struct AppState {
 impl AppState {
     pub fn upstream_of(&self, source: Source) -> &Upstream {
         match source {
-            Source::CurseForge => &self.upstream,
+            Source::CurseForge => &self.curseforge,
             Source::Modrinth => &self.modrinth,
         }
     }
 
     pub fn budget_of(&self, source: Source) -> &Budget {
         match source {
-            Source::CurseForge => &self.budget,
+            Source::CurseForge => &self.curseforge_budget,
             Source::Modrinth => &self.modrinth_budget,
         }
     }
@@ -64,7 +65,7 @@ impl AppState {
         });
         let pools: Vec<(&str, &str)> = pools.collect();
         Ok(Self {
-            budget: Budget::new(
+            curseforge_budget: Budget::new(
                 Source::CurseForge,
                 config.budget_per_minute,
                 pools.iter().copied(),
@@ -80,7 +81,7 @@ impl AppState {
                 redis.clone(),
             )
             .keeping_days(config.budget_history_days),
-            upstream: Upstream::new(
+            curseforge: Upstream::new(
                 Source::CurseForge,
                 &addresses.curseforge_api,
                 Some(config.curseforge_api_key.clone()),
@@ -205,9 +206,10 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::clock::TestClock;
     use crate::test_support::{
-        self, KEY, Mock, NOV_3_2026_20H, Reply, TOKEN, TestClock, USER_AGENT, call, consumer,
-        reply, test_state,
+        self, KEY, Mock, NOV_3_2026_20H, Reply, TOKEN, USER_AGENT, call, consumer, reply,
+        test_state,
     };
 
     fn app() -> Router {

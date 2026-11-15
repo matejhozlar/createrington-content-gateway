@@ -18,8 +18,8 @@ use utoipa::{IntoParams, ToSchema};
 use crate::{
     app::AppState,
     cache::{AnswerCache, Entry, LoadFailure, Outcome},
+    clock::{DAY_MS, HOUR_MS},
     error::ApiError,
-    passthrough::{DAY_MS, HOUR_MS},
     upstream::{self, UpstreamFailure},
 };
 
@@ -361,25 +361,22 @@ async fn document(
                 }
                 Err(failure) => Err(LoadFailure::Upstream(failure)),
             };
-            state.cache.finish(
-                &key,
-                finisher,
-                Outcome {
-                    loaded,
-                    called: true,
-                },
-            );
+            state.cache.finish(&key, finisher, Outcome::called(loaded));
         });
     }
     let outcome = AnswerCache::wait(waiting).await;
     match outcome.map(|outcome| outcome.loaded) {
         Some(Ok(entry)) => Ok(entry.answer.body.clone()),
         Some(Err(LoadFailure::Upstream(failure))) => match cached {
-            Some(entry) if entry.is_stale(state.clock.now_ms()) => Ok(entry.answer.body.clone()),
+            Some(entry) if entry.can_stand_in(state.clock.now_ms()) => {
+                Ok(entry.answer.body.clone())
+            }
             _ => Err(failure),
         },
         _ => match cached {
-            Some(entry) if entry.is_stale(state.clock.now_ms()) => Ok(entry.answer.body.clone()),
+            Some(entry) if entry.can_stand_in(state.clock.now_ms()) => {
+                Ok(entry.answer.body.clone())
+            }
             _ => Err(UpstreamFailure::Unreachable),
         },
     }
@@ -928,7 +925,7 @@ mod tests {
         let bad = get(&gateway.router, "/v1/minecraft/versions?type=beta").await;
         assert_eq!(bad.status, StatusCode::BAD_REQUEST);
         assert_eq!(bad.json()["code"], "INVALID_QUERY");
-        assert_eq!(gateway.state.budget.snapshot().await.days, []);
+        assert_eq!(gateway.state.curseforge_budget.snapshot().await.days, []);
     }
 
     #[tokio::test]
@@ -1202,7 +1199,7 @@ mod tests {
         )
         .await;
         assert_eq!(mock.calls(), 2);
-        assert_eq!(gateway.state.budget.snapshot().await.days, []);
+        assert_eq!(gateway.state.curseforge_budget.snapshot().await.days, []);
     }
 
     #[tokio::test]

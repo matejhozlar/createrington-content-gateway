@@ -11,8 +11,9 @@ use crate::{
     app::AppState,
     auth::Pool,
     batch::Batch,
+    clock::{DAY_MS, HOUR_MS, MINUTE_MS},
     error::ApiError,
-    passthrough::{self, DAY_MS, Freshness, HOUR_MS, MINUTE_MS, fresh, is_id},
+    passthrough::{self, Freshness, fresh, is_id},
     upstream::Source,
 };
 
@@ -228,7 +229,7 @@ mod tests {
         assert_eq!(again.body, r#"{"data":{"id":1}}"#);
         assert_eq!(mock.calls(), 1);
 
-        let snapshot = gateway.state.budget.snapshot().await;
+        let snapshot = gateway.state.curseforge_budget.snapshot().await;
         assert_eq!(snapshot.used, 1);
         assert_eq!(snapshot.days[0].pools[0].counts.calls, 1);
         assert_eq!(snapshot.days[0].pools[0].counts.hits, 1);
@@ -360,7 +361,7 @@ mod tests {
         assert_eq!(caches, ["hit", "hit", "hit", "hit", "miss"]);
         assert_eq!(mock.calls(), 1);
         assert_eq!(
-            gateway.state.budget.snapshot().await.days[0].pools[0]
+            gateway.state.curseforge_budget.snapshot().await.days[0].pools[0]
                 .counts
                 .hits,
             4
@@ -386,7 +387,7 @@ mod tests {
         assert_eq!(mock.calls(), 1);
         assert_eq!(gateway.state.cache.loads_running(), 0);
         assert_eq!(
-            gateway.state.budget.snapshot().await.days[0].pools[0]
+            gateway.state.curseforge_budget.snapshot().await.days[0].pools[0]
                 .counts
                 .calls,
             1
@@ -447,7 +448,7 @@ mod tests {
         assert_eq!(held.json()["pool"], "launcher");
         assert_eq!(mock.calls(), 1);
         assert_eq!(
-            gateway.state.budget.snapshot().await.days[0].pools[0]
+            gateway.state.curseforge_budget.snapshot().await.days[0].pools[0]
                 .counts
                 .throttled,
             1
@@ -469,7 +470,7 @@ mod tests {
         assert_eq!(stale.status, StatusCode::OK);
         assert_eq!(stale.header("x-cache"), Some("stale"));
         assert_eq!(stale.body, r#"{"data":"old"}"#);
-        let snapshot = gateway.state.budget.snapshot().await;
+        let snapshot = gateway.state.curseforge_budget.snapshot().await;
         let counts = &snapshot.days[0].pools[0].counts;
         assert_eq!((counts.calls, counts.hits), (2, 1));
 
@@ -538,7 +539,7 @@ mod tests {
             ("POST", "/v1/mods")
         );
         assert_eq!(seen[0].body, r#"{"modIds":[1,2],"filterPcOnly":true}"#);
-        assert_eq!(gateway.state.budget.snapshot().await.used, 2);
+        assert_eq!(gateway.state.curseforge_budget.snapshot().await.used, 2);
     }
 
     #[tokio::test]
@@ -548,7 +549,7 @@ mod tests {
         get(&gateway.router, "/v1/curseforge/games").await;
         get(&gateway.router, "/v1/curseforge/games").await;
         assert_eq!(mock.calls(), 2);
-        assert_eq!(gateway.state.budget.snapshot().await.used, 2);
+        assert_eq!(gateway.state.curseforge_budget.snapshot().await.used, 2);
     }
 
     #[tokio::test]
@@ -585,7 +586,7 @@ mod tests {
         assert_eq!(got.status, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(got.json()["code"], "UPSTREAM_TIMEOUT");
         assert_eq!(
-            gateway.state.budget.snapshot().await.days[0].pools[0]
+            gateway.state.curseforge_budget.snapshot().await.days[0].pools[0]
                 .counts
                 .calls,
             1

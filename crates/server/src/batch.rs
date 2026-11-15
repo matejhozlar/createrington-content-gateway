@@ -14,12 +14,14 @@ use serde_json::value::RawValue;
 use crate::{
     app::AppState,
     auth::Pool,
-    cache::{Answer, AnswerCache, Entry, Finisher, LoadFailure, Outcome, Waiting},
+    cache::{
+        Answer, AnswerCache, CacheStatus, Entry, Finisher, LoadFailure, Outcome, Waiting, load_key,
+    },
     passthrough,
     upstream::{Source, UpstreamFailure},
 };
 
-use crate::passthrough::{HOUR_MS, MINUTE_MS};
+use crate::clock::{HOUR_MS, MINUTE_MS};
 
 const IDS_PER_CALL: usize = 100;
 
@@ -199,7 +201,7 @@ struct Mine {
 /// The kept rows of a batch and whether they were a `hit`, a `miss` or `stale`.
 pub struct Rows {
     pub rows: Vec<(u64, Bytes)>,
-    pub cache: &'static str,
+    pub cache: CacheStatus,
 }
 
 pub async fn answer(
@@ -220,14 +222,10 @@ pub async fn answer(
         Err(response) => return *response,
     };
     if batch.is_fingerprints() {
-        return passthrough::respond(&json(fingerprint_answer(&rows, &asked)), cache);
+        return passthrough::respond(&Answer::json(fingerprint_answer(&rows, &asked)), cache);
     }
     if rows.is_empty() {
-        let answer = Answer {
-            status: StatusCode::NOT_FOUND,
-            content_type: None,
-            body: Bytes::new(),
-        };
+        let answer = Answer::not_found();
         return passthrough::respond(&answer, cache);
     }
     let mut body =
@@ -235,7 +233,7 @@ pub async fn answer(
     body.extend_from_slice(b"{\"data\":[");
     join(&mut body, rows.iter().map(|(_, row)| row.as_ref()));
     body.extend_from_slice(b"]}");
-    passthrough::respond(&json(body), cache)
+    passthrough::respond(&Answer::json(body), cache)
 }
 
 /// The rows of these ids from the cache while fresh, the rest asked for 100 per call.
@@ -252,16 +250,12 @@ pub async fn rows(
     let mut slots = Vec::with_capacity(ids.len());
     let mut mine = Vec::new();
     for ((&id, key), kept) in ids.iter().zip(keys).zip(found) {
-        let kept = kept.filter(|entry| usable(entry));
+        let kept = kept.filter(|entry| entry.fits_a_batch());
         if !forced && let Some(entry) = kept.clone().filter(|entry| entry.is_fresh(now)) {
             slots.push((id, kept, Slot::Kept(entry)));
             continue;
         }
-        let load_key = if forced {
-            format!("{key} no-cache")
-        } else {
-            key
-        };
+        let load_key = load_key(key, forced);
         let (waiting, finisher) = state.cache.join(&load_key);
         let started = finisher.is_some();
         if let Some(finisher) = finisher {
@@ -293,7 +287,7 @@ pub async fn rows(
             },
         };
         let loaded = loaded.and_then(|entry| {
-            if usable(&entry) {
+            if entry.fits_a_batch() {
                 Ok(entry)
             } else {
                 Err(LoadFailure::Upstream(UpstreamFailure::Unreadable))
@@ -303,8 +297,8 @@ pub async fn rows(
             Ok(entry) => entry,
             Err(failure) => {
                 let now = state.clock.now_ms();
-                match kept.filter(|entry| entry.is_stale(now)) {
-                    Some(entry) if failed_upstream(&failure) => {
+                match kept.filter(|entry| entry.can_stand_in(now)) {
+                    Some(entry) if failure.allows_stale() => {
                         stale = true;
                         entry
                     }
@@ -324,26 +318,14 @@ pub async fn rows(
     }
 
     if !called {
-        state.budget.record_hit(&pool.consumer, &pool.name);
+        state
+            .curseforge_budget
+            .record_hit(&pool.consumer, &pool.name);
     }
     Ok(Rows {
         rows,
-        cache: if stale {
-            "stale"
-        } else if called {
-            "miss"
-        } else {
-            "hit"
-        },
+        cache: CacheStatus::of(stale, called),
     })
-}
-
-fn json(body: Vec<u8>) -> Answer {
-    Answer {
-        status: StatusCode::OK,
-        content_type: Some(HeaderValue::from_static("application/json; charset=utf-8")),
-        body: body.into(),
-    }
 }
 
 fn join<'a>(body: &mut Vec<u8>, parts: impl Iterator<Item = &'a [u8]>) {
@@ -373,30 +355,15 @@ fn fingerprint_answer(rows: &[(u64, Bytes)], asked: &[u64]) -> Vec<u8> {
     body
 }
 
-fn usable(entry: &Entry) -> bool {
-    entry.answer.status == StatusCode::NOT_FOUND || entry.row.is_some()
-}
-
-pub fn failed_upstream(failure: &LoadFailure) -> bool {
-    match failure {
-        LoadFailure::Answered(answer) => answer.status.is_server_error(),
-        LoadFailure::Refused(_) | LoadFailure::Upstream(_) => true,
-    }
-}
-
 async fn fetch(state: Arc<AppState>, pool: Pool, batch: Batch, mine: Vec<Mine>, forced: bool) {
     let mut missing = Vec::with_capacity(mine.len());
     for load in mine {
-        let kept = state
-            .cache
-            .get(&batch.key(load.id))
-            .filter(|entry| !forced && usable(entry) && entry.is_fresh(state.clock.now_ms()));
+        let kept = state.cache.get(&batch.key(load.id)).filter(|entry| {
+            !forced && entry.fits_a_batch() && entry.is_fresh(state.clock.now_ms())
+        });
         match kept {
             Some(entry) => {
-                let outcome = Outcome {
-                    loaded: Ok(entry),
-                    called: false,
-                };
+                let outcome = Outcome::not_called(Ok(entry));
                 state.cache.finish(&load.load_key, load.finisher, outcome);
             }
             None => missing.push(load),
@@ -407,12 +374,13 @@ async fn fetch(state: Arc<AppState>, pool: Pool, batch: Batch, mine: Vec<Mine>, 
     }
     let mine = missing;
     let calls = u32::try_from(mine.len().div_ceil(IDS_PER_CALL)).unwrap_or(u32::MAX);
-    if let Err(refusal) = state.budget.admit(&pool.consumer, &pool.name, calls).await {
+    if let Err(refusal) = state
+        .curseforge_budget
+        .admit(&pool.consumer, &pool.name, calls)
+        .await
+    {
         for load in mine {
-            let outcome = Outcome {
-                loaded: Err(LoadFailure::Refused(refusal)),
-                called: false,
-            };
+            let outcome = Outcome::not_called(Err(LoadFailure::Refused(refusal)));
             state.cache.finish(&load.load_key, load.finisher, outcome);
         }
         return;
@@ -454,15 +422,7 @@ async fn fetch_chunk(state: Arc<AppState>, pool: Pool, batch: Batch, chunk: Vec<
             Ok((rows, content_type)) => {
                 let entry = match rows.iter().find(|(id, _, _)| *id == load.id) {
                     Some((_, row, owner)) => kept_row(batch, row, *owner, content_type, now),
-                    None => Entry::new(
-                        Answer {
-                            status: StatusCode::NOT_FOUND,
-                            content_type: None,
-                            body: Bytes::new(),
-                        },
-                        now,
-                        batch.not_found_ms(),
-                    ),
+                    None => Entry::new(Answer::not_found(), now, batch.not_found_ms()),
                 };
                 let entry = Arc::new(entry);
                 state.cache.insert(&batch.key(load.id), entry.clone());
@@ -470,10 +430,7 @@ async fn fetch_chunk(state: Arc<AppState>, pool: Pool, batch: Batch, chunk: Vec<
             }
             Err(failure) => Err(failure.clone()),
         };
-        let outcome = Outcome {
-            loaded,
-            called: true,
-        };
+        let outcome = Outcome::called(loaded);
         state.cache.finish(&load.load_key, load.finisher, outcome);
     }
 }
@@ -701,7 +658,7 @@ mod tests {
         );
         assert_eq!(mock.calls(), 1);
         assert_eq!(
-            gateway.state.budget.snapshot().await.days[0].pools[0]
+            gateway.state.curseforge_budget.snapshot().await.days[0].pools[0]
                 .counts
                 .hits,
             3
@@ -739,7 +696,7 @@ mod tests {
             .collect();
         sizes.sort_unstable();
         assert_eq!(sizes, [50, 100, 100]);
-        let snapshot = gateway.state.budget.snapshot().await;
+        let snapshot = gateway.state.curseforge_budget.snapshot().await;
         assert_eq!(
             (snapshot.used, snapshot.days[0].pools[0].counts.calls),
             (3, 3)
@@ -933,7 +890,7 @@ mod tests {
             Bytes::from(mod_row(1))
         );
         assert_eq!(mock.calls(), 1);
-        assert_eq!(gateway.state.budget.snapshot().await.used, 1);
+        assert_eq!(gateway.state.curseforge_budget.snapshot().await.used, 1);
     }
 
     #[tokio::test]
