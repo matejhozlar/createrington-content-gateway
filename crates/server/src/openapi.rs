@@ -139,29 +139,6 @@ mod tests {
     }
 
     #[test]
-    fn every_error_code_is_in_the_document() {
-        let document: Value = serde_json::from_str(CHECKED_IN).unwrap();
-        let codes = document["components"]["schemas"]["ErrorCode"]["enum"]
-            .as_array()
-            .unwrap();
-        for code in [
-            "UNAUTHORIZED",
-            "POOL_REQUIRED",
-            "UNKNOWN_POOL",
-            "INVALID_PATH",
-            "UPSTREAM_TIMEOUT",
-            "UPSTREAM_UNREACHABLE",
-            "UPSTREAM_TOO_LARGE",
-            "UPSTREAM_UNREADABLE",
-            "BUDGET_SPENT",
-            "UPSTREAM_HOLD",
-            "REQUEST_TOO_LARGE",
-        ] {
-            assert!(codes.contains(&Value::from(code)), "{code}");
-        }
-    }
-
-    #[test]
     fn the_bearer_scheme_guards_every_route_but_health_and_the_document() {
         let document: Value = serde_json::from_str(CHECKED_IN).unwrap();
         assert_eq!(

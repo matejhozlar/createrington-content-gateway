@@ -92,10 +92,11 @@ export interface paths {
       cookie?: never;
     };
     /**
-     * A loader's builds, newest first: NeoForge from its Maven, Forge's promoted builds (the recommended and the
-     *     latest per Minecraft version, which is what pickers show), Fabric's loaders from its meta. `minecraft` keeps
-     *     only the builds for that version; for Fabric, whose loader is not tied to one, that means all of them when
-     *     Fabric supports the version and none otherwise. Each list is kept for an hour.
+     * A loader's builds, newest first.
+     * @description NeoForge's come from its Maven, Forge's are its promoted builds (the recommended and the latest per Minecraft
+     *     version, which is what pickers show), Fabric's are the loaders from its meta. `minecraft` keeps only the builds
+     *     for that version; for Fabric, whose loader is not tied to one, that means all of them when Fabric supports the
+     *     version and none otherwise. Each list is kept for an hour.
      */
     get: operations["loader_versions"];
     put?: never;
@@ -201,9 +202,11 @@ export interface paths {
     get?: never;
     put?: never;
     /**
-     * A download address for each CurseForge file: CurseForge's own link, else Modrinth's copy of the file found by
-     *     its SHA-1, else the file's built address on CurseForge's CDN when a HEAD answers 200 with the file's size.
-     * @description The files are read from the cache like `POST /v1/curseforge/mods/files`, and the CurseForge calls for the ones
+     * A download address for each CurseForge file.
+     * @description The address is CurseForge's own link, else Modrinth's copy of the file found by its SHA-1, else the file's built
+     *     address on CurseForge's CDN when a HEAD answers 200 with the file's size.
+     *
+     *     The files are read from the cache like `POST /v1/curseforge/mods/files`, and the CurseForge calls for the ones
      *     not kept count against the budget. Modrinth answers and CDN verdicts are kept for an hour, misses for 10
      *     minutes. No bytes pass through the gateway: the consumer downloads from the address given. A null `source` with
      *     `retry` false means no source has the file; `retry` true means a source could not be asked this time. At worst
@@ -250,12 +253,12 @@ export interface components {
     DayCounts: {
       /**
        * Format: int64
-       * @description Calls that reached CurseForge.
+       * @description Calls that reached the upstream.
        */
       calls: number;
       /**
        * Format: int64
-       * @description Calls CurseForge answered 403.
+       * @description Calls the upstream answered 403.
        */
       forbidden: number;
       /**
@@ -265,7 +268,7 @@ export interface components {
       hits: number;
       /**
        * Format: int64
-       * @description Calls CurseForge answered 429.
+       * @description Calls the upstream answered 429.
        */
       throttled: number;
       /**
@@ -517,7 +520,7 @@ export interface components {
     /** @description The body of `POST /v1/modrinth/version_files`. */
     VersionFilesRequest: {
       /**
-       * @description Only `sha1` is supported.
+       * @description `sha1`, kept per hash. Any other algorithm sends the body to Modrinth as it came, uncached.
        * @example sha1
        */
       algorithm?: string;
@@ -1068,7 +1071,7 @@ export interface operations {
       };
       path: {
         /**
-         * @description The path under `api.modrinth.com/v2/`, such as `search`, `project/sodium` or `version_file/{sha1}`: segments of letters, digits, `-` and `_`
+         * @description The path under `api.modrinth.com/v2/`, such as `search`, `project/sodium` or `version_file/{sha1}`: segments of letters, digits, `-`, `_` and any of `.+!()~',@$`
          * @example search
          */
         path: string;
@@ -1155,7 +1158,7 @@ export interface operations {
       };
       path: {
         /**
-         * @description The path under `api.modrinth.com/v2/`, such as `version_files` or `version_files/update`: segments of letters, digits, `-` and `_`
+         * @description The path under `api.modrinth.com/v2/`, such as `version_files` or `version_files/update`: segments of letters, digits, `-`, `_` and any of `.+!()~',@$`
          * @example version_files
          */
         path: string;
@@ -1180,7 +1183,7 @@ export interface operations {
           "application/json": unknown;
         };
       };
-      /** @description `INVALID_PATH`, `INVALID_BODY` (no hashes, more than 1000, or another algorithm), `INVALID_HASH`, `POOL_REQUIRED` or `UNKNOWN_POOL` */
+      /** @description `INVALID_PATH`, `INVALID_BODY` (no hashes or more than 1000), `INVALID_HASH`, `POOL_REQUIRED` or `UNKNOWN_POOL` */
       400: {
         headers: {
           [name: string]: unknown;

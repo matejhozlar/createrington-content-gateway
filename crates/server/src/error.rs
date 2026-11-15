@@ -6,7 +6,11 @@ use axum::{
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::{budget::Refusal, upstream::UpstreamFailure};
+use crate::{
+    budget::Refusal,
+    passthrough::MODRINTH_SLUG_CHARACTERS,
+    upstream::{Source, UpstreamFailure},
+};
 
 /// What went wrong, for a consumer to branch on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
@@ -83,11 +87,18 @@ impl ApiError {
         }
     }
 
-    pub fn invalid_path() -> Self {
+    pub fn invalid_path(source: Source) -> Self {
+        let extra = match source {
+            Source::CurseForge => String::new(),
+            Source::Modrinth => format!(" and any of {MODRINTH_SLUG_CHARACTERS}"),
+        };
         Self::new(
             StatusCode::BAD_REQUEST,
             ErrorCode::InvalidPath,
-            "a CurseForge path is segments of letters, digits, - and _, separated by single slashes",
+            format!(
+                "a {} path is segments of letters, digits, - and _{extra}, separated by single slashes",
+                source.name()
+            ),
         )
     }
 
@@ -167,20 +178,18 @@ impl ApiError {
             UpstreamFailure::Unreadable => Self::new(
                 StatusCode::BAD_GATEWAY,
                 ErrorCode::UpstreamUnreadable,
-                format!(
-                    "{source} answered a batch with something other than rows the gateway can keep"
-                ),
+                format!("{source} answered with something the gateway cannot read"),
             ),
         }
     }
 
-    pub fn refused(refusal: Refusal, pool: &str) -> Self {
+    pub fn refused(refusal: Refusal, pool: &str, source: &str) -> Self {
         let (error, retry_after_ms) = match refusal {
             Refusal::Spent { retry_after_ms } => (
                 Self::new(
                     StatusCode::SERVICE_UNAVAILABLE,
                     ErrorCode::BudgetSpent,
-                    "the gateway has asked CurseForge enough this minute",
+                    format!("the gateway has asked {source} enough this minute"),
                 ),
                 Some(retry_after_ms),
             ),
@@ -188,7 +197,7 @@ impl ApiError {
                 Self::new(
                     StatusCode::SERVICE_UNAVAILABLE,
                     ErrorCode::UpstreamHold,
-                    "CurseForge answered 429, every call waits until the hold ends",
+                    format!("{source} answered 429, every call waits until the hold ends"),
                 ),
                 Some(retry_after_ms),
             ),
@@ -200,7 +209,7 @@ impl ApiError {
                     StatusCode::PAYLOAD_TOO_LARGE,
                     ErrorCode::RequestTooLarge,
                     format!(
-                        "this request needs {calls} calls to CurseForge, more than the {limit_per_minute} a minute allows; split it"
+                        "this request needs {calls} calls to {source}, more than the {limit_per_minute} a minute allows; split it"
                     ),
                 ),
                 None,
@@ -290,6 +299,7 @@ mod tests {
                 retry_after_ms: 12_300,
             },
             "launcher",
+            "CurseForge",
         ))
         .await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -313,6 +323,7 @@ mod tests {
                 limit_per_minute: 300,
             },
             "jobs",
+            "CurseForge",
         ))
         .await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
@@ -327,6 +338,7 @@ mod tests {
         let (_, headers, body) = parts(ApiError::refused(
             Refusal::Hold { retry_after_ms: 40 },
             "jobs",
+            "Modrinth",
         ))
         .await;
         assert_eq!(headers[header::RETRY_AFTER], "1");
