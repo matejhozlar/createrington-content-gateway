@@ -193,7 +193,8 @@ impl Config {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
 
-    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
+    /// Reads the configuration from `lookup`, which gives a variable's value by its name.
+    pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let lookup = |name: &str| set(lookup(name));
         let host = match lookup(HOST_ENV) {
             Some(value) => value.parse().map_err(|_| ConfigError::Host {

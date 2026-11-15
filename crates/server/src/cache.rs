@@ -381,6 +381,7 @@ fn decode(bytes: Vec<u8>) -> Option<Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestRedis;
 
     fn entry(body: &'static str) -> Arc<Entry> {
         Arc::new(Entry::new(
@@ -479,18 +480,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs CONTENT_GATEWAY_TEST_REDIS_URL"]
     async fn entries_survive_in_redis_for_a_new_cache() {
-        let Ok(url) = std::env::var("CONTENT_GATEWAY_TEST_REDIS_URL") else {
-            eprintln!("CONTENT_GATEWAY_TEST_REDIS_URL is not set, skipped");
-            return;
-        };
-        let prefix = format!("content-gateway-test:cache:{}", std::process::id());
-        let open = || Arc::new(RedisStore::open(&url, prefix.clone()).unwrap());
-        let kept = AnswerCache::new(Some(open()));
+        let redis = TestRedis::required();
+        let kept = AnswerCache::new(Some(redis.open()));
         kept.insert("mod:1", entry("one"));
         kept.insert("mod:2", entry("two"));
 
-        let store = open();
+        let store = redis.open();
         let stored = vec![store.key("cache:mod:1"), store.key("cache:mod:2")];
         for _ in 0..100 {
             let keys = stored.clone();
@@ -531,15 +528,7 @@ mod tests {
             [Some(Bytes::from("two")), None, Some(Bytes::from("one"))]
         );
         assert!(after_restart.get("mod:1").is_some());
-
-        store
-            .run(|mut connection| async move {
-                redis::cmd("DEL")
-                    .arg(stored)
-                    .query_async::<()>(&mut connection)
-                    .await
-            })
-            .await;
+        redis.forget().await;
     }
 
     #[tokio::test]

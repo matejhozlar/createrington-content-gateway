@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Router, middleware,
@@ -7,7 +7,7 @@ use axum::{
 
 use crate::{
     auth,
-    budget::{self, Budget, Clock, SystemClock},
+    budget::{self, Budget, Clock},
     cache::AnswerCache,
     config::{Config, Consumer},
     curseforge::{self, CURSEFORGE_API},
@@ -49,7 +49,13 @@ impl AppState {
         }
     }
 
-    pub fn from_config(config: &Config, redis: Option<Arc<RedisStore>>) -> reqwest::Result<Self> {
+    pub fn new(
+        config: &Config,
+        addresses: &Addresses,
+        timeouts: Timeouts,
+        clock: Arc<dyn Clock>,
+        redis: Option<Arc<RedisStore>>,
+    ) -> reqwest::Result<Self> {
         let pools = config.consumers.iter().flat_map(|consumer| {
             consumer
                 .pools
@@ -57,7 +63,6 @@ impl AppState {
                 .map(|pool| (consumer.name.as_str(), pool.as_str()))
         });
         let pools: Vec<(&str, &str)> = pools.collect();
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         Ok(Self {
             budget: Budget::new(
                 Source::CurseForge,
@@ -77,31 +82,76 @@ impl AppState {
             .keeping_days(config.budget_history_days),
             upstream: Upstream::new(
                 Source::CurseForge,
-                CURSEFORGE_API,
+                &addresses.curseforge_api,
                 Some(config.curseforge_api_key.clone()),
                 &config.user_agent,
-                curseforge::TIMEOUT,
+                timeouts.curseforge,
             )?,
             modrinth: Upstream::new(
                 Source::Modrinth,
-                MODRINTH_API,
+                &addresses.modrinth_api,
                 None,
                 &config.user_agent,
-                modrinth::TIMEOUT,
+                timeouts.modrinth,
             )?,
-            cdn: Cdn::new(CURSEFORGE_CDN, &config.user_agent, resolve::CDN_TIMEOUT)?,
+            cdn: Cdn::new(&addresses.curseforge_cdn, &config.user_agent, timeouts.cdn)?,
             meta: Meta::new(
-                MOJANG_META,
-                NEOFORGE_MAVEN,
-                FORGE_FILES,
-                FABRIC_META,
+                &addresses.mojang_meta,
+                &addresses.neoforge_maven,
+                &addresses.forge_files,
+                &addresses.fabric_meta,
                 &config.user_agent,
-                versions::TIMEOUT,
+                timeouts.meta,
             )?,
             cache: AnswerCache::new(redis),
             clock,
             consumers: config.consumers.clone(),
         })
+    }
+}
+
+/// Where each upstream client sends its calls.
+pub struct Addresses {
+    pub curseforge_api: String,
+    pub modrinth_api: String,
+    pub curseforge_cdn: String,
+    pub mojang_meta: String,
+    pub neoforge_maven: String,
+    pub forge_files: String,
+    pub fabric_meta: String,
+}
+
+impl Default for Addresses {
+    fn default() -> Self {
+        Self {
+            curseforge_api: CURSEFORGE_API.to_owned(),
+            modrinth_api: MODRINTH_API.to_owned(),
+            curseforge_cdn: CURSEFORGE_CDN.to_owned(),
+            mojang_meta: MOJANG_META.to_owned(),
+            neoforge_maven: NEOFORGE_MAVEN.to_owned(),
+            forge_files: FORGE_FILES.to_owned(),
+            fabric_meta: FABRIC_META.to_owned(),
+        }
+    }
+}
+
+/// How long each upstream client waits for an answer.
+#[derive(Debug, Clone, Copy)]
+pub struct Timeouts {
+    pub curseforge: Duration,
+    pub modrinth: Duration,
+    pub cdn: Duration,
+    pub meta: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            curseforge: curseforge::TIMEOUT,
+            modrinth: modrinth::TIMEOUT,
+            cdn: resolve::CDN_TIMEOUT,
+            meta: versions::TIMEOUT,
+        }
     }
 }
 
@@ -140,101 +190,35 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 #[cfg(test)]
-pub(crate) fn test_state(consumers: Vec<Consumer>) -> Arc<AppState> {
-    let pools: Vec<(String, String)> = consumers
-        .iter()
-        .flat_map(|consumer| {
-            consumer
-                .pools
-                .iter()
-                .map(|pool| (consumer.name.clone(), pool.clone()))
-        })
-        .collect();
-    Arc::new(AppState {
-        budget: Budget::new(
-            Source::CurseForge,
-            300,
-            pools.clone(),
-            Arc::new(SystemClock),
-            None,
-        ),
-        modrinth_budget: Budget::new(Source::Modrinth, 300, pools, Arc::new(SystemClock), None),
-        upstream: Upstream::new(
-            Source::CurseForge,
-            "http://127.0.0.1:9/v1",
-            Some(crate::config::ApiKey::new("unused")),
-            crate::config::DEFAULT_USER_AGENT,
-            curseforge::TIMEOUT,
-        )
-        .unwrap(),
-        modrinth: Upstream::new(
-            Source::Modrinth,
-            "http://127.0.0.1:9/v2",
-            None,
-            crate::config::DEFAULT_USER_AGENT,
-            modrinth::TIMEOUT,
-        )
-        .unwrap(),
-        cdn: Cdn::new(
-            "http://127.0.0.1:9",
-            crate::config::DEFAULT_USER_AGENT,
-            resolve::CDN_TIMEOUT,
-        )
-        .unwrap(),
-        meta: Meta::new(
-            "http://127.0.0.1:9",
-            "http://127.0.0.1:9",
-            "http://127.0.0.1:9",
-            "http://127.0.0.1:9",
-            crate::config::DEFAULT_USER_AGENT,
-            versions::TIMEOUT,
-        )
-        .unwrap(),
-        cache: AnswerCache::default(),
-        clock: Arc::new(SystemClock),
-        consumers,
-    })
-}
-
-#[cfg(test)]
 mod tests {
     use axum::{
         body::Body,
-        http::{Request, StatusCode, header},
+        http::{Request, StatusCode},
     };
-    use http_body_util::BodyExt;
     use serde_json::Value;
-    use tower::ServiceExt;
 
     use super::*;
-    use crate::config::Token;
-
-    const TOKEN: &str = "app-token-0123456789abcdef0123456789";
+    use crate::test_support::{
+        self, KEY, Mock, NOV_3_2026_20H, TOKEN, TestClock, USER_AGENT, addresses_at, call,
+        consumer, reply, test_state,
+    };
 
     fn app() -> Router {
-        router(test_state(vec![Consumer {
-            name: "app".to_owned(),
-            token: Token::new(TOKEN),
-            pools: vec!["launcher".to_owned(), "app".to_owned()],
-        }]))
+        router(test_state(vec![consumer(
+            "app",
+            TOKEN,
+            &["launcher", "app"],
+        )]))
     }
 
     async fn get(uri: &str, token: Option<&str>) -> (StatusCode, Option<String>, Vec<u8>) {
-        let mut request = Request::get(uri);
-        if let Some(token) = token {
-            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
-        }
-        let response = app()
-            .oneshot(request.body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let status = response.status();
-        let content_type = response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .map(|value| value.to_str().unwrap().to_owned());
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        (status, content_type, body.to_vec())
+        let got = match token {
+            Some(TOKEN) => test_support::get(&app(), uri).await,
+            Some(other) => panic!("no consumer has the token {other}"),
+            None => call(&app(), Request::get(uri).body(Body::empty()).unwrap()).await,
+        };
+        let content_type = got.header("content-type").map(str::to_owned);
+        (got.status, content_type, got.body.to_vec())
     }
 
     #[tokio::test]
@@ -302,6 +286,69 @@ mod tests {
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["code"], "INVALID_DAYS", "{query}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_config_gives_each_client_its_key_and_user_agent_and_sets_the_budgets() {
+        let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "{}")).await;
+        let config = Config::from_lookup(|name| {
+            let value = match name {
+                "CURSEFORGE_API_KEY" => KEY,
+                "CONTENT_GATEWAY_TOKEN" => TOKEN,
+                "CONTENT_GATEWAY_USER_AGENT" => USER_AGENT,
+                "CONTENT_GATEWAY_BUDGET_PER_MINUTE" => "7",
+                "CONTENT_GATEWAY_MODRINTH_PER_MINUTE" => "8",
+                "CONTENT_GATEWAY_BUDGET_HISTORY_DAYS" => "30",
+                _ => return None,
+            };
+            Some(value.to_owned())
+        })
+        .unwrap();
+        let state = AppState::new(
+            &config,
+            &addresses_at(&mock.base),
+            Timeouts::default(),
+            TestClock::at(NOV_3_2026_20H),
+            None,
+        )
+        .unwrap();
+        let app = router(Arc::new(state));
+
+        for uri in [
+            "/v1/curseforge/mods/1",
+            "/v1/modrinth/project/jei",
+            "/v1/minecraft/versions",
+        ] {
+            test_support::get(&app, uri).await;
+        }
+        let seen: Vec<(String, Option<String>, Option<String>)> = mock
+            .seen()
+            .into_iter()
+            .map(|seen| (seen.uri, seen.key, seen.user_agent))
+            .collect();
+        let user_agent = Some(USER_AGENT.to_owned());
+        assert_eq!(
+            seen,
+            [
+                (
+                    "/v1/mods/1".to_owned(),
+                    Some(KEY.to_owned()),
+                    user_agent.clone()
+                ),
+                ("/v2/project/jei".to_owned(), None, user_agent.clone()),
+                (
+                    "/mc/game/version_manifest_v2.json".to_owned(),
+                    None,
+                    user_agent
+                ),
+            ]
+        );
+
+        let budget = test_support::get(&app, "/v1/budget").await.json();
+        assert_eq!(budget["historyDays"], 30);
+        assert_eq!(budget["curseforge"]["limitPerMinute"], 7);
+        assert_eq!(budget["modrinth"]["limitPerMinute"], 8);
+        assert_eq!(budget["curseforge"]["pools"][0]["consumer"], "default");
     }
 
     #[tokio::test]

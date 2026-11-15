@@ -578,7 +578,7 @@ mod tests {
     use axum::http::Request;
 
     use super::*;
-    use crate::{curseforge::TIMEOUT, redis_store::RedisStore, test_support::*};
+    use crate::test_support::*;
 
     fn ids_in(body: &str) -> Vec<u64> {
         let body: serde_json::Value = serde_json::from_str(body).unwrap();
@@ -640,10 +640,6 @@ mod tests {
         }
     }
 
-    async fn post(gateway: &Gateway, uri: &str, body: &str) -> Got {
-        send(&gateway.router, Request::post(uri), body).await
-    }
-
     fn many(count: u64) -> String {
         let ids: Vec<String> = (1..=count).map(|id| id.to_string()).collect();
         format!(r#"{{"modIds":[{}]}}"#, ids.join(","))
@@ -652,9 +648,9 @@ mod tests {
     #[tokio::test]
     async fn asks_for_each_id_once_and_answers_in_the_order_asked() {
         let mock = Mock::start(Duration::ZERO, curseforge).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-        let got = post(
-            &gateway,
+        let gateway = gateway(&mock);
+        let got = post_json(
+            &gateway.router,
             "/v1/curseforge/mods",
             r#"{"modIds":[2,1,1000,2]}"#,
         )
@@ -675,10 +671,20 @@ mod tests {
     #[tokio::test]
     async fn kept_rows_answer_later_batches_and_the_single_route() {
         let mock = Mock::start(Duration::ZERO, curseforge).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-        post(&gateway, "/v1/curseforge/mods", r#"{"modIds":[1,2,1000]}"#).await;
+        let gateway = gateway(&mock);
+        post_json(
+            &gateway.router,
+            "/v1/curseforge/mods",
+            r#"{"modIds":[1,2,1000]}"#,
+        )
+        .await;
 
-        let again = post(&gateway, "/v1/curseforge/mods", r#"{"modIds":[2,1000,1]}"#).await;
+        let again = post_json(
+            &gateway.router,
+            "/v1/curseforge/mods",
+            r#"{"modIds":[2,1000,1]}"#,
+        )
+        .await;
         assert_eq!(again.header("x-cache"), Some("hit"));
         assert_eq!(
             again.body,
@@ -705,9 +711,14 @@ mod tests {
     #[tokio::test]
     async fn only_the_ids_not_kept_are_asked_for() {
         let mock = Mock::start(Duration::ZERO, curseforge).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         get(&gateway.router, "/v1/curseforge/mods/1").await;
-        let got = post(&gateway, "/v1/curseforge/mods", r#"{"modIds":[1,2]}"#).await;
+        let got = post_json(
+            &gateway.router,
+            "/v1/curseforge/mods",
+            r#"{"modIds":[1,2]}"#,
+        )
+        .await;
         assert_eq!(
             got.body,
             format!(r#"{{"data":[{},{}]}}"#, mod_row(1), mod_row(2))
@@ -718,8 +729,8 @@ mod tests {
     #[tokio::test]
     async fn counts_one_call_per_hundred_ids_asked_for() {
         let mock = Mock::start(Duration::ZERO, curseforge).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-        let got = post(&gateway, "/v1/curseforge/mods", &many(250)).await;
+        let gateway = gateway(&mock);
+        let got = post_json(&gateway.router, "/v1/curseforge/mods", &many(250)).await;
         assert_eq!(got.status, StatusCode::OK);
         let mut sizes: Vec<usize> = mock
             .seen()
@@ -738,8 +749,14 @@ mod tests {
     #[tokio::test]
     async fn a_batch_larger_than_a_minute_allows_is_refused_whole() {
         let mock = Mock::start(Duration::ZERO, curseforge).await;
-        let gateway = gateway(&mock, 2, TIMEOUT);
-        let got = post(&gateway, "/v1/curseforge/mods", &many(250)).await;
+        let gateway = gateway_with(
+            &mock,
+            GatewayWith {
+                limit: 2,
+                ..GatewayWith::default()
+            },
+        );
+        let got = post_json(&gateway.router, "/v1/curseforge/mods", &many(250)).await;
         assert_eq!(got.status, StatusCode::PAYLOAD_TOO_LARGE);
         assert_eq!(got.json()["code"], "REQUEST_TOO_LARGE");
         assert_eq!(mock.calls(), 0);
@@ -748,9 +765,14 @@ mod tests {
     #[tokio::test]
     async fn a_batch_of_unknown_ids_is_a_kept_404_without_a_body() {
         let mock = Mock::start(Duration::ZERO, curseforge).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         for cache in ["miss", "hit"] {
-            let got = post(&gateway, "/v1/curseforge/mods", r#"{"modIds":[1000,1001]}"#).await;
+            let got = post_json(
+                &gateway.router,
+                "/v1/curseforge/mods",
+                r#"{"modIds":[1000,1001]}"#,
+            )
+            .await;
             assert_eq!(
                 (got.status, got.header("x-cache")),
                 (StatusCode::NOT_FOUND, Some(cache))
@@ -763,9 +785,9 @@ mod tests {
     #[tokio::test]
     async fn a_kept_file_answers_the_single_route_only_under_its_own_project() {
         let mock = Mock::start(Duration::ZERO, curseforge).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-        post(
-            &gateway,
+        let gateway = gateway(&mock);
+        post_json(
+            &gateway.router,
             "/v1/curseforge/mods/files",
             r#"{"fileIds":[50,51]}"#,
         )
@@ -785,9 +807,14 @@ mod tests {
     #[tokio::test]
     async fn a_file_from_the_single_route_answers_a_later_batch() {
         let mock = Mock::start(Duration::ZERO, curseforge).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         get(&gateway.router, "/v1/curseforge/mods/5/files/50").await;
-        let got = post(&gateway, "/v1/curseforge/mods/files", r#"{"fileIds":[50]}"#).await;
+        let got = post_json(
+            &gateway.router,
+            "/v1/curseforge/mods/files",
+            r#"{"fileIds":[50]}"#,
+        )
+        .await;
         assert_eq!(got.header("x-cache"), Some("hit"));
         assert_eq!(got.body, format!(r#"{{"data":[{}]}}"#, file_row(50)));
         assert_eq!(mock.calls(), 1);
@@ -796,13 +823,13 @@ mod tests {
     #[tokio::test]
     async fn a_batch_joins_a_single_lookup_already_running() {
         let mock = Mock::start(Duration::from_millis(200), curseforge).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         let single = {
             let router = gateway.router.clone();
             tokio::spawn(async move { get(&router, "/v1/curseforge/mods/1").await })
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let got = post(&gateway, "/v1/curseforge/mods", r#"{"modIds":[1]}"#).await;
+        let got = post_json(&gateway.router, "/v1/curseforge/mods", r#"{"modIds":[1]}"#).await;
         single.await.unwrap();
         assert_eq!(got.header("x-cache"), Some("hit"));
         assert_eq!(got.body, format!(r#"{{"data":[{}]}}"#, mod_row(1)));
@@ -816,11 +843,21 @@ mod tests {
             _ => reply(503, "unavailable"),
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-        post(&gateway, "/v1/curseforge/mods", r#"{"modIds":[1,2]}"#).await;
+        let gateway = gateway(&mock);
+        post_json(
+            &gateway.router,
+            "/v1/curseforge/mods",
+            r#"{"modIds":[1,2]}"#,
+        )
+        .await;
         gateway.clock.advance(2 * HOUR_MS);
 
-        let stale = post(&gateway, "/v1/curseforge/mods", r#"{"modIds":[1,2]}"#).await;
+        let stale = post_json(
+            &gateway.router,
+            "/v1/curseforge/mods",
+            r#"{"modIds":[1,2]}"#,
+        )
+        .await;
         assert_eq!(
             (stale.status, stale.header("x-cache")),
             (StatusCode::OK, Some("stale"))
@@ -830,7 +867,12 @@ mod tests {
             format!(r#"{{"data":[{},{}]}}"#, mod_row(1), mod_row(2))
         );
 
-        let failed = post(&gateway, "/v1/curseforge/mods", r#"{"modIds":[1,3]}"#).await;
+        let failed = post_json(
+            &gateway.router,
+            "/v1/curseforge/mods",
+            r#"{"modIds":[1,3]}"#,
+        )
+        .await;
         assert_eq!(failed.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(failed.body, "unavailable");
     }
@@ -838,8 +880,13 @@ mod tests {
     #[tokio::test]
     async fn no_cache_asks_for_every_id_again() {
         let mock = Mock::start(Duration::ZERO, curseforge).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-        post(&gateway, "/v1/curseforge/mods", r#"{"modIds":[1,2]}"#).await;
+        let gateway = gateway(&mock);
+        post_json(
+            &gateway.router,
+            "/v1/curseforge/mods",
+            r#"{"modIds":[1,2]}"#,
+        )
+        .await;
         let forced = send(
             &gateway.router,
             Request::post("/v1/curseforge/mods").header("cache-control", "no-cache"),
@@ -853,7 +900,7 @@ mod tests {
     #[tokio::test]
     async fn an_id_kept_meanwhile_is_neither_asked_for_nor_counted() {
         let mock = Mock::start(Duration::ZERO, curseforge).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         get(&gateway.router, "/v1/curseforge/mods/1").await;
 
         let (waiting, finisher) = gateway.state.cache.join("mod:1");
@@ -884,13 +931,13 @@ mod tests {
             reply(200, r#"{"error":"not a project"}"#)
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         let single = {
             let router = gateway.router.clone();
             tokio::spawn(async move { get(&router, "/v1/curseforge/mods/1").await })
         };
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let got = post(&gateway, "/v1/curseforge/mods", r#"{"modIds":[1]}"#).await;
+        let got = post_json(&gateway.router, "/v1/curseforge/mods", r#"{"modIds":[1]}"#).await;
         assert_eq!(single.await.unwrap().status, StatusCode::OK);
         assert_eq!(got.status, StatusCode::BAD_GATEWAY);
         assert_eq!(got.json()["code"], "UPSTREAM_UNREADABLE");
@@ -954,9 +1001,9 @@ mod tests {
     #[tokio::test]
     async fn rebuilds_a_fingerprint_answer_from_what_each_fingerprint_matched() {
         let mock = Mock::start(Duration::ZERO, fingerprint_api).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-        let got = post(
-            &gateway,
+        let gateway = gateway(&mock);
+        let got = post_json(
+            &gateway.router,
             "/v1/curseforge/fingerprints/432",
             r#"{"fingerprints":[2,150,2,999]}"#,
         )
@@ -973,24 +1020,24 @@ mod tests {
     #[tokio::test]
     async fn kept_fingerprints_answer_later_lookups_in_any_order() {
         let mock = Mock::start(Duration::ZERO, fingerprint_api).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-        post(
-            &gateway,
+        let gateway = gateway(&mock);
+        post_json(
+            &gateway.router,
             "/v1/curseforge/fingerprints/432",
             r#"{"fingerprints":[2,150,999]}"#,
         )
         .await;
 
-        let again = post(
-            &gateway,
+        let again = post_json(
+            &gateway.router,
             "/v1/curseforge/fingerprints/432",
             r#"{"fingerprints":[999,150,2]}"#,
         )
         .await;
         assert_eq!(again.header("x-cache"), Some("hit"));
         assert_eq!(again.body, expected(&[999, 150, 2]));
-        let more = post(
-            &gateway,
+        let more = post_json(
+            &gateway.router,
             "/v1/curseforge/fingerprints/432",
             r#"{"fingerprints":[2,3]}"#,
         )
@@ -1002,10 +1049,10 @@ mod tests {
     #[tokio::test]
     async fn fingerprints_curseforge_knows_none_of_are_an_answer_not_a_404() {
         let mock = Mock::start(Duration::ZERO, fingerprint_api).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         for cache in ["miss", "hit"] {
-            let got = post(
-                &gateway,
+            let got = post_json(
+                &gateway.router,
                 "/v1/curseforge/fingerprints/432",
                 r#"{"fingerprints":[998,999]}"#,
             )
@@ -1022,15 +1069,15 @@ mod tests {
     #[tokio::test]
     async fn the_route_without_a_game_keeps_its_own_fingerprints() {
         let mock = Mock::start(Duration::ZERO, fingerprint_api).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-        post(
-            &gateway,
+        let gateway = gateway(&mock);
+        post_json(
+            &gateway.router,
             "/v1/curseforge/fingerprints/432",
             r#"{"fingerprints":[2]}"#,
         )
         .await;
-        let other = post(
-            &gateway,
+        let other = post_json(
+            &gateway.router,
             "/v1/curseforge/fingerprints",
             r#"{"fingerprints":[2]}"#,
         )
@@ -1038,8 +1085,8 @@ mod tests {
         assert_eq!(other.header("x-cache"), Some("miss"));
         assert_eq!(other.body, expected(&[2]));
         assert_eq!(mock.seen()[1].uri, "/v1/fingerprints");
-        let again = post(
-            &gateway,
+        let again = post_json(
+            &gateway.router,
             "/v1/curseforge/fingerprints",
             r#"{"fingerprints":[2]}"#,
         )
@@ -1050,10 +1097,10 @@ mod tests {
     #[tokio::test]
     async fn another_game_passes_through() {
         let mock = Mock::start(Duration::ZERO, fingerprint_api).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         for _ in 0..2 {
-            post(
-                &gateway,
+            post_json(
+                &gateway.router,
                 "/v1/curseforge/fingerprints/1",
                 r#"{"fingerprints":[2]}"#,
             )
@@ -1071,9 +1118,9 @@ mod tests {
             )
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-        let got = post(
-            &gateway,
+        let gateway = gateway(&mock);
+        let got = post_json(
+            &gateway.router,
             "/v1/curseforge/fingerprints/432",
             r#"{"fingerprints":[2]}"#,
         )
@@ -1091,9 +1138,9 @@ mod tests {
             )
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-        let got = post(
-            &gateway,
+        let gateway = gateway(&mock);
+        let got = post_json(
+            &gateway.router,
             "/v1/curseforge/fingerprints/432",
             r#"{"fingerprints":[998]}"#,
         )
@@ -1109,9 +1156,9 @@ mod tests {
             r#"{"data":{"isCacheBuilt":true,"exactMatches":[],"partialMatches":[],"partialMatchFingerprints":{},"unmatchedFingerprints":[2]}}"#,
         ] {
             let mock = Mock::start(Duration::ZERO, move |_, _| reply(200, lists)).await;
-            let gateway = gateway(&mock, 300, TIMEOUT);
-            let got = post(
-                &gateway,
+            let gateway = gateway(&mock);
+            let got = post_json(
+                &gateway.router,
                 "/v1/curseforge/fingerprints/432",
                 r#"{"fingerprints":[2]}"#,
             )
@@ -1128,17 +1175,17 @@ mod tests {
             _ => reply(500, "boom"),
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-        post(
-            &gateway,
+        let gateway = gateway(&mock);
+        post_json(
+            &gateway.router,
             "/v1/curseforge/fingerprints/432",
             r#"{"fingerprints":[2,150,999]}"#,
         )
         .await;
         gateway.clock.advance(2 * HOUR_MS);
 
-        let stale = post(
-            &gateway,
+        let stale = post_json(
+            &gateway.router,
             "/v1/curseforge/fingerprints/432",
             r#"{"fingerprints":[150,2,2]}"#,
         )
@@ -1151,22 +1198,26 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs CONTENT_GATEWAY_TEST_REDIS_URL"]
     async fn answers_kept_in_redis_are_hits_after_a_restart() {
-        let Ok(url) = std::env::var("CONTENT_GATEWAY_TEST_REDIS_URL") else {
-            eprintln!("CONTENT_GATEWAY_TEST_REDIS_URL is not set, skipped");
-            return;
+        let redis = TestRedis::required();
+        let on_redis = || GatewayWith {
+            redis: Some(redis.open()),
+            ..GatewayWith::default()
         };
-        let prefix = format!("content-gateway-test:restart:{}", std::process::id());
-        let open = || Some(Arc::new(RedisStore::open(&url, prefix.clone()).unwrap()));
-        forget_prefix(&RedisStore::open(&url, prefix.clone()).unwrap()).await;
         let mock = Mock::start(Duration::ZERO, curseforge).await;
 
-        let before = gateway_on(&mock, 300, TIMEOUT, open());
+        let before = gateway_with(&mock, on_redis());
         get(&before.router, "/v1/curseforge/mods/1").await;
-        post(&before, "/v1/curseforge/mods", r#"{"modIds":[2,1000]}"#).await;
+        post_json(
+            &before.router,
+            "/v1/curseforge/mods",
+            r#"{"modIds":[2,1000]}"#,
+        )
+        .await;
         get(&before.router, "/v1/curseforge/mods/3/files/30").await;
 
-        let store = RedisStore::open(&url, prefix.clone()).unwrap();
+        let store = redis.open();
         let written: Vec<String> = ["mod:1", "mod:2", "mod:1000", "mods/3/files/30?", "file:30"]
             .iter()
             .map(|key| store.key(&format!("cache:{key}")))
@@ -1188,11 +1239,16 @@ mod tests {
         }
         let calls = mock.calls();
 
-        let after = gateway_on(&mock, 300, TIMEOUT, open());
+        let after = gateway_with(&mock, on_redis());
         let single = get(&after.router, "/v1/curseforge/mods/2").await;
         assert_eq!(single.header("x-cache"), Some("hit"));
         assert_eq!(single.body, format!(r#"{{"data":{}}}"#, mod_row(2)));
-        let joined = post(&after, "/v1/curseforge/mods", r#"{"modIds":[1,2,1000]}"#).await;
+        let joined = post_json(
+            &after.router,
+            "/v1/curseforge/mods",
+            r#"{"modIds":[1,2,1000]}"#,
+        )
+        .await;
         assert_eq!(joined.header("x-cache"), Some("hit"));
         assert_eq!(
             joined.body,
@@ -1205,32 +1261,7 @@ mod tests {
             Some("hit")
         );
         assert_eq!(mock.calls(), calls);
-
-        forget_prefix(&store).await;
-    }
-
-    async fn forget_prefix(store: &RedisStore) {
-        let pattern = store.key("*");
-        let stored = store
-            .run(|mut connection| async move {
-                redis::cmd("KEYS")
-                    .arg(pattern)
-                    .query_async::<Vec<String>>(&mut connection)
-                    .await
-            })
-            .await
-            .unwrap_or_default();
-        if stored.is_empty() {
-            return;
-        }
-        store
-            .run(|mut connection| async move {
-                redis::cmd("DEL")
-                    .arg(stored)
-                    .query_async::<()>(&mut connection)
-                    .await
-            })
-            .await;
+        redis.forget().await;
     }
 
     #[test]

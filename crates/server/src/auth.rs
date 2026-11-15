@@ -110,28 +110,17 @@ mod tests {
         middleware,
         routing::get,
     };
-    use http_body_util::BodyExt;
     use serde_json::Value;
-    use tower::ServiceExt;
 
     use super::*;
-    use crate::{app::test_state, config::Token};
+    use crate::test_support::{TOKEN as APP_TOKEN, call as call_router, consumer, test_state};
 
-    const APP_TOKEN: &str = "app-token-0123456789abcdef0123456789";
     const SANDBOX_TOKEN: &str = "sandbox-token-0123456789abcdef012345";
 
     fn router() -> Router {
         let state = test_state(vec![
-            Consumer {
-                name: "app".to_owned(),
-                token: Token::new(APP_TOKEN),
-                pools: vec!["launcher".to_owned(), "app".to_owned()],
-            },
-            Consumer {
-                name: "sandbox".to_owned(),
-                token: Token::new(SANDBOX_TOKEN),
-                pools: vec!["jobs".to_owned()],
-            },
+            consumer("app", APP_TOKEN, &["launcher", "app"]),
+            consumer("sandbox", SANDBOX_TOKEN, &["jobs"]),
         ]);
         Router::new()
             .route(
@@ -147,13 +136,8 @@ mod tests {
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
-        let response = router()
-            .oneshot(request.body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let status = response.status();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        (status, String::from_utf8(body.to_vec()).unwrap())
+        let got = call_router(&router(), request.body(Body::empty()).unwrap()).await;
+        (got.status, got.text())
     }
 
     fn code(body: &str) -> String {

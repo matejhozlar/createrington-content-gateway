@@ -209,6 +209,8 @@ pnpm format:check
 pnpm audit --audit-level=high
 ```
 
+`cargo test` skips the tests that need Redis and lists them as ignored. To run them as well, point `CONTENT_GATEWAY_TEST_REDIS_URL` at a Redis (each test keeps its keys under a prefix of its own and deletes them) and run `cargo test --workspace --locked -- --include-ignored`, as CI does.
+
 The Python client's checks (ruff, mypy, pytest and its generate check) run with uv in `packages/python-client`, see [its README](packages/python-client/README.md).
 
 `openapi.json`, `packages/client/src/generated/openapi.ts` and `packages/python-client/src/content_gateway/generated.py` are generated and checked in: `cargo test` fails when the document no longer matches the server, and each client's generate check fails when its types no longer match the document. `pnpm openapi` rewrites all three; the Python step needs [uv](https://docs.astral.sh/uv/), which also runs the Python client's own checks (see its README).

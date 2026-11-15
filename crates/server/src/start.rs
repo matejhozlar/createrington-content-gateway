@@ -4,7 +4,8 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    app::{self, AppState},
+    app::{self, Addresses, AppState, Timeouts},
+    budget::SystemClock,
     config::{self, Config, DEFAULT_LOG},
     openapi,
     redis_store::{self, RedisStore},
@@ -73,7 +74,13 @@ pub async fn run() -> ExitCode {
         },
     };
 
-    let state = match AppState::from_config(&config, redis) {
+    let state = match AppState::new(
+        &config,
+        &Addresses::default(),
+        Timeouts::default(),
+        Arc::new(SystemClock),
+        redis,
+    ) {
         Ok(state) => Arc::new(state),
         Err(error) => {
             tracing::error!("cannot set up the upstream clients: {error}");
