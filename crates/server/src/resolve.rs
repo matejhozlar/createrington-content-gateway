@@ -18,11 +18,13 @@ use utoipa::ToSchema;
 use crate::{
     app::AppState,
     auth::Pool,
-    batch::{self, Batch},
+    batch::Batch,
     cache::{Answer, Entry},
     clock::{HOUR_MS, MINUTE_MS},
     error::ApiError,
-    modrinth, passthrough,
+    load,
+    modrinth::VersionFiles,
+    passthrough,
     upstream::Source,
 };
 
@@ -253,20 +255,11 @@ pub async fn resolve(
     }
     let forced = passthrough::wants_fresh(&headers);
 
-    let rows = match batch::rows(
-        state.clone(),
-        pool.clone(),
-        Batch::Files,
-        ids.clone(),
-        forced,
-    )
-    .await
-    {
-        Ok(rows) => rows,
+    let rows = match load::rows(&state, &pool, Batch::Files, ids.clone(), forced).await {
+        Ok(given) => given.value,
         Err(failure) => return passthrough::failed(failure, &pool, Source::CurseForge),
     };
     let known: HashMap<u64, ListedFile> = rows
-        .rows
         .iter()
         .filter_map(|(id, row)| {
             let row: FileRow = serde_json::from_slice(row)
@@ -302,12 +295,15 @@ pub async fn resolve(
     let (on_modrinth, modrinth_failed) = if hashes.is_empty() {
         (HashMap::new(), false)
     } else {
-        match modrinth::lookup(&state, &pool, hashes, forced).await {
-            Ok(looked) => (
-                looked
-                    .known
+        match load::rows(&state, &pool, VersionFiles, hashes, forced).await {
+            Ok(given) => (
+                given
+                    .value
                     .into_iter()
-                    .filter_map(|known| Some((known.hash.clone(), modrinth_url(&known)?)))
+                    .filter_map(|(hash, version)| {
+                        let url = modrinth_url(&hash, &version)?;
+                        Some((hash, url))
+                    })
                     .collect::<HashMap<String, String>>(),
                 false,
             ),
@@ -388,8 +384,8 @@ pub async fn resolve(
     Json(Resolved { files }).into_response()
 }
 
-fn modrinth_url(known: &modrinth::Known) -> Option<String> {
-    let version: Version = serde_json::from_slice(known.version.as_ref()?).ok()?;
+fn modrinth_url(hash: &str, version: &[u8]) -> Option<String> {
+    let version: Version = serde_json::from_slice(version).ok()?;
     version
         .files
         .into_iter()
@@ -397,7 +393,7 @@ fn modrinth_url(known: &modrinth::Known) -> Option<String> {
             file.hashes
                 .sha1
                 .as_ref()
-                .is_some_and(|sha1| sha1.eq_ignore_ascii_case(&known.hash))
+                .is_some_and(|sha1| sha1.eq_ignore_ascii_case(hash))
                 && is_modrinth_cdn(&file.url)
         })
         .map(|file| file.url)
@@ -519,7 +515,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::{app::Timeouts, config::DEFAULT_USER_AGENT, curseforge::TIMEOUT, test_support::*};
+    use crate::{
+        app::Timeouts, config::DEFAULT_USER_AGENT, curseforge::TIMEOUT, modrinth, test_support::*,
+    };
 
     const JEI_SHA1: &str = "3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e";
     const SODIUM_SHA1: &str = "0123456789abcdef0123456789abcdef01234567";

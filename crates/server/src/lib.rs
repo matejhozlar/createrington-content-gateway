@@ -8,6 +8,7 @@ mod config;
 mod curseforge;
 mod error;
 mod health;
+mod load;
 mod modrinth;
 mod openapi;
 mod passthrough;

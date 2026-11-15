@@ -210,7 +210,7 @@
           "curseforge"
         ],
         "summary": "What `POST api.curseforge.com/v1/{path}` answers to this body.",
-        "description": "`POST mods` with only `{\"modIds\": [...]}`, `POST mods/files` with only `{\"fileIds\": [...]}`, and\n`POST fingerprints/432` or `POST fingerprints` with only `{\"fingerprints\": [...]}` are answered per id from the\ncache, and only the ids not kept are asked for, 100 per call. Every other body goes to CurseForge each time.",
+        "description": "`POST mods` with only `{\"modIds\": [...]}`, `POST mods/files` with only `{\"fileIds\": [...]}`, and\n`POST fingerprints/432` or `POST fingerprints` with only `{\"fingerprints\": [...]}` are answered per id from the\ncache, and only the ids not kept are asked for, 100 per call, at most 1000 different ids. Every other body goes to\nCurseForge each time.",
         "operationId": "curseforge_post",
         "parameters": [
           {
@@ -275,7 +275,7 @@
             }
           },
           "400": {
-            "description": "`INVALID_PATH`, `POOL_REQUIRED` or `UNKNOWN_POOL`",
+            "description": "`INVALID_PATH`, `INVALID_BODY` (a batch of more than 1000 different ids), `POOL_REQUIRED` or `UNKNOWN_POOL`",
             "content": {
               "application/json": {
                 "schema": {
