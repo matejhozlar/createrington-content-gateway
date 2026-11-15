@@ -199,8 +199,8 @@ mod tests {
 
     use super::*;
     use crate::test_support::{
-        self, KEY, Mock, NOV_3_2026_20H, TOKEN, TestClock, USER_AGENT, addresses_at, call,
-        consumer, reply, test_state,
+        self, KEY, Mock, NOV_3_2026_20H, Reply, TOKEN, TestClock, USER_AGENT, call, consumer,
+        reply, test_state,
     };
 
     fn app() -> Router {
@@ -211,11 +211,11 @@ mod tests {
         )]))
     }
 
-    async fn get(uri: &str, token: Option<&str>) -> (StatusCode, Option<String>, Vec<u8>) {
-        let got = match token {
-            Some(TOKEN) => test_support::get(&app(), uri).await,
-            Some(other) => panic!("no consumer has the token {other}"),
-            None => call(&app(), Request::get(uri).body(Body::empty()).unwrap()).await,
+    async fn get(uri: &str, authenticated: bool) -> (StatusCode, Option<String>, Vec<u8>) {
+        let got = if authenticated {
+            test_support::get(&app(), uri).await
+        } else {
+            call(&app(), Request::get(uri).body(Body::empty()).unwrap()).await
         };
         let content_type = got.header("content-type").map(str::to_owned);
         (got.status, content_type, got.body.to_vec())
@@ -223,7 +223,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_answers_ok_as_json_without_a_token() {
-        let (status, content_type, body) = get("/v1/healthz", None).await;
+        let (status, content_type, body) = get("/v1/healthz", false).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(content_type.as_deref(), Some("application/json"));
 
@@ -236,7 +236,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_openapi_document_is_served_without_a_token_as_checked_in() {
-        let (status, content_type, body) = get("/v1/openapi.json", None).await;
+        let (status, content_type, body) = get("/v1/openapi.json", false).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(content_type.as_deref(), Some("application/json"));
 
@@ -249,13 +249,13 @@ mod tests {
 
     #[tokio::test]
     async fn the_budget_needs_a_token() {
-        let (status, _, _) = get("/v1/budget", None).await;
+        let (status, _, _) = get("/v1/budget", false).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn the_budget_lists_every_pool_without_a_pool_header() {
-        let (status, _, body) = get("/v1/budget", Some(TOKEN)).await;
+        let (status, _, body) = get("/v1/budget", true).await;
         assert_eq!(status, StatusCode::OK);
 
         let body: Value = serde_json::from_slice(&body).unwrap();
@@ -274,14 +274,14 @@ mod tests {
 
     #[tokio::test]
     async fn the_budget_answers_the_days_asked_for_and_refuses_a_bad_number() {
-        let (status, _, body) = get("/v1/budget?days=30", Some(TOKEN)).await;
+        let (status, _, body) = get("/v1/budget?days=30", true).await;
         assert_eq!(status, StatusCode::OK);
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["historyDays"], 90);
         assert_eq!(body["curseforge"]["days"], Value::Array(Vec::new()));
 
         for query in ["days=0", "days=-1", "days=many", "days="] {
-            let (status, _, body) = get(&format!("/v1/budget?{query}"), Some(TOKEN)).await;
+            let (status, _, body) = get(&format!("/v1/budget?{query}"), true).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["code"], "INVALID_DAYS", "{query}");
@@ -289,8 +289,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_config_gives_each_client_its_key_and_user_agent_and_sets_the_budgets() {
-        let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "{}")).await;
+    async fn the_config_gives_each_client_its_address_key_and_user_agent_and_sets_the_budgets() {
+        let mock = Mock::start(Duration::ZERO, |_, seen| {
+            match (seen.method.as_str(), seen.uri.as_str()) {
+                ("POST", "/curseforge/mods/files") => reply(
+                    200,
+                    r#"{"data":[{"id":1001,"modId":100,"fileName":"jei.jar","fileLength":10,"downloadUrl":null,"hashes":[{"value":"3E1DD9FB5EA2F0DD4FFCC2B1A7D0BB1A1A9D6A8E","algo":1}]}]}"#,
+                ),
+                ("HEAD", _) => Reply {
+                    status: 200,
+                    headers: vec![("content-length", "10")],
+                    body: String::new(),
+                },
+                _ => reply(200, "{}"),
+            }
+        })
+        .await;
         let config = Config::from_lookup(|name| {
             let value = match name {
                 "CURSEFORGE_API_KEY" => KEY,
@@ -304,9 +318,19 @@ mod tests {
             Some(value.to_owned())
         })
         .unwrap();
+        let base = &mock.base;
+        let addresses = Addresses {
+            curseforge_api: format!("{base}/curseforge"),
+            modrinth_api: format!("{base}/modrinth"),
+            curseforge_cdn: format!("{base}/cdn"),
+            mojang_meta: format!("{base}/mojang"),
+            neoforge_maven: format!("{base}/neoforge"),
+            forge_files: format!("{base}/forge"),
+            fabric_meta: format!("{base}/fabric"),
+        };
         let state = AppState::new(
             &config,
-            &addresses_at(&mock.base),
+            &addresses,
             Timeouts::default(),
             TestClock::at(NOV_3_2026_20H),
             None,
@@ -314,35 +338,48 @@ mod tests {
         .unwrap();
         let app = router(Arc::new(state));
 
-        for uri in [
-            "/v1/curseforge/mods/1",
-            "/v1/modrinth/project/jei",
-            "/v1/minecraft/versions",
+        let key = Some(KEY);
+        for (uri, expected) in [
+            ("/v1/curseforge/mods/1", vec![("curseforge", key)]),
+            ("/v1/modrinth/project/jei", vec![("modrinth", None)]),
+            ("/v1/minecraft/versions", vec![("mojang", None)]),
+            (
+                "/v1/minecraft/loaders/neoforge/versions",
+                vec![("neoforge", None)],
+            ),
+            (
+                "/v1/minecraft/loaders/forge/versions",
+                vec![("forge", None)],
+            ),
+            (
+                "/v1/minecraft/loaders/fabric/versions",
+                vec![("fabric", None)],
+            ),
+            (
+                "/v1/resolve",
+                vec![("curseforge", key), ("modrinth", None), ("cdn", None)],
+            ),
         ] {
-            test_support::get(&app, uri).await;
+            let before = mock.calls();
+            if uri == "/v1/resolve" {
+                test_support::post_json(&app, uri, r#"{"fileIds":[1001]}"#).await;
+            } else {
+                test_support::get(&app, uri).await;
+            }
+            let reached: Vec<(String, Option<String>)> = mock.seen()[before..]
+                .iter()
+                .map(|seen| {
+                    assert_eq!(seen.user_agent.as_deref(), Some(USER_AGENT), "{uri}");
+                    let first = seen.uri.split('/').nth(1).unwrap_or_default();
+                    (first.to_owned(), seen.key.clone())
+                })
+                .collect();
+            let expected: Vec<(String, Option<String>)> = expected
+                .into_iter()
+                .map(|(first, key)| (first.to_owned(), key.map(str::to_owned)))
+                .collect();
+            assert_eq!(reached, expected, "{uri}");
         }
-        let seen: Vec<(String, Option<String>, Option<String>)> = mock
-            .seen()
-            .into_iter()
-            .map(|seen| (seen.uri, seen.key, seen.user_agent))
-            .collect();
-        let user_agent = Some(USER_AGENT.to_owned());
-        assert_eq!(
-            seen,
-            [
-                (
-                    "/v1/mods/1".to_owned(),
-                    Some(KEY.to_owned()),
-                    user_agent.clone()
-                ),
-                ("/v2/project/jei".to_owned(), None, user_agent.clone()),
-                (
-                    "/mc/game/version_manifest_v2.json".to_owned(),
-                    None,
-                    user_agent
-                ),
-            ]
-        );
 
         let budget = test_support::get(&app, "/v1/budget").await.json();
         assert_eq!(budget["historyDays"], 30);
@@ -353,7 +390,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_routes_answer_not_found_without_a_token() {
-        let (status, _, _) = get("/v1/nothing-here", None).await;
+        let (status, _, _) = get("/v1/nothing-here", false).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }
