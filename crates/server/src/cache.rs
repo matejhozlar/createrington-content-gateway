@@ -152,10 +152,13 @@ pub type Waiting = watch::Receiver<Option<Outcome>>;
 pub type Finisher = watch::Sender<Option<Outcome>>;
 
 /// Why a load gave no answer to keep. `Answered` is an answer that is not kept, such as a 5xx, passed on as it came.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LoadFailure {
+    #[error("answered {}", .0.status)]
     Answered(Answer),
+    #[error("refused: {0}")]
     Refused(crate::budget::Refusal),
+    #[error(transparent)]
     Upstream(crate::upstream::UpstreamFailure),
 }
 
@@ -567,6 +570,28 @@ mod tests {
             60_000,
         );
         assert_eq!(decode(encode(&not_found)).unwrap(), not_found);
+    }
+
+    #[test]
+    fn a_failure_says_what_went_wrong_without_the_upstream_s_body() {
+        let answered = LoadFailure::Answered(Answer {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            content_type: None,
+            body: Bytes::from_static(b"a whole page of upstream html"),
+        });
+        assert_eq!(answered.to_string(), "answered 503 Service Unavailable");
+        assert_eq!(
+            LoadFailure::Refused(crate::budget::Refusal::TooLarge {
+                calls: 4,
+                limit_per_minute: 3
+            })
+            .to_string(),
+            "refused: 4 calls are more than the 3 a minute allows"
+        );
+        assert_eq!(
+            LoadFailure::Upstream(crate::upstream::UpstreamFailure::Timeout).to_string(),
+            "did not answer in time"
+        );
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::{
     clock::{HOUR_MS, MINUTE_MS},
     error::ApiError,
     modrinth, passthrough,
+    upstream::Source,
 };
 
 pub const CURSEFORGE_CDN: &str = "https://mediafilez.forgecdn.net";
@@ -262,13 +263,19 @@ pub async fn resolve(
     .await
     {
         Ok(rows) => rows,
-        Err(response) => return *response,
+        Err(failure) => return passthrough::failed(failure, &pool, Source::CurseForge),
     };
     let known: HashMap<u64, ListedFile> = rows
         .rows
         .iter()
         .filter_map(|(id, row)| {
-            let row: FileRow = serde_json::from_slice(row).ok()?;
+            let row: FileRow = serde_json::from_slice(row)
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        "CurseForge's row of file {id} does not read as a file: {error}"
+                    );
+                })
+                .ok()?;
             Some((
                 *id,
                 ListedFile {
@@ -306,7 +313,7 @@ pub async fn resolve(
             ),
             Err(failure) => {
                 tracing::warn!(
-                    "Modrinth could not be asked for {} files: {failure:?}",
+                    "Modrinth could not be asked for {} files: {failure}",
                     wanted.len()
                 );
                 (HashMap::new(), true)

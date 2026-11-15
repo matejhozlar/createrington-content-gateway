@@ -54,12 +54,16 @@ impl Source {
     }
 }
 
-/// Why an upstream gave no answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why an upstream gave no answer, worded to follow the upstream's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum UpstreamFailure {
+    #[error("did not answer in time")]
     Timeout,
+    #[error("could not be reached")]
     Unreachable,
+    #[error("answered with more than the gateway keeps")]
     TooLarge,
+    #[error("answered with something the gateway cannot read")]
     Unreadable,
 }
 

@@ -12,6 +12,7 @@ use crate::{
     clock::Clock,
     config::{Config, Consumer},
     curseforge::{self, CURSEFORGE_API},
+    error::ApiError,
     health,
     modrinth::{self, MODRINTH_API},
     openapi,
@@ -194,6 +195,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/v1/healthz", get(health::healthz))
         .route("/v1/openapi.json", get(openapi::document))
         .merge(authenticated)
+        .fallback(|| async { ApiError::unknown_route() })
         .with_state(state)
 }
 
@@ -399,7 +401,12 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_routes_answer_not_found_without_a_token() {
-        let (status, _, _) = get("/v1/nothing-here", false).await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
+        for uri in ["/v1/nothing-here", "/", "/v2/budget"] {
+            let (status, content_type, body) = get(uri, false).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(content_type.as_deref(), Some("application/json"), "{uri}");
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["code"], "UNKNOWN_ROUTE", "{uri}");
+        }
     }
 }

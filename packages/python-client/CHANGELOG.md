@@ -1,5 +1,9 @@
 # content-gateway-client
 
+## 0.2.2
+
+New error code `UNKNOWN_ROUTE`: the gateway now answers a path none of its routes serves with its JSON error, `404 UNKNOWN_ROUTE`, instead of an empty 404.
+
 ## 0.2.1
 
 The gateway's own routes (`health`, `budget`, `resolve` and the version lists) raise `ContentGatewayError` on any answer that is not the gateway's JSON object instead of returning it typed as their result: a page from something else at the base URL, an empty success, or CurseForge's own failure that `resolve` passes on with its status. A raised error's `retry_after_ms` falls back to `Retry-After` when the body carries none, and an `X-Cache` value the gateway does not send is named as such instead of reported as a missing header.

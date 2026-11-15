@@ -9,15 +9,14 @@ use axum::{
     body::Bytes,
     extract::{Path, Query, State, rejection::QueryRejection},
     http::{Method, StatusCode},
-    response::{IntoResponse, Response},
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use serde_json::value::RawValue;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
     app::AppState,
-    cache::{AnswerCache, Entry, LoadFailure, Outcome},
+    cache::{Answer, AnswerCache, Entry, LoadFailure, Outcome},
     clock::{DAY_MS, HOUR_MS},
     error::ApiError,
     upstream::{self, UpstreamFailure},
@@ -70,7 +69,8 @@ impl Meta {
         })
     }
 
-    async fn get(&self, url: &str, name: &'static str) -> Result<Bytes, UpstreamFailure> {
+    async fn get(&self, url: &str, origin: Origin) -> Result<Bytes, UpstreamFailure> {
+        let name = origin.name();
         let response = self
             .client
             .request(Method::GET, url)
@@ -86,8 +86,51 @@ impl Meta {
     }
 }
 
-/// The mod loaders whose versions the gateway lists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+/// Where a version list comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Mojang,
+    NeoForge,
+    Forge,
+    Fabric,
+}
+
+impl Origin {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mojang => "Mojang",
+            Self::NeoForge => "NeoForge",
+            Self::Forge => "Forge",
+            Self::Fabric => "Fabric",
+        }
+    }
+}
+
+/// Why a version list could not be given: the source, and what went wrong with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{} {failure}", origin.name())]
+pub struct ListFailure {
+    pub origin: Origin,
+    pub failure: UpstreamFailure,
+}
+
+impl ListFailure {
+    fn unreadable(origin: Origin) -> Self {
+        Self {
+            origin,
+            failure: UpstreamFailure::Unreadable,
+        }
+    }
+}
+
+impl From<ListFailure> for ApiError {
+    fn from(failed: ListFailure) -> Self {
+        ApiError::upstream(failed.failure, failed.origin.name())
+    }
+}
+
+/// The mod loaders whose versions the gateway lists, named in any case in a path or a query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum Loader {
     NeoForge,
@@ -96,6 +139,8 @@ pub enum Loader {
 }
 
 impl Loader {
+    const NAMES: [&str; 3] = ["neoforge", "forge", "fabric"];
+
     fn of(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "neoforge" => Some(Self::NeoForge),
@@ -103,6 +148,13 @@ impl Loader {
             "fabric" => Some(Self::Fabric),
             _ => None,
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for Loader {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        Self::of(&name).ok_or_else(|| serde::de::Error::unknown_variant(&name, &Self::NAMES))
     }
 }
 
@@ -325,74 +377,92 @@ struct FabricGame {
     version: String,
 }
 
-fn failed(failure: UpstreamFailure, name: &'static str) -> Response {
-    ApiError::upstream(failure, name).into_response()
+fn parsed<T: DeserializeOwned>(body: &[u8], origin: Origin, url: &str) -> Result<T, ListFailure> {
+    serde_json::from_slice(body).map_err(|error| {
+        tracing::warn!(
+            "{} answered {url} with something the gateway cannot read: {error}",
+            origin.name()
+        );
+        ListFailure::unreadable(origin)
+    })
 }
 
-async fn document(
+/// The list at `url` read as `T`, from the cache while fresh. A body is kept only once it reads as `T`, and the old
+/// copy answers while the source fails. A kept copy that does not read, such as one an older gateway kept in Redis,
+/// counts as no copy. A fetched body is read twice, once to decide it is kept and once for each waiting request.
+async fn document<T: DeserializeOwned + 'static>(
     state: &Arc<AppState>,
     key: &str,
     url: &str,
-    name: &'static str,
+    origin: Origin,
     fresh_ms: u64,
-) -> Result<Bytes, UpstreamFailure> {
+) -> Result<T, ListFailure> {
     let now = state.clock.now_ms();
     let cached = state.cache.lookup(key, now).await;
-    if let Some(entry) = cached.as_ref().filter(|entry| entry.is_fresh(now)) {
-        return Ok(entry.answer.body.clone());
+    if let Some(entry) = cached.as_ref().filter(|entry| entry.is_fresh(now))
+        && let Ok(kept) = serde_json::from_slice(&entry.answer.body)
+    {
+        return Ok(kept);
     }
     let (waiting, finisher) = state.cache.join(key);
     if let Some(finisher) = finisher {
         let (state, key, url) = (state.clone(), key.to_owned(), url.to_owned());
         tokio::spawn(async move {
-            let loaded = match state.meta.get(&url, name).await {
-                Ok(body) => {
-                    let entry = Arc::new(Entry::new(
-                        crate::cache::Answer {
+            let loaded = match state.meta.get(&url, origin).await {
+                Ok(body) => match parsed::<T>(&body, origin, &url) {
+                    Ok(_) => {
+                        let answer = Answer {
                             status: StatusCode::OK,
                             content_type: None,
                             body,
-                        },
-                        state.clock.now_ms(),
-                        fresh_ms,
-                    ));
-                    state.cache.insert(&key, entry.clone());
-                    Ok(entry)
-                }
+                        };
+                        let entry = Arc::new(Entry::new(answer, state.clock.now_ms(), fresh_ms));
+                        state.cache.insert(&key, entry.clone());
+                        Ok(entry)
+                    }
+                    Err(failed) => Err(LoadFailure::Upstream(failed.failure)),
+                },
                 Err(failure) => Err(LoadFailure::Upstream(failure)),
             };
             state.cache.finish(&key, finisher, Outcome::called(loaded));
         });
     }
-    let outcome = AnswerCache::wait(waiting).await;
-    match outcome.map(|outcome| outcome.loaded) {
-        Some(Ok(entry)) => Ok(entry.answer.body.clone()),
-        Some(Err(LoadFailure::Upstream(failure))) => match cached {
-            Some(entry) if entry.can_stand_in(state.clock.now_ms()) => {
-                Ok(entry.answer.body.clone())
-            }
-            _ => Err(failure),
-        },
-        _ => match cached {
-            Some(entry) if entry.can_stand_in(state.clock.now_ms()) => {
-                Ok(entry.answer.body.clone())
-            }
-            _ => Err(UpstreamFailure::Unreachable),
-        },
-    }
+    let failure = match AnswerCache::wait(waiting)
+        .await
+        .map(|outcome| outcome.loaded)
+    {
+        Some(Ok(entry)) => return parsed(&entry.answer.body, origin, url),
+        Some(Err(LoadFailure::Upstream(failure))) => failure,
+        _ => UpstreamFailure::Unreachable,
+    };
+    cached
+        .filter(|entry| entry.can_stand_in(state.clock.now_ms()))
+        .and_then(|entry| serde_json::from_slice(&entry.answer.body).ok())
+        .ok_or(ListFailure { origin, failure })
 }
 
-async fn manifest(state: &Arc<AppState>) -> Result<Manifest, UpstreamFailure> {
+async fn manifest(state: &Arc<AppState>) -> Result<Manifest, ListFailure> {
     let url = format!("{}{MANIFEST_PATH}", state.meta.mojang);
-    let body = document(state, "minecraft:manifest", &url, "Mojang", LIST_FRESH_MS).await?;
-    serde_json::from_slice(&body).map_err(|_| UpstreamFailure::Unreadable)
+    document(
+        state,
+        "minecraft:manifest",
+        &url,
+        Origin::Mojang,
+        LIST_FRESH_MS,
+    )
+    .await
 }
 
-async fn neoforge(state: &Arc<AppState>) -> Result<Vec<LoaderVersion>, UpstreamFailure> {
+async fn neoforge(state: &Arc<AppState>) -> Result<Vec<LoaderVersion>, ListFailure> {
     let url = format!("{}{NEOFORGE_PATH}", state.meta.neoforge);
-    let body = document(state, "loader:neoforge", &url, "NeoForge", LIST_FRESH_MS).await?;
-    let listed: NeoForgeVersions =
-        serde_json::from_slice(&body).map_err(|_| UpstreamFailure::Unreadable)?;
+    let listed: NeoForgeVersions = document(
+        state,
+        "loader:neoforge",
+        &url,
+        Origin::NeoForge,
+        LIST_FRESH_MS,
+    )
+    .await?;
     Ok(listed
         .versions
         .into_iter()
@@ -425,11 +495,10 @@ fn neoforge_minecraft(version: &str) -> Option<String> {
     })
 }
 
-async fn forge(state: &Arc<AppState>) -> Result<Vec<LoaderVersion>, UpstreamFailure> {
+async fn forge(state: &Arc<AppState>) -> Result<Vec<LoaderVersion>, ListFailure> {
     let url = format!("{}{FORGE_PATH}", state.meta.forge);
-    let body = document(state, "loader:forge", &url, "Forge", LIST_FRESH_MS).await?;
     let listed: ForgePromotions =
-        serde_json::from_slice(&body).map_err(|_| UpstreamFailure::Unreadable)?;
+        document(state, "loader:forge", &url, Origin::Forge, LIST_FRESH_MS).await?;
     let mut versions: Vec<LoaderVersion> = Vec::new();
     for (key, version) in &listed.promos {
         let Some((minecraft, promotion)) = key.rsplit_once('-') else {
@@ -464,11 +533,10 @@ fn version_order(version: &str) -> Vec<u64> {
         .collect()
 }
 
-async fn fabric(state: &Arc<AppState>) -> Result<Vec<LoaderVersion>, UpstreamFailure> {
+async fn fabric(state: &Arc<AppState>) -> Result<Vec<LoaderVersion>, ListFailure> {
     let url = format!("{}{FABRIC_LOADER_PATH}", state.meta.fabric);
-    let body = document(state, "loader:fabric", &url, "Fabric", LIST_FRESH_MS).await?;
     let listed: Vec<FabricLoader> =
-        serde_json::from_slice(&body).map_err(|_| UpstreamFailure::Unreadable)?;
+        document(state, "loader:fabric", &url, Origin::Fabric, LIST_FRESH_MS).await?;
     Ok(listed
         .into_iter()
         .map(|loader| LoaderVersion {
@@ -480,26 +548,20 @@ async fn fabric(state: &Arc<AppState>) -> Result<Vec<LoaderVersion>, UpstreamFai
         .collect())
 }
 
-async fn fabric_games(state: &Arc<AppState>) -> Result<BTreeSet<String>, UpstreamFailure> {
+async fn fabric_games(state: &Arc<AppState>) -> Result<BTreeSet<String>, ListFailure> {
     let url = format!("{}{FABRIC_GAME_PATH}", state.meta.fabric);
-    let body = document(state, "loader:fabric:games", &url, "Fabric", LIST_FRESH_MS).await?;
-    let listed: Vec<FabricGame> =
-        serde_json::from_slice(&body).map_err(|_| UpstreamFailure::Unreadable)?;
+    let listed: Vec<FabricGame> = document(
+        state,
+        "loader:fabric:games",
+        &url,
+        Origin::Fabric,
+        LIST_FRESH_MS,
+    )
+    .await?;
     Ok(listed.into_iter().map(|game| game.version).collect())
 }
 
-fn source_name(loader: Loader) -> &'static str {
-    match loader {
-        Loader::NeoForge => "NeoForge",
-        Loader::Forge => "Forge",
-        Loader::Fabric => "Fabric",
-    }
-}
-
-async fn supported(
-    state: &Arc<AppState>,
-    loader: Loader,
-) -> Result<BTreeSet<String>, UpstreamFailure> {
+async fn supported(state: &Arc<AppState>, loader: Loader) -> Result<BTreeSet<String>, ListFailure> {
     Ok(match loader {
         Loader::NeoForge => neoforge(state)
             .await?
@@ -536,22 +598,15 @@ async fn supported(
 pub async fn minecraft_versions(
     State(state): State<Arc<AppState>>,
     query: Result<Query<VersionsQuery>, QueryRejection>,
-) -> Response {
+) -> Result<Json<MinecraftVersions>, ApiError> {
     let Ok(Query(query)) = query else {
-        return ApiError::invalid_query(
+        return Err(ApiError::invalid_query(
             "`type` is release, snapshot or all; `loader` is neoforge, forge or fabric",
-        )
-        .into_response();
+        ));
     };
-    let manifest = match manifest(&state).await {
-        Ok(manifest) => manifest,
-        Err(failure) => return failed(failure, "Mojang"),
-    };
+    let manifest = manifest(&state).await?;
     let with_builds = match query.loader {
-        Some(loader) => match supported(&state, loader).await {
-            Ok(versions) => Some(versions),
-            Err(failure) => return failed(failure, source_name(loader)),
-        },
+        Some(loader) => Some(supported(&state, loader).await?),
         None => None,
     };
     let kind = query.kind.unwrap_or_default();
@@ -574,14 +629,13 @@ pub async fn minecraft_versions(
             release_time: version.release_time,
         })
         .collect();
-    Json(MinecraftVersions {
+    Ok(Json(MinecraftVersions {
         latest: Latest {
             release: manifest.latest.release,
             snapshot: manifest.latest.snapshot,
         },
         versions,
-    })
-    .into_response()
+    }))
 }
 
 /// One Minecraft version with the Java it needs, from Mojang's own document of the version, kept a day.
@@ -602,42 +656,32 @@ pub async fn minecraft_versions(
 pub async fn minecraft_version(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> Response {
-    let manifest = match manifest(&state).await {
-        Ok(manifest) => manifest,
-        Err(failure) => return failed(failure, "Mojang"),
-    };
+) -> Result<Json<MinecraftVersionDetails>, ApiError> {
+    let manifest = manifest(&state).await?;
     let Some(version) = manifest
         .versions
         .into_iter()
         .find(|version| version.id == id)
     else {
-        return ApiError::unknown_version(&id).into_response();
+        return Err(ApiError::unknown_version(&id));
     };
     if !version.url.starts_with(&format!("{}/", state.meta.mojang)) {
         tracing::warn!(
             "Mojang's manifest points version {id} outside its own host: {}",
             version.url
         );
-        return failed(UpstreamFailure::Unreadable, "Mojang");
+        return Err(ListFailure::unreadable(Origin::Mojang).into());
     }
     let key = format!("minecraft:version:{id}");
-    let body = match document(&state, &key, &version.url, "Mojang", DETAILS_FRESH_MS).await {
-        Ok(body) => body,
-        Err(failure) => return failed(failure, "Mojang"),
-    };
-    let details: VersionDocument = match serde_json::from_slice(&body) {
-        Ok(details) => details,
-        Err(_) => return failed(UpstreamFailure::Unreadable, "Mojang"),
-    };
-    Json(MinecraftVersionDetails {
+    let details: VersionDocument =
+        document(&state, &key, &version.url, Origin::Mojang, DETAILS_FRESH_MS).await?;
+    Ok(Json(MinecraftVersionDetails {
         id: version.id,
         kind: version.kind,
         release_time: version.release_time,
         java_major: details.java_version.as_ref().map(|java| java.major_version),
         java_component: details.java_version.and_then(|java| java.component),
-    })
-    .into_response()
+    }))
 }
 
 /// A loader's builds, newest first.
@@ -657,6 +701,7 @@ pub async fn minecraft_version(
     ),
     responses(
         (status = 200, description = "The builds", body = LoaderVersions),
+        (status = 400, description = "`INVALID_QUERY`: `minecraft` given more than once", body = ApiError),
         (status = 401, description = "No valid consumer token", body = ApiError),
         (status = 404, description = "No such loader, `UNKNOWN_LOADER`", body = ApiError),
         (status = 502, description = "The loader's source could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`", body = ApiError),
@@ -667,29 +712,23 @@ pub async fn loader_versions(
     State(state): State<Arc<AppState>>,
     Path(loader): Path<String>,
     query: Result<Query<LoaderQuery>, QueryRejection>,
-) -> Response {
+) -> Result<Json<LoaderVersions>, ApiError> {
     let Some(loader) = Loader::of(&loader) else {
-        return ApiError::unknown_loader().into_response();
+        return Err(ApiError::unknown_loader());
     };
-    let minecraft = query
-        .ok()
-        .and_then(|Query(query)| query.minecraft)
-        .filter(|minecraft| !minecraft.is_empty());
-    let listed = match loader {
-        Loader::NeoForge => neoforge(&state).await,
-        Loader::Forge => forge(&state).await,
+    let Ok(Query(query)) = query else {
+        return Err(ApiError::invalid_query(
+            "at most one `minecraft`, such as 1.21.1",
+        ));
+    };
+    let minecraft = query.minecraft.filter(|minecraft| !minecraft.is_empty());
+    let versions = match loader {
+        Loader::NeoForge => neoforge(&state).await?,
+        Loader::Forge => forge(&state).await?,
         Loader::Fabric => match &minecraft {
-            Some(minecraft) => match fabric_games(&state).await {
-                Ok(games) if games.contains(minecraft) => fabric(&state).await,
-                Ok(_) => Ok(Vec::new()),
-                Err(failure) => Err(failure),
-            },
-            None => fabric(&state).await,
+            Some(minecraft) if !fabric_games(&state).await?.contains(minecraft) => Vec::new(),
+            _ => fabric(&state).await?,
         },
-    };
-    let versions = match listed {
-        Ok(versions) => versions,
-        Err(failure) => return failed(failure, source_name(loader)),
     };
     let versions = versions
         .into_iter()
@@ -700,12 +739,11 @@ pub async fn loader_versions(
                     .is_none_or(|wanted| version.minecraft.as_ref() == Some(wanted))
         })
         .collect();
-    Json(LoaderVersions {
+    Ok(Json(LoaderVersions {
         loader,
         minecraft,
         versions,
-    })
-    .into_response()
+    }))
 }
 
 enum Wanted {
@@ -780,7 +818,7 @@ fn pick(index: &RuntimeIndex, platform: &str, wanted: &Wanted) -> Option<JavaRun
 pub async fn java_runtime(
     State(state): State<Arc<AppState>>,
     query: Result<Query<JavaQuery>, QueryRejection>,
-) -> Response {
+) -> Result<Json<JavaRuntime>, ApiError> {
     let (platform, wanted) = match query {
         Ok(Query(JavaQuery {
             platform,
@@ -793,25 +831,26 @@ pub async fn java_runtime(
             component: Some(component),
         })) => (platform, Wanted::Component(component)),
         _ => {
-            return ApiError::invalid_query("`platform` with either `major` or `component`")
-                .into_response();
+            return Err(ApiError::invalid_query(
+                "`platform` with either `major` or `component`",
+            ));
         }
     };
     let url = format!("{}{JAVA_RUNTIMES_PATH}", state.meta.mojang);
-    let body = match document(&state, "minecraft:java", &url, "Mojang", LIST_FRESH_MS).await {
-        Ok(body) => body,
-        Err(failure) => return failed(failure, "Mojang"),
-    };
-    let index: RuntimeIndex = match serde_json::from_slice(&body) {
-        Ok(index) => index,
-        Err(_) => return failed(UpstreamFailure::Unreadable, "Mojang"),
-    };
+    let index: RuntimeIndex = document(
+        &state,
+        "minecraft:java",
+        &url,
+        Origin::Mojang,
+        LIST_FRESH_MS,
+    )
+    .await?;
     let Some(runtime) = pick(&index, &platform, &wanted) else {
         let what = match wanted {
             Wanted::Major(major) => format!("Java {major}"),
             Wanted::Component(component) => format!("runtime {component:?}"),
         };
-        return ApiError::unknown_runtime(&what, &platform).into_response();
+        return Err(ApiError::unknown_runtime(&what, &platform));
     };
     if !runtime
         .manifest
@@ -823,9 +862,9 @@ pub async fn java_runtime(
             runtime.component,
             runtime.manifest.url
         );
-        return failed(UpstreamFailure::Unreadable, "Mojang");
+        return Err(ListFailure::unreadable(Origin::Mojang).into());
     }
-    Json(runtime).into_response()
+    Ok(Json(runtime))
 }
 
 #[cfg(test)]
@@ -944,6 +983,11 @@ mod tests {
         .await;
         assert_eq!(ids(&fabric.json()), ["24w33a", "1.21.1", "1.21"]);
         assert_eq!(mock.calls(), 4);
+
+        let any_case = get(&gateway.router, "/v1/minecraft/versions?loader=NeoForge").await;
+        assert_eq!(ids(&any_case.json()), ["1.21.1", "1.21"]);
+        let unknown = get(&gateway.router, "/v1/minecraft/versions?loader=quilt").await;
+        assert_eq!(unknown.json()["code"], "INVALID_QUERY");
     }
 
     #[tokio::test]
@@ -1304,13 +1348,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_source_answering_200_with_something_unreadable_is_a_502() {
+    async fn a_200_the_gateway_cannot_read_is_a_502_and_not_kept() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "not json")).await;
         let gateway = gateway(&mock);
-        let got = get(&gateway.router, "/v1/minecraft/versions").await;
-        assert_eq!(got.status, StatusCode::BAD_GATEWAY);
-        assert_eq!(got.json()["code"], "UPSTREAM_UNREADABLE");
-        assert!(got.json()["message"].as_str().unwrap().contains("Mojang"));
+        for _ in 0..2 {
+            let got = get(&gateway.router, "/v1/minecraft/versions").await;
+            assert_eq!(got.status, StatusCode::BAD_GATEWAY);
+            assert_eq!(got.json()["code"], "UPSTREAM_UNREADABLE");
+            assert!(got.json()["message"].as_str().unwrap().contains("Mojang"));
+        }
+        assert_eq!(mock.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_200_after_a_good_list_answers_the_old_list() {
+        let mock = Mock::start(Duration::ZERO, |call, seen| {
+            if call == 0 {
+                sources(call, seen)
+            } else {
+                reply(200, r#"{"versions":"not a list"}"#)
+            }
+        })
+        .await;
+        let gateway = gateway(&mock);
+        let fresh = get(&gateway.router, "/v1/minecraft/loaders/neoforge/versions").await;
+
+        gateway.clock.advance(LIST_FRESH_MS + 1);
+        for _ in 0..2 {
+            let stale = get(&gateway.router, "/v1/minecraft/loaders/neoforge/versions").await;
+            assert_eq!(stale.status, StatusCode::OK);
+            assert_eq!(stale.json(), fresh.json());
+        }
+        assert_eq!(mock.calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_kept_copy_that_does_not_read_counts_as_no_copy() {
+        let (mock, _never) = Mock::held_when(|seen| seen.uri == NEOFORGE_PATH, sources).await;
+        let gateway = gateway_with(
+            &mock,
+            GatewayWith {
+                timeouts: Timeouts {
+                    meta: Duration::from_millis(50),
+                    ..Timeouts::default()
+                },
+                ..GatewayWith::default()
+            },
+        );
+        let unreadable = |fresh_ms| {
+            Arc::new(Entry::new(
+                Answer {
+                    status: StatusCode::OK,
+                    content_type: None,
+                    body: Bytes::from_static(b"not json"),
+                },
+                NOV_3_2026_20H,
+                fresh_ms,
+            ))
+        };
+        gateway
+            .state
+            .cache
+            .insert("loader:forge", unreadable(LIST_FRESH_MS));
+        let fresh = get(&gateway.router, "/v1/minecraft/loaders/forge/versions").await;
+        assert_eq!(fresh.status, StatusCode::OK);
+        assert_eq!(mock.calls(), 1);
+
+        gateway.state.cache.insert("loader:neoforge", unreadable(0));
+        let failed = get(&gateway.router, "/v1/minecraft/loaders/neoforge/versions").await;
+        assert_eq!(failed.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(failed.json()["code"], "UPSTREAM_TIMEOUT");
+        assert_eq!(mock.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_loader_query_that_does_not_read_is_refused() {
+        let mock = Mock::start(Duration::ZERO, sources).await;
+        let gateway = gateway(&mock);
+        let got = get(
+            &gateway.router,
+            "/v1/minecraft/loaders/forge/versions?minecraft=1.20.1&minecraft=1.21.1",
+        )
+        .await;
+        assert_eq!(got.status, StatusCode::BAD_REQUEST);
+        assert_eq!(got.json()["code"], "INVALID_QUERY");
+        assert_eq!(mock.calls(), 0);
     }
 
     #[tokio::test]
