@@ -547,10 +547,9 @@ pub async fn version_files(
 
 #[cfg(test)]
 mod tests {
-    use axum::http::Request;
 
     use super::*;
-    use crate::test_support::*;
+    use crate::{app::Timeouts, test_support::*};
 
     const JEI: &str = "3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e";
     const SODIUM: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -567,7 +566,7 @@ mod tests {
             reply(200, format!(r#"{{"{JEI}":{}}}"#, version(JEI, "jei.jar")))
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
 
         let got = get(&gateway.router, &format!("/v1/modrinth/version_file/{JEI}")).await;
         assert_eq!(got.status, StatusCode::OK);
@@ -603,7 +602,7 @@ mod tests {
     #[tokio::test]
     async fn a_hash_modrinth_does_not_know_answers_404_and_is_kept_ten_minutes() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "{}")).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
 
         let got = get(&gateway.router, &format!("/v1/modrinth/version_file/{JEI}")).await;
         assert_eq!(got.status, StatusCode::NOT_FOUND);
@@ -635,13 +634,13 @@ mod tests {
             reply(200, body)
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         get(&gateway.router, &format!("/v1/modrinth/version_file/{JEI}")).await;
 
         let other = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
-        let got = send(
+        let got = post_json(
             &gateway.router,
-            Request::post("/v1/modrinth/version_files").header("content-type", "application/json"),
+            "/v1/modrinth/version_files",
             &format!(r#"{{"hashes":["{JEI}","{SODIUM}","{other}","{JEI}"],"algorithm":"sha1"}}"#),
         )
         .await;
@@ -658,9 +657,9 @@ mod tests {
             serde_json::json!([SODIUM, other])
         );
 
-        let again = send(
+        let again = post_json(
             &gateway.router,
-            Request::post("/v1/modrinth/version_files").header("content-type", "application/json"),
+            "/v1/modrinth/version_files",
             &format!(r#"{{"hashes":["{SODIUM}","{other}"]}}"#),
         )
         .await;
@@ -671,7 +670,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_a_bad_hash_or_body() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "{}")).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
 
         let got = get(&gateway.router, "/v1/modrinth/version_file/not-a-hash").await;
         assert_eq!(got.status, StatusCode::BAD_REQUEST);
@@ -686,13 +685,7 @@ mod tests {
             (many.as_str(), "INVALID_BODY"),
             (r#"{"hashes":["abc"]}"#, "INVALID_HASH"),
         ] {
-            let got = send(
-                &gateway.router,
-                Request::post("/v1/modrinth/version_files")
-                    .header("content-type", "application/json"),
-                body,
-            )
-            .await;
+            let got = post_json(&gateway.router, "/v1/modrinth/version_files", body).await;
             assert_eq!(got.status, StatusCode::BAD_REQUEST, "{body}");
             assert_eq!(got.json()["code"], code, "{body}");
         }
@@ -709,7 +702,7 @@ mod tests {
             }
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         get(&gateway.router, &format!("/v1/modrinth/version_file/{JEI}")).await;
 
         gateway.clock.advance(FOUND_MS + 1);
@@ -728,6 +721,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_modrinth_that_does_not_answer_in_time_is_a_504() {
+        let mock = Mock::start(Duration::from_millis(500), |_, _| reply(200, "{}")).await;
+        let gateway = gateway_with(
+            &mock,
+            GatewayWith {
+                timeouts: Timeouts {
+                    modrinth: Duration::from_millis(50),
+                    ..Timeouts::default()
+                },
+                ..GatewayWith::default()
+            },
+        );
+        let got = get(&gateway.router, "/v1/modrinth/project/jei").await;
+        assert_eq!(got.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(got.json()["code"], "UPSTREAM_TIMEOUT");
+        assert_eq!(
+            gateway.state.modrinth_budget.snapshot().await.days[0].pools[0]
+                .counts
+                .calls,
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn a_search_passes_through_with_the_query_and_stays_fresh_five_minutes() {
         let mock = Mock::start(Duration::ZERO, |_, _| {
             reply(
@@ -736,7 +753,7 @@ mod tests {
             )
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
 
         let got = get(
             &gateway.router,
@@ -783,7 +800,7 @@ mod tests {
             }
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
 
         let got = get(&gateway.router, "/v1/modrinth/project/sodium").await;
         assert_eq!(got.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -817,12 +834,11 @@ mod tests {
     #[tokio::test]
     async fn another_hash_algorithm_goes_to_modrinth_as_it_came() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, r#"{"x":{}}"#)).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         for _ in 0..2 {
-            let got = send(
+            let got = post_json(
                 &gateway.router,
-                Request::post("/v1/modrinth/version_files")
-                    .header("content-type", "application/json"),
+                "/v1/modrinth/version_files",
                 r#"{"hashes":["abc"],"algorithm":"sha512"}"#,
             )
             .await;
@@ -845,7 +861,7 @@ mod tests {
     #[tokio::test]
     async fn a_slug_with_the_characters_modrinth_allows_passes_and_a_dot_segment_does_not() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, r#"{"slug":"x"}"#)).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         let got = get(
             &gateway.router,
             "/v1/modrinth/project/fabric-api.v1+jar(a)!",
@@ -878,12 +894,11 @@ mod tests {
     #[tokio::test]
     async fn a_post_to_another_route_goes_to_modrinth_uncached() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "{}")).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         for _ in 0..2 {
-            let got = send(
+            let got = post_json(
                 &gateway.router,
-                Request::post("/v1/modrinth/version_files/update")
-                    .header("content-type", "application/json"),
+                "/v1/modrinth/version_files/update",
                 r#"{"hashes":["a"],"algorithm":"sha1","loaders":["fabric"],"game_versions":["1.21"]}"#,
             )
             .await;

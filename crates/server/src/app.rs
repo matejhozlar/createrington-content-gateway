@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Router, middleware,
@@ -7,7 +7,7 @@ use axum::{
 
 use crate::{
     auth,
-    budget::{self, Budget, Clock, SystemClock},
+    budget::{self, Budget, Clock},
     cache::AnswerCache,
     config::{Config, Consumer},
     curseforge::{self, CURSEFORGE_API},
@@ -49,7 +49,13 @@ impl AppState {
         }
     }
 
-    pub fn from_config(config: &Config, redis: Option<Arc<RedisStore>>) -> reqwest::Result<Self> {
+    pub fn new(
+        config: &Config,
+        addresses: &Addresses,
+        timeouts: Timeouts,
+        clock: Arc<dyn Clock>,
+        redis: Option<Arc<RedisStore>>,
+    ) -> reqwest::Result<Self> {
         let pools = config.consumers.iter().flat_map(|consumer| {
             consumer
                 .pools
@@ -57,7 +63,6 @@ impl AppState {
                 .map(|pool| (consumer.name.as_str(), pool.as_str()))
         });
         let pools: Vec<(&str, &str)> = pools.collect();
-        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         Ok(Self {
             budget: Budget::new(
                 Source::CurseForge,
@@ -77,31 +82,76 @@ impl AppState {
             .keeping_days(config.budget_history_days),
             upstream: Upstream::new(
                 Source::CurseForge,
-                CURSEFORGE_API,
+                &addresses.curseforge_api,
                 Some(config.curseforge_api_key.clone()),
                 &config.user_agent,
-                curseforge::TIMEOUT,
+                timeouts.curseforge,
             )?,
             modrinth: Upstream::new(
                 Source::Modrinth,
-                MODRINTH_API,
+                &addresses.modrinth_api,
                 None,
                 &config.user_agent,
-                modrinth::TIMEOUT,
+                timeouts.modrinth,
             )?,
-            cdn: Cdn::new(CURSEFORGE_CDN, &config.user_agent, resolve::CDN_TIMEOUT)?,
+            cdn: Cdn::new(&addresses.curseforge_cdn, &config.user_agent, timeouts.cdn)?,
             meta: Meta::new(
-                MOJANG_META,
-                NEOFORGE_MAVEN,
-                FORGE_FILES,
-                FABRIC_META,
+                &addresses.mojang_meta,
+                &addresses.neoforge_maven,
+                &addresses.forge_files,
+                &addresses.fabric_meta,
                 &config.user_agent,
-                versions::TIMEOUT,
+                timeouts.meta,
             )?,
             cache: AnswerCache::new(redis),
             clock,
             consumers: config.consumers.clone(),
         })
+    }
+}
+
+/// Where each upstream client sends its calls.
+pub struct Addresses {
+    pub curseforge_api: String,
+    pub modrinth_api: String,
+    pub curseforge_cdn: String,
+    pub mojang_meta: String,
+    pub neoforge_maven: String,
+    pub forge_files: String,
+    pub fabric_meta: String,
+}
+
+impl Default for Addresses {
+    fn default() -> Self {
+        Self {
+            curseforge_api: CURSEFORGE_API.to_owned(),
+            modrinth_api: MODRINTH_API.to_owned(),
+            curseforge_cdn: CURSEFORGE_CDN.to_owned(),
+            mojang_meta: MOJANG_META.to_owned(),
+            neoforge_maven: NEOFORGE_MAVEN.to_owned(),
+            forge_files: FORGE_FILES.to_owned(),
+            fabric_meta: FABRIC_META.to_owned(),
+        }
+    }
+}
+
+/// How long each upstream client waits for an answer.
+#[derive(Debug, Clone, Copy)]
+pub struct Timeouts {
+    pub curseforge: Duration,
+    pub modrinth: Duration,
+    pub cdn: Duration,
+    pub meta: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            curseforge: curseforge::TIMEOUT,
+            modrinth: modrinth::TIMEOUT,
+            cdn: resolve::CDN_TIMEOUT,
+            meta: versions::TIMEOUT,
+        }
     }
 }
 
@@ -140,106 +190,40 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 #[cfg(test)]
-pub(crate) fn test_state(consumers: Vec<Consumer>) -> Arc<AppState> {
-    let pools: Vec<(String, String)> = consumers
-        .iter()
-        .flat_map(|consumer| {
-            consumer
-                .pools
-                .iter()
-                .map(|pool| (consumer.name.clone(), pool.clone()))
-        })
-        .collect();
-    Arc::new(AppState {
-        budget: Budget::new(
-            Source::CurseForge,
-            300,
-            pools.clone(),
-            Arc::new(SystemClock),
-            None,
-        ),
-        modrinth_budget: Budget::new(Source::Modrinth, 300, pools, Arc::new(SystemClock), None),
-        upstream: Upstream::new(
-            Source::CurseForge,
-            "http://127.0.0.1:9/v1",
-            Some(crate::config::ApiKey::new("unused")),
-            crate::config::DEFAULT_USER_AGENT,
-            curseforge::TIMEOUT,
-        )
-        .unwrap(),
-        modrinth: Upstream::new(
-            Source::Modrinth,
-            "http://127.0.0.1:9/v2",
-            None,
-            crate::config::DEFAULT_USER_AGENT,
-            modrinth::TIMEOUT,
-        )
-        .unwrap(),
-        cdn: Cdn::new(
-            "http://127.0.0.1:9",
-            crate::config::DEFAULT_USER_AGENT,
-            resolve::CDN_TIMEOUT,
-        )
-        .unwrap(),
-        meta: Meta::new(
-            "http://127.0.0.1:9",
-            "http://127.0.0.1:9",
-            "http://127.0.0.1:9",
-            "http://127.0.0.1:9",
-            crate::config::DEFAULT_USER_AGENT,
-            versions::TIMEOUT,
-        )
-        .unwrap(),
-        cache: AnswerCache::default(),
-        clock: Arc::new(SystemClock),
-        consumers,
-    })
-}
-
-#[cfg(test)]
 mod tests {
     use axum::{
         body::Body,
-        http::{Request, StatusCode, header},
+        http::{Request, StatusCode},
     };
-    use http_body_util::BodyExt;
     use serde_json::Value;
-    use tower::ServiceExt;
 
     use super::*;
-    use crate::config::Token;
-
-    const TOKEN: &str = "app-token-0123456789abcdef0123456789";
+    use crate::test_support::{
+        self, KEY, Mock, NOV_3_2026_20H, Reply, TOKEN, TestClock, USER_AGENT, call, consumer,
+        reply, test_state,
+    };
 
     fn app() -> Router {
-        router(test_state(vec![Consumer {
-            name: "app".to_owned(),
-            token: Token::new(TOKEN),
-            pools: vec!["launcher".to_owned(), "app".to_owned()],
-        }]))
+        router(test_state(vec![consumer(
+            "app",
+            TOKEN,
+            &["launcher", "app"],
+        )]))
     }
 
-    async fn get(uri: &str, token: Option<&str>) -> (StatusCode, Option<String>, Vec<u8>) {
-        let mut request = Request::get(uri);
-        if let Some(token) = token {
-            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
-        }
-        let response = app()
-            .oneshot(request.body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let status = response.status();
-        let content_type = response
-            .headers()
-            .get(header::CONTENT_TYPE)
-            .map(|value| value.to_str().unwrap().to_owned());
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        (status, content_type, body.to_vec())
+    async fn get(uri: &str, authenticated: bool) -> (StatusCode, Option<String>, Vec<u8>) {
+        let got = if authenticated {
+            test_support::get(&app(), uri).await
+        } else {
+            call(&app(), Request::get(uri).body(Body::empty()).unwrap()).await
+        };
+        let content_type = got.header("content-type").map(str::to_owned);
+        (got.status, content_type, got.body.to_vec())
     }
 
     #[tokio::test]
     async fn healthz_answers_ok_as_json_without_a_token() {
-        let (status, content_type, body) = get("/v1/healthz", None).await;
+        let (status, content_type, body) = get("/v1/healthz", false).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(content_type.as_deref(), Some("application/json"));
 
@@ -252,7 +236,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_openapi_document_is_served_without_a_token_as_checked_in() {
-        let (status, content_type, body) = get("/v1/openapi.json", None).await;
+        let (status, content_type, body) = get("/v1/openapi.json", false).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(content_type.as_deref(), Some("application/json"));
 
@@ -265,13 +249,13 @@ mod tests {
 
     #[tokio::test]
     async fn the_budget_needs_a_token() {
-        let (status, _, _) = get("/v1/budget", None).await;
+        let (status, _, _) = get("/v1/budget", false).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
     async fn the_budget_lists_every_pool_without_a_pool_header() {
-        let (status, _, body) = get("/v1/budget", Some(TOKEN)).await;
+        let (status, _, body) = get("/v1/budget", true).await;
         assert_eq!(status, StatusCode::OK);
 
         let body: Value = serde_json::from_slice(&body).unwrap();
@@ -290,14 +274,14 @@ mod tests {
 
     #[tokio::test]
     async fn the_budget_answers_the_days_asked_for_and_refuses_a_bad_number() {
-        let (status, _, body) = get("/v1/budget?days=30", Some(TOKEN)).await;
+        let (status, _, body) = get("/v1/budget?days=30", true).await;
         assert_eq!(status, StatusCode::OK);
         let body: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["historyDays"], 90);
         assert_eq!(body["curseforge"]["days"], Value::Array(Vec::new()));
 
         for query in ["days=0", "days=-1", "days=many", "days="] {
-            let (status, _, body) = get(&format!("/v1/budget?{query}"), Some(TOKEN)).await;
+            let (status, _, body) = get(&format!("/v1/budget?{query}"), true).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{query}");
             let body: Value = serde_json::from_slice(&body).unwrap();
             assert_eq!(body["code"], "INVALID_DAYS", "{query}");
@@ -305,8 +289,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_config_gives_each_client_its_address_key_and_user_agent_and_sets_the_budgets() {
+        let mock = Mock::start(Duration::ZERO, |_, seen| {
+            match (seen.method.as_str(), seen.uri.as_str()) {
+                ("POST", "/curseforge/mods/files") => reply(
+                    200,
+                    r#"{"data":[{"id":1001,"modId":100,"fileName":"jei.jar","fileLength":10,"downloadUrl":null,"hashes":[{"value":"3E1DD9FB5EA2F0DD4FFCC2B1A7D0BB1A1A9D6A8E","algo":1}]}]}"#,
+                ),
+                ("HEAD", _) => Reply {
+                    status: 200,
+                    headers: vec![("content-length", "10")],
+                    body: String::new(),
+                },
+                _ => reply(200, "{}"),
+            }
+        })
+        .await;
+        let config = Config::from_lookup(|name| {
+            let value = match name {
+                "CURSEFORGE_API_KEY" => KEY,
+                "CONTENT_GATEWAY_TOKEN" => TOKEN,
+                "CONTENT_GATEWAY_USER_AGENT" => USER_AGENT,
+                "CONTENT_GATEWAY_BUDGET_PER_MINUTE" => "7",
+                "CONTENT_GATEWAY_MODRINTH_PER_MINUTE" => "8",
+                "CONTENT_GATEWAY_BUDGET_HISTORY_DAYS" => "30",
+                _ => return None,
+            };
+            Some(value.to_owned())
+        })
+        .unwrap();
+        let base = &mock.base;
+        let addresses = Addresses {
+            curseforge_api: format!("{base}/curseforge"),
+            modrinth_api: format!("{base}/modrinth"),
+            curseforge_cdn: format!("{base}/cdn"),
+            mojang_meta: format!("{base}/mojang"),
+            neoforge_maven: format!("{base}/neoforge"),
+            forge_files: format!("{base}/forge"),
+            fabric_meta: format!("{base}/fabric"),
+        };
+        let state = AppState::new(
+            &config,
+            &addresses,
+            Timeouts::default(),
+            TestClock::at(NOV_3_2026_20H),
+            None,
+        )
+        .unwrap();
+        let app = router(Arc::new(state));
+
+        let key = Some(KEY);
+        for (uri, expected) in [
+            ("/v1/curseforge/mods/1", vec![("curseforge", key)]),
+            ("/v1/modrinth/project/jei", vec![("modrinth", None)]),
+            ("/v1/minecraft/versions", vec![("mojang", None)]),
+            (
+                "/v1/minecraft/loaders/neoforge/versions",
+                vec![("neoforge", None)],
+            ),
+            (
+                "/v1/minecraft/loaders/forge/versions",
+                vec![("forge", None)],
+            ),
+            (
+                "/v1/minecraft/loaders/fabric/versions",
+                vec![("fabric", None)],
+            ),
+            (
+                "/v1/resolve",
+                vec![("curseforge", key), ("modrinth", None), ("cdn", None)],
+            ),
+        ] {
+            let before = mock.calls();
+            if uri == "/v1/resolve" {
+                test_support::post_json(&app, uri, r#"{"fileIds":[1001]}"#).await;
+            } else {
+                test_support::get(&app, uri).await;
+            }
+            let reached: Vec<(String, Option<String>)> = mock.seen()[before..]
+                .iter()
+                .map(|seen| {
+                    assert_eq!(seen.user_agent.as_deref(), Some(USER_AGENT), "{uri}");
+                    let first = seen.uri.split('/').nth(1).unwrap_or_default();
+                    (first.to_owned(), seen.key.clone())
+                })
+                .collect();
+            let expected: Vec<(String, Option<String>)> = expected
+                .into_iter()
+                .map(|(first, key)| (first.to_owned(), key.map(str::to_owned)))
+                .collect();
+            assert_eq!(reached, expected, "{uri}");
+        }
+
+        let budget = test_support::get(&app, "/v1/budget").await.json();
+        assert_eq!(budget["historyDays"], 30);
+        assert_eq!(budget["curseforge"]["limitPerMinute"], 7);
+        assert_eq!(budget["modrinth"]["limitPerMinute"], 8);
+        assert_eq!(budget["curseforge"]["pools"][0]["consumer"], "default");
+    }
+
+    #[tokio::test]
     async fn unknown_routes_answer_not_found_without_a_token() {
-        let (status, _, _) = get("/v1/nothing-here", None).await;
+        let (status, _, _) = get("/v1/nothing-here", false).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 }

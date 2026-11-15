@@ -171,10 +171,9 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
-    use tower::ServiceExt;
 
     use super::*;
-    use crate::test_support::*;
+    use crate::{app::Timeouts, test_support::*};
 
     #[tokio::test]
     async fn passes_an_answer_through_as_it_came() {
@@ -185,7 +184,7 @@ mod tests {
             )
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
 
         let got = get(
             &gateway.router,
@@ -216,7 +215,7 @@ mod tests {
     #[tokio::test]
     async fn a_fresh_answer_comes_from_the_cache_and_counts_as_a_hit() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, r#"{"data":{"id":1}}"#)).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
 
         assert_eq!(
             get(&gateway.router, "/v1/curseforge/mods/1")
@@ -238,7 +237,7 @@ mod tests {
     #[tokio::test]
     async fn the_order_of_query_parameters_does_not_matter_to_the_cache() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "{}")).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         get(
             &gateway.router,
             "/v1/curseforge/mods/search?gameId=432&classId=6",
@@ -261,7 +260,7 @@ mod tests {
     #[tokio::test]
     async fn an_answer_stays_fresh_for_the_time_of_its_route() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "{}")).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         get(&gateway.router, "/v1/curseforge/mods/1").await;
         get(&gateway.router, "/v1/curseforge/mods/search?gameId=432").await;
 
@@ -292,7 +291,7 @@ mod tests {
     #[tokio::test]
     async fn not_found_is_kept_for_the_shorter_not_found_time() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(404, "")).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         assert_eq!(
             get(&gateway.router, "/v1/curseforge/mods/1").await.status,
             StatusCode::NOT_FOUND
@@ -319,7 +318,7 @@ mod tests {
             reply(200, format!("{{\"call\":{call}}}"))
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         get(&gateway.router, "/v1/curseforge/mods/1/files").await;
 
         let forced = send(
@@ -341,7 +340,7 @@ mod tests {
     #[tokio::test]
     async fn concurrent_misses_make_one_call() {
         let mock = Mock::start(Duration::from_millis(100), |_, _| reply(200, "{}")).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         let requests: Vec<_> = (0..5)
             .map(|_| {
                 let router = gateway.router.clone();
@@ -366,7 +365,7 @@ mod tests {
     #[tokio::test]
     async fn a_call_finishes_and_is_recorded_after_its_caller_is_gone() {
         let mock = Mock::start(Duration::from_millis(200), |_, _| reply(200, "{}")).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         let caller = {
             let router = gateway.router.clone();
             tokio::spawn(async move { get(&router, "/v1/curseforge/mods/1").await })
@@ -397,7 +396,7 @@ mod tests {
             reply(200, format!("{{\"call\":{call}}}"))
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         let plain = {
             let router = gateway.router.clone();
             tokio::spawn(async move { get(&router, "/v1/curseforge/mods/1").await })
@@ -424,7 +423,7 @@ mod tests {
             body: String::new(),
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
 
         let throttled = get(&gateway.router, "/v1/curseforge/mods/1").await;
         assert_eq!(throttled.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -450,7 +449,7 @@ mod tests {
             _ => reply(502, "bad gateway"),
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         get(&gateway.router, "/v1/curseforge/mods/1").await;
         gateway.clock.advance(2 * HOUR_MS);
 
@@ -470,7 +469,13 @@ mod tests {
     #[tokio::test]
     async fn a_stale_answer_is_served_when_the_budget_refuses() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "{}")).await;
-        let gateway = gateway(&mock, 1, TIMEOUT);
+        let gateway = gateway_with(
+            &mock,
+            GatewayWith {
+                limit: 1,
+                ..GatewayWith::default()
+            },
+        );
         get(&gateway.router, "/v1/curseforge/mods/1").await;
         gateway.clock.advance(2 * HOUR_MS);
         get(&gateway.router, "/v1/curseforge/mods/2").await;
@@ -486,7 +491,7 @@ mod tests {
     #[tokio::test]
     async fn an_error_answer_is_passed_on_and_not_kept() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(500, r#"{"error":"boom"}"#)).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         let first = get(&gateway.router, "/v1/curseforge/mods/1").await;
         assert_eq!(
             (first.status, first.body),
@@ -502,7 +507,7 @@ mod tests {
     #[tokio::test]
     async fn a_post_that_is_not_a_plain_batch_goes_through_with_its_body() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, r#"{"data":[]}"#)).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         for _ in 0..2 {
             let got = send(
                 &gateway.router,
@@ -524,7 +529,7 @@ mod tests {
     #[tokio::test]
     async fn a_route_outside_the_cache_table_is_counted_but_not_kept() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "{}")).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         get(&gateway.router, "/v1/curseforge/games").await;
         get(&gateway.router, "/v1/curseforge/games").await;
         assert_eq!(mock.calls(), 2);
@@ -534,7 +539,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_a_path_that_could_leave_the_v1_api() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "{}")).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         for uri in [
             "/v1/curseforge/..%2Fv2%2Fmods",
             "/v1/curseforge/mods/1%3Fpage=2",
@@ -551,7 +556,16 @@ mod tests {
     #[tokio::test]
     async fn a_curseforge_that_does_not_answer_in_time_is_a_504() {
         let mock = Mock::start(Duration::from_millis(500), |_, _| reply(200, "{}")).await;
-        let gateway = gateway(&mock, 300, Duration::from_millis(50));
+        let gateway = gateway_with(
+            &mock,
+            GatewayWith {
+                timeouts: Timeouts {
+                    curseforge: Duration::from_millis(50),
+                    ..Timeouts::default()
+                },
+                ..GatewayWith::default()
+            },
+        );
         let got = get(&gateway.router, "/v1/curseforge/mods/1").await;
         assert_eq!(got.status, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(got.json()["code"], "UPSTREAM_TIMEOUT");
@@ -566,18 +580,15 @@ mod tests {
     #[tokio::test]
     async fn needs_a_token() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "{}")).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-        let response = gateway
-            .router
-            .clone()
-            .oneshot(
-                Request::get("/v1/curseforge/mods/1")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let gateway = gateway(&mock);
+        let got = call(
+            &gateway.router,
+            Request::get("/v1/curseforge/mods/1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(got.status, StatusCode::UNAUTHORIZED);
         assert_eq!(mock.calls(), 0);
     }
 

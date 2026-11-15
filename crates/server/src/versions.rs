@@ -836,7 +836,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::{curseforge::TIMEOUT as CF_TIMEOUT, test_support::*};
+    use crate::test_support::*;
 
     fn manifest_body(base: &str) -> String {
         json!({
@@ -901,7 +901,7 @@ mod tests {
     #[tokio::test]
     async fn lists_releases_by_default_snapshots_or_everything_on_request_and_keeps_the_manifest() {
         let mock = Mock::start(Duration::ZERO, sources).await;
-        let gateway = gateway(&mock, 300, CF_TIMEOUT);
+        let gateway = gateway(&mock);
 
         let got = get(&gateway.router, "/v1/minecraft/versions").await;
         assert_eq!(got.status, StatusCode::OK);
@@ -934,7 +934,7 @@ mod tests {
     #[tokio::test]
     async fn narrows_the_versions_to_the_ones_a_loader_builds_for() {
         let mock = Mock::start(Duration::ZERO, sources).await;
-        let gateway = gateway(&mock, 300, CF_TIMEOUT);
+        let gateway = gateway(&mock);
 
         let neoforge = get(&gateway.router, "/v1/minecraft/versions?loader=neoforge").await;
         assert_eq!(ids(&neoforge.json()), ["1.21.1", "1.21"]);
@@ -952,7 +952,7 @@ mod tests {
     #[tokio::test]
     async fn a_version_tells_the_java_it_needs_and_is_kept_a_day() {
         let mock = Mock::start(Duration::ZERO, sources).await;
-        let gateway = gateway(&mock, 300, CF_TIMEOUT);
+        let gateway = gateway(&mock);
 
         let got = get(&gateway.router, "/v1/minecraft/versions/1.21.1").await;
         assert_eq!(got.status, StatusCode::OK);
@@ -975,7 +975,7 @@ mod tests {
     #[tokio::test]
     async fn lists_a_loader_s_builds_newest_first_and_narrows_them_to_a_minecraft_version() {
         let mock = Mock::start(Duration::ZERO, sources).await;
-        let gateway = gateway(&mock, 300, CF_TIMEOUT);
+        let gateway = gateway(&mock);
 
         let neoforge = get(&gateway.router, "/v1/minecraft/loaders/neoforge/versions").await;
         assert_eq!(neoforge.status, StatusCode::OK);
@@ -1043,7 +1043,7 @@ mod tests {
             }
         })
         .await;
-        let gateway = gateway(&mock, 300, CF_TIMEOUT);
+        let gateway = gateway(&mock);
         get(&gateway.router, "/v1/minecraft/versions").await;
         get(&gateway.router, "/v1/minecraft/loaders/fabric/versions").await;
 
@@ -1094,7 +1094,7 @@ mod tests {
             uri => panic!("unexpected {uri}"),
         })
         .await;
-        let gateway = gateway(&mock, 300, CF_TIMEOUT);
+        let gateway = gateway(&mock);
 
         let builds = get(
             &gateway.router,
@@ -1149,7 +1149,7 @@ mod tests {
     #[tokio::test]
     async fn a_java_runtime_is_found_by_major_or_component_from_one_kept_list() {
         let mock = Mock::start(Duration::ZERO, runtimes).await;
-        let gateway = gateway(&mock, 300, CF_TIMEOUT);
+        let gateway = gateway(&mock);
 
         let got = get(
             &gateway.router,
@@ -1208,7 +1208,7 @@ mod tests {
     #[tokio::test]
     async fn a_java_runtime_mojang_does_not_ship_or_a_bad_query_is_refused() {
         let mock = Mock::start(Duration::ZERO, runtimes).await;
-        let gateway = gateway(&mock, 300, CF_TIMEOUT);
+        let gateway = gateway(&mock);
 
         for missing in [
             "/v1/minecraft/java?platform=linux&major=25",
@@ -1247,7 +1247,7 @@ mod tests {
             )
         })
         .await;
-        let gateway = gateway(&mock, 300, CF_TIMEOUT);
+        let gateway = gateway(&mock);
         let got = get(
             &gateway.router,
             "/v1/minecraft/java?platform=linux&major=21",
@@ -1300,7 +1300,7 @@ mod tests {
             uri => panic!("unexpected {uri}"),
         })
         .await;
-        let gateway = gateway(&mock, 300, CF_TIMEOUT);
+        let gateway = gateway(&mock);
         let got = get(&gateway.router, "/v1/minecraft/versions/1.21.1").await;
         assert_eq!(got.status, StatusCode::BAD_GATEWAY);
         assert_eq!(mock.calls(), 1);

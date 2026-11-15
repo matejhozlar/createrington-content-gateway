@@ -891,74 +891,14 @@ fn utc_date(ms: u64) -> String {
 }
 
 #[cfg(test)]
-pub(crate) struct TestClock(std::sync::atomic::AtomicU64);
-
-#[cfg(test)]
-impl TestClock {
-    pub(crate) fn at(ms: u64) -> Arc<Self> {
-        Arc::new(Self(std::sync::atomic::AtomicU64::new(ms)))
-    }
-
-    pub(crate) fn advance(&self, ms: u64) {
-        self.0.fetch_add(ms, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-#[cfg(test)]
-impl Clock for TestClock {
-    fn now_ms(&self) -> u64 {
-        self.0.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
     use super::*;
+    use crate::test_support::{NOV_3_2026_20H, TestClock, TestRedis};
 
-    const NOV_3_2026_20H: u64 = 1_793_736_000_000;
-    const TEST_REDIS_ENV: &str = "CONTENT_GATEWAY_TEST_REDIS_URL";
     const POOLS: [(&str, &str); 3] = [("app", "launcher"), ("app", "app"), ("sandbox", "jobs")];
 
-    fn test_redis_url() -> Option<String> {
-        std::env::var(TEST_REDIS_ENV)
-            .ok()
-            .filter(|url| !url.trim().is_empty())
-    }
-
-    fn unique_prefix() -> String {
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        format!(
-            "content-gateway-test:{}:{}:{}",
-            std::process::id(),
-            SystemClock.now_ms(),
-            NEXT.fetch_add(1, Ordering::SeqCst)
-        )
-    }
-
-    async fn forget(url: &str, prefix: &str) {
-        let mut connection = redis::Client::open(url)
-            .unwrap()
-            .get_multiplexed_async_connection()
-            .await
-            .unwrap();
-        let keys: Vec<String> = redis::cmd("KEYS")
-            .arg(format!("{prefix}:*"))
-            .query_async(&mut connection)
-            .await
-            .unwrap();
-        if !keys.is_empty() {
-            redis::cmd("DEL")
-                .arg(keys)
-                .query_async::<()>(&mut connection)
-                .await
-                .unwrap();
-        }
-    }
-
     struct Backends {
-        redis: Option<(String, String)>,
+        redis: Option<TestRedis>,
         budgets: Vec<(Source, Budget)>,
     }
 
@@ -979,9 +919,8 @@ mod tests {
                 )
                 .keeping_days(days),
             )];
-            let redis = test_redis_url().map(|url| (url, unique_prefix()));
-            if let Some((url, prefix)) = &redis {
-                let store = RedisStore::open(url, prefix.clone()).unwrap();
+            let redis = TestRedis::from_env();
+            if let Some(redis) = &redis {
                 budgets.push((
                     Source::Redis,
                     Budget::new(
@@ -989,7 +928,7 @@ mod tests {
                         limit,
                         POOLS,
                         clock.clone(),
-                        Some(Arc::new(store)),
+                        Some(redis.open()),
                     )
                     .keeping_days(days),
                 ));
@@ -998,11 +937,11 @@ mod tests {
         }
 
         async fn forget(self) {
-            if let Some((url, prefix)) = &self.redis {
+            if let Some(redis) = &self.redis {
                 for (_, budget) in &self.budgets {
                     budget.write_days_at_exit().await;
                 }
-                forget(url, prefix).await;
+                redis.forget().await;
             }
         }
     }
@@ -1316,12 +1255,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs CONTENT_GATEWAY_TEST_REDIS_URL"]
     async fn redis_keeps_the_minute_the_hold_and_the_days_across_a_restart() {
-        let Some(url) = test_redis_url() else {
-            eprintln!("{TEST_REDIS_ENV} is not set, skipped");
-            return;
-        };
-        let prefix = unique_prefix();
+        let redis = TestRedis::required();
         let clock = TestClock::at(NOV_3_2026_20H);
         let open = || {
             Budget::new(
@@ -1329,7 +1265,7 @@ mod tests {
                 5,
                 POOLS,
                 clock.clone(),
-                Some(Arc::new(RedisStore::open(&url, prefix.clone()).unwrap())),
+                Some(redis.open()),
             )
         };
 
@@ -1359,16 +1295,13 @@ mod tests {
 
         clock.advance(60_000);
         assert_eq!(after.admit("sandbox", "jobs", 5).await, Ok(()));
-        forget(&url, &prefix).await;
+        redis.forget().await;
     }
 
     #[tokio::test]
+    #[ignore = "needs CONTENT_GATEWAY_TEST_REDIS_URL"]
     async fn a_hold_redis_missed_is_stored_by_the_next_admit() {
-        let Some(url) = test_redis_url() else {
-            eprintln!("{TEST_REDIS_ENV} is not set, skipped");
-            return;
-        };
-        let prefix = unique_prefix();
+        let redis = TestRedis::required();
         let clock = TestClock::at(NOV_3_2026_20H);
         let open = || {
             Budget::new(
@@ -1376,7 +1309,7 @@ mod tests {
                 5,
                 POOLS,
                 clock.clone(),
-                Some(Arc::new(RedisStore::open(&url, prefix.clone()).unwrap())),
+                Some(redis.open()),
             )
         };
 
@@ -1391,25 +1324,22 @@ mod tests {
                 retry_after_ms: 60_000
             })
         );
-        forget(&url, &prefix).await;
+        redis.forget().await;
     }
 
     #[tokio::test]
+    #[ignore = "needs CONTENT_GATEWAY_TEST_REDIS_URL"]
     async fn the_exit_write_tries_redis_even_while_it_is_skipped() {
-        let Some(url) = test_redis_url() else {
-            eprintln!("{TEST_REDIS_ENV} is not set, skipped");
-            return;
-        };
-        let prefix = unique_prefix();
+        let redis = TestRedis::required();
         let clock = TestClock::at(NOV_3_2026_20H);
-        let store = RedisStore::open(&url, prefix.clone()).unwrap();
+        let store = redis.open();
         store.skip_for_a_while();
         let before = Budget::new(
             upstream::Source::CurseForge,
             5,
             POOLS,
             clock.clone(),
-            Some(Arc::new(store)),
+            Some(store),
         );
         before.record("app", "app", Some(200), None).await;
         before.write_days_at_exit().await;
@@ -1420,23 +1350,20 @@ mod tests {
             5,
             POOLS,
             clock,
-            Some(Arc::new(RedisStore::open(&url, prefix.clone()).unwrap())),
+            Some(redis.open()),
         );
         let snapshot = after.snapshot().await;
         assert_eq!(snapshot.source, Source::Redis);
         assert_eq!(snapshot.days[0].pools[0].counts.calls, 1);
-        forget(&url, &prefix).await;
+        redis.forget().await;
     }
 
     #[tokio::test]
+    #[ignore = "needs CONTENT_GATEWAY_TEST_REDIS_URL"]
     async fn daily_counts_never_expire_and_days_past_the_kept_are_deleted() {
-        let Some(url) = test_redis_url() else {
-            eprintln!("{TEST_REDIS_ENV} is not set, skipped");
-            return;
-        };
-        let prefix = unique_prefix();
+        let redis = TestRedis::required();
         let clock = TestClock::at(NOV_3_2026_20H);
-        let store = Arc::new(RedisStore::open(&url, prefix.clone()).unwrap());
+        let store = redis.open();
         let budget = Budget::new(
             upstream::Source::CurseForge,
             300,
@@ -1474,18 +1401,15 @@ mod tests {
             })
             .await;
         assert_eq!(ttl, Some(-1));
-        forget(&url, &prefix).await;
+        redis.forget().await;
     }
 
     #[tokio::test]
+    #[ignore = "needs CONTENT_GATEWAY_TEST_REDIS_URL"]
     async fn days_past_a_lowered_history_are_deleted_on_the_first_write() {
-        let Some(url) = test_redis_url() else {
-            eprintln!("{TEST_REDIS_ENV} is not set, skipped");
-            return;
-        };
-        let prefix = unique_prefix();
+        let redis = TestRedis::required();
         let clock = TestClock::at(NOV_3_2026_20H);
-        let store = Arc::new(RedisStore::open(&url, prefix.clone()).unwrap());
+        let store = redis.open();
         let long = Budget::new(
             upstream::Source::CurseForge,
             300,
@@ -1515,7 +1439,7 @@ mod tests {
         assert_eq!(days.len(), 14, "{days:?}");
         assert!(days[0].ends_with("2027-01-09"), "{days:?}");
         assert_eq!(short.history(90).await.days.len(), 14);
-        forget(&url, &prefix).await;
+        redis.forget().await;
     }
 
     async fn day_keys(store: &RedisStore) -> Vec<String> {
@@ -1538,14 +1462,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "needs CONTENT_GATEWAY_TEST_REDIS_URL"]
     async fn a_modrinth_budget_keeps_its_own_keys() {
-        let Some(url) = test_redis_url() else {
-            eprintln!("{TEST_REDIS_ENV} is not set, skipped");
-            return;
-        };
-        let prefix = unique_prefix();
+        let redis = TestRedis::required();
         let clock = TestClock::at(NOV_3_2026_20H);
-        let store = Arc::new(RedisStore::open(&url, prefix.clone()).unwrap());
+        let store = redis.open();
         let curseforge = Budget::new(
             upstream::Source::CurseForge,
             5,
@@ -1579,16 +1500,13 @@ mod tests {
         let modrinth = modrinth.snapshot().await;
         assert!(modrinth.held_until.is_some());
         assert_eq!(modrinth.days[0].pools[0].counts.throttled, 1);
-        forget(&url, &prefix).await;
+        redis.forget().await;
     }
 
     #[tokio::test]
+    #[ignore = "needs CONTENT_GATEWAY_TEST_REDIS_URL"]
     async fn two_budgets_on_one_redis_share_the_minute() {
-        let Some(url) = test_redis_url() else {
-            eprintln!("{TEST_REDIS_ENV} is not set, skipped");
-            return;
-        };
-        let prefix = unique_prefix();
+        let redis = TestRedis::required();
         let clock = TestClock::at(NOV_3_2026_20H);
         let open = || {
             Budget::new(
@@ -1596,7 +1514,7 @@ mod tests {
                 5,
                 POOLS,
                 clock.clone(),
-                Some(Arc::new(RedisStore::open(&url, prefix.clone()).unwrap())),
+                Some(redis.open()),
             )
         };
         let (first, second) = (open(), open());
@@ -1608,19 +1526,20 @@ mod tests {
             })
         );
         assert_eq!(second.admit("sandbox", "jobs", 2).await, Ok(()));
-        forget(&url, &prefix).await;
+        redis.forget().await;
     }
 
     #[tokio::test]
     async fn falls_back_to_memory_when_redis_does_not_answer() {
         let clock = TestClock::at(NOV_3_2026_20H);
-        let store = RedisStore::open("redis://127.0.0.1:1", unique_prefix()).unwrap();
+        let store =
+            Arc::new(RedisStore::open("redis://127.0.0.1:1", "content-gateway-test").unwrap());
         let budget = Budget::new(
             upstream::Source::CurseForge,
             2,
             POOLS,
             clock.clone(),
-            Some(Arc::new(store)),
+            Some(store),
         );
 
         assert_eq!(budget.admit("app", "app", 2).await, Ok(()));

@@ -261,17 +261,16 @@ fn join(pools: &[impl AsRef<str>]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use http_body_util::BodyExt;
+    use axum::http::HeaderMap;
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::test_support::collect;
 
-    async fn parts(error: ApiError) -> (StatusCode, axum::http::HeaderMap, Value) {
-        let response = error.into_response();
-        let status = response.status();
-        let headers = response.headers().clone();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        (status, headers, serde_json::from_slice(&body).unwrap())
+    async fn parts(error: ApiError) -> (StatusCode, HeaderMap, Value) {
+        let got = collect(error.into_response()).await;
+        let body = got.json();
+        (got.status, got.headers, body)
     }
 
     #[tokio::test]

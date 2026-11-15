@@ -1,15 +1,16 @@
 use std::{
+    net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Router,
     body::{Body, Bytes},
-    http::{HeaderMap, Request, StatusCode},
+    http::{HeaderMap, Request, StatusCode, request::Builder},
     response::Response,
 };
 use http_body_util::BodyExt;
@@ -18,21 +19,36 @@ use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 use crate::{
-    app::{self, AppState},
-    budget::{Budget, TestClock},
-    cache::AnswerCache,
-    config::{ApiKey, Consumer, Token},
-    modrinth,
+    app::{self, Addresses, AppState, Timeouts},
+    budget::{Clock, DEFAULT_HISTORY_DAYS},
+    config::{ApiKey, Config, Consumer, Token},
     redis_store::RedisStore,
-    resolve::{self, Cdn},
-    upstream::{Source, Upstream},
-    versions::{self, Meta},
 };
 
 pub(crate) const NOV_3_2026_20H: u64 = 1_793_736_000_000;
 pub(crate) const TOKEN: &str = "app-token-0123456789abcdef0123456789";
 pub(crate) const KEY: &str = "test-curseforge-key";
 pub(crate) const USER_AGENT: &str = "test-gateway/0 (https://example.com)";
+pub(crate) const TEST_REDIS_ENV: &str = "CONTENT_GATEWAY_TEST_REDIS_URL";
+const UNREACHABLE: &str = "http://127.0.0.1:9";
+
+pub(crate) struct TestClock(AtomicU64);
+
+impl TestClock {
+    pub(crate) fn at(ms: u64) -> Arc<Self> {
+        Arc::new(Self(AtomicU64::new(ms)))
+    }
+
+    pub(crate) fn advance(&self, ms: u64) {
+        self.0.fetch_add(ms, Ordering::SeqCst);
+    }
+}
+
+impl Clock for TestClock {
+    fn now_ms(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Seen {
@@ -123,83 +139,90 @@ impl Mock {
     }
 }
 
+pub(crate) fn addresses_at(base: &str) -> Addresses {
+    Addresses {
+        curseforge_api: format!("{base}/v1"),
+        modrinth_api: format!("{base}/v2"),
+        curseforge_cdn: base.to_owned(),
+        mojang_meta: base.to_owned(),
+        neoforge_maven: base.to_owned(),
+        forge_files: base.to_owned(),
+        fabric_meta: base.to_owned(),
+    }
+}
+
+pub(crate) fn consumer(name: &str, token: &str, pools: &[&str]) -> Consumer {
+    Consumer {
+        name: name.to_owned(),
+        token: Token::new(token),
+        pools: pools.iter().map(|pool| (*pool).to_owned()).collect(),
+    }
+}
+
+pub(crate) fn config(consumers: Vec<Consumer>, limit: u32) -> Config {
+    Config {
+        listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        consumers,
+        budget_per_minute: limit,
+        modrinth_per_minute: limit,
+        budget_history_days: DEFAULT_HISTORY_DAYS,
+        redis_url: None,
+        curseforge_api_key: ApiKey::new(KEY),
+        user_agent: USER_AGENT.to_owned(),
+    }
+}
+
+pub(crate) fn test_state(consumers: Vec<Consumer>) -> Arc<AppState> {
+    Arc::new(
+        AppState::new(
+            &config(consumers, 300),
+            &addresses_at(UNREACHABLE),
+            Timeouts::default(),
+            TestClock::at(NOV_3_2026_20H),
+            None,
+        )
+        .unwrap(),
+    )
+}
+
 pub(crate) struct Gateway {
     pub(crate) router: Router,
     pub(crate) state: Arc<AppState>,
     pub(crate) clock: Arc<TestClock>,
 }
 
-pub(crate) fn gateway(mock: &Mock, limit: u32, timeout: Duration) -> Gateway {
-    gateway_on(mock, limit, timeout, None)
+pub(crate) struct GatewayWith {
+    pub(crate) limit: u32,
+    pub(crate) timeouts: Timeouts,
+    pub(crate) redis: Option<Arc<RedisStore>>,
 }
 
-pub(crate) fn gateway_on(
-    mock: &Mock,
-    limit: u32,
-    timeout: Duration,
-    redis: Option<Arc<RedisStore>>,
-) -> Gateway {
-    gateway_with(mock, limit, timeout, redis, &["launcher"])
+impl Default for GatewayWith {
+    fn default() -> Self {
+        Self {
+            limit: 300,
+            timeouts: Timeouts::default(),
+            redis: None,
+        }
+    }
 }
 
-fn gateway_with(
-    mock: &Mock,
-    limit: u32,
-    timeout: Duration,
-    redis: Option<Arc<RedisStore>>,
-    pools: &[&str],
-) -> Gateway {
+pub(crate) fn gateway(mock: &Mock) -> Gateway {
+    gateway_with(mock, GatewayWith::default())
+}
+
+pub(crate) fn gateway_with(mock: &Mock, with: GatewayWith) -> Gateway {
     let clock = TestClock::at(NOV_3_2026_20H);
-    let consumers = vec![Consumer {
-        name: "app".to_owned(),
-        token: Token::new(TOKEN),
-        pools: pools.iter().map(|pool| (*pool).to_owned()).collect(),
-    }];
-    let state = Arc::new(AppState {
-        budget: Budget::new(
-            Source::CurseForge,
-            limit,
-            pools.iter().map(|pool| ("app", *pool)),
+    let state = Arc::new(
+        AppState::new(
+            &config(vec![consumer("app", TOKEN, &["launcher"])], with.limit),
+            &addresses_at(&mock.base),
+            with.timeouts,
             clock.clone(),
-            redis.clone(),
-        ),
-        modrinth_budget: Budget::new(
-            Source::Modrinth,
-            limit,
-            pools.iter().map(|pool| ("app", *pool)),
-            clock.clone(),
-            redis.clone(),
-        ),
-        upstream: Upstream::new(
-            Source::CurseForge,
-            format!("{}/v1", mock.base),
-            Some(ApiKey::new(KEY)),
-            USER_AGENT,
-            timeout,
+            with.redis,
         )
         .unwrap(),
-        modrinth: Upstream::new(
-            Source::Modrinth,
-            format!("{}/v2", mock.base),
-            None,
-            USER_AGENT,
-            modrinth::TIMEOUT,
-        )
-        .unwrap(),
-        cdn: Cdn::new(mock.base.clone(), USER_AGENT, resolve::CDN_TIMEOUT).unwrap(),
-        meta: Meta::new(
-            mock.base.clone(),
-            mock.base.clone(),
-            mock.base.clone(),
-            mock.base.clone(),
-            USER_AGENT,
-            versions::TIMEOUT,
-        )
-        .unwrap(),
-        cache: AnswerCache::new(redis),
-        clock: clock.clone(),
-        consumers,
-    });
+    );
     Gateway {
         router: app::router(state.clone()),
         state,
@@ -218,21 +241,16 @@ impl Got {
         self.headers.get(name).map(|value| value.to_str().unwrap())
     }
 
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8(self.body.to_vec()).unwrap()
+    }
+
     pub(crate) fn json(&self) -> Value {
         serde_json::from_slice(&self.body).unwrap()
     }
 }
 
-pub(crate) async fn send(
-    router: &Router,
-    request: axum::http::request::Builder,
-    body: &str,
-) -> Got {
-    let request = request
-        .header("authorization", format!("Bearer {TOKEN}"))
-        .body(Body::from(body.to_owned()))
-        .unwrap();
-    let response = router.clone().oneshot(request).await.unwrap();
+pub(crate) async fn collect(response: Response) -> Got {
     let status = response.status();
     let headers = response.headers().clone();
     let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -243,6 +261,80 @@ pub(crate) async fn send(
     }
 }
 
+pub(crate) async fn call(router: &Router, request: Request<Body>) -> Got {
+    collect(router.clone().oneshot(request).await.unwrap()).await
+}
+
+pub(crate) async fn send(router: &Router, request: Builder, body: &str) -> Got {
+    let request = request
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .body(Body::from(body.to_owned()))
+        .unwrap();
+    call(router, request).await
+}
+
 pub(crate) async fn get(router: &Router, uri: &str) -> Got {
     send(router, Request::get(uri), "").await
+}
+
+pub(crate) async fn post_json(router: &Router, uri: &str, body: &str) -> Got {
+    send(
+        router,
+        Request::post(uri).header("content-type", "application/json"),
+        body,
+    )
+    .await
+}
+
+pub(crate) struct TestRedis {
+    url: String,
+    prefix: String,
+}
+
+impl TestRedis {
+    pub(crate) fn from_env() -> Option<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let url = std::env::var(TEST_REDIS_ENV)
+            .ok()
+            .filter(|url| !url.trim().is_empty())?;
+        let started = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let prefix = format!(
+            "content-gateway-test:{}:{started}:{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::SeqCst)
+        );
+        Some(Self { url, prefix })
+    }
+
+    pub(crate) fn required() -> Self {
+        Self::from_env()
+            .unwrap_or_else(|| panic!("{TEST_REDIS_ENV} must name a Redis to run this test"))
+    }
+
+    pub(crate) fn open(&self) -> Arc<RedisStore> {
+        Arc::new(RedisStore::open(&self.url, self.prefix.clone()).unwrap())
+    }
+
+    pub(crate) async fn forget(&self) {
+        let mut connection = redis::Client::open(self.url.as_str())
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(format!("{}:*", self.prefix))
+            .query_async(&mut connection)
+            .await
+            .unwrap();
+        if !keys.is_empty() {
+            redis::cmd("DEL")
+                .arg(keys)
+                .query_async::<()>(&mut connection)
+                .await
+                .unwrap();
+        }
+    }
 }

@@ -511,7 +511,6 @@ async fn head(
 
 #[cfg(test)]
 mod tests {
-    use axum::http::Request;
     use serde_json::{Value, json};
 
     use super::*;
@@ -556,12 +555,7 @@ mod tests {
     }
 
     async fn resolve(gateway: &Gateway, body: &str) -> Got {
-        send(
-            &gateway.router,
-            Request::post("/v1/resolve").header("content-type", "application/json"),
-            body,
-        )
-        .await
+        post_json(&gateway.router, "/v1/resolve", body).await
     }
 
     #[tokio::test]
@@ -594,7 +588,7 @@ mod tests {
             uri => panic!("unexpected {uri}"),
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
 
         let got = resolve(&gateway, r#"{"fileIds":[1001,1002,1003,1004,9999,1001]}"#).await;
         assert_eq!(got.status, StatusCode::OK);
@@ -667,7 +661,7 @@ mod tests {
             uri => panic!("unexpected {uri}"),
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
 
         let off = resolve(&gateway, r#"{"fileIds":[1003],"cdn":false}"#).await;
         assert_eq!(off.json()["files"][0]["source"], Value::Null);
@@ -703,7 +697,7 @@ mod tests {
             uri => panic!("unexpected {uri}"),
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
 
         let got = resolve(&gateway, r#"{"fileIds":[1003,1006]}"#).await;
         assert_eq!(got.status, StatusCode::OK);
@@ -716,12 +710,18 @@ mod tests {
     #[tokio::test]
     async fn a_curseforge_failure_is_the_passthrough_s_answer() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(500, "{}")).await;
-        let failing = gateway(&mock, 300, TIMEOUT);
+        let failing = gateway(&mock);
         let got = resolve(&failing, r#"{"fileIds":[1003]}"#).await;
         assert_eq!(got.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(got.header("x-cache"), Some("miss"));
 
-        let refused = gateway(&mock, 1, TIMEOUT);
+        let refused = gateway_with(
+            &mock,
+            GatewayWith {
+                limit: 1,
+                ..GatewayWith::default()
+            },
+        );
         resolve(&refused, r#"{"fileIds":[1003]}"#).await;
         let got = resolve(&refused, r#"{"fileIds":[1004]}"#).await;
         assert_eq!(got.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -731,7 +731,7 @@ mod tests {
     #[tokio::test]
     async fn refuses_a_bad_body() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "{}")).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
         for body in ["{}", r#"{"fileIds":[]}"#, r#"{"fileIds":["x"]}"#, "nope"] {
             let got = resolve(&gateway, body).await;
             assert_eq!(got.status, StatusCode::BAD_REQUEST, "{body}");
@@ -766,7 +766,7 @@ mod tests {
             uri => panic!("unexpected {uri}"),
         })
         .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
+        let gateway = gateway(&mock);
 
         let got = resolve(&gateway, r#"{"fileIds":[1007,1008]}"#).await;
         let files = got.json()["files"].clone();
