@@ -20,7 +20,8 @@ use tower::ServiceExt;
 
 use crate::{
     app::{self, Addresses, AppState, Timeouts},
-    budget::{Clock, DEFAULT_HISTORY_DAYS},
+    budget::DEFAULT_HISTORY_DAYS,
+    clock::TestClock,
     config::{ApiKey, Config, Consumer, Token},
     redis_store::RedisStore,
 };
@@ -31,24 +32,6 @@ pub(crate) const KEY: &str = "test-curseforge-key";
 pub(crate) const USER_AGENT: &str = "test-gateway/0 (https://example.com)";
 pub(crate) const TEST_REDIS_ENV: &str = "CONTENT_GATEWAY_TEST_REDIS_URL";
 const UNREACHABLE: &str = "http://127.0.0.1:9";
-
-pub(crate) struct TestClock(AtomicU64);
-
-impl TestClock {
-    pub(crate) fn at(ms: u64) -> Arc<Self> {
-        Arc::new(Self(AtomicU64::new(ms)))
-    }
-
-    pub(crate) fn advance(&self, ms: u64) {
-        self.0.fetch_add(ms, Ordering::SeqCst);
-    }
-}
-
-impl Clock for TestClock {
-    fn now_ms(&self) -> u64 {
-        self.0.load(Ordering::SeqCst)
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct Seen {

@@ -3,6 +3,7 @@ mod auth;
 mod batch;
 mod budget;
 mod cache;
+mod clock;
 mod config;
 mod curseforge;
 mod error;
