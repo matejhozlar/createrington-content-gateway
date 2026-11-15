@@ -21,6 +21,7 @@ use crate::{
     upstream::{Source, UpstreamFailure},
 };
 
+pub const SHA1_LENGTH: usize = 40;
 const X_CACHE: HeaderName = HeaderName::from_static("x-cache");
 
 /// How long an answer of a route stays fresh, found and (when a 404 is kept) not found.
@@ -46,8 +47,6 @@ fn valid_segment(source: Source, segment: &str) -> bool {
             byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || slug_byte(byte)
         })
 }
-
-pub const SHA1_LENGTH: usize = 40;
 
 /// A lowercase SHA-1, or none when the text is not one.
 pub fn sha1_of(text: &str) -> Option<String> {
