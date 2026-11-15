@@ -217,9 +217,9 @@ pub async fn answer(
         .copied()
         .filter(|id| seen.insert(*id))
         .collect();
-    let Rows { rows, cache } = match rows(state, pool, batch, ids, forced).await {
+    let Rows { rows, cache } = match rows(state, pool.clone(), batch, ids, forced).await {
         Ok(rows) => rows,
-        Err(response) => return *response,
+        Err(failure) => return passthrough::failed(failure, &pool, Source::CurseForge),
     };
     if batch.is_fingerprints() {
         return passthrough::respond(&Answer::json(fingerprint_answer(&rows, &asked)), cache);
@@ -243,7 +243,7 @@ pub async fn rows(
     batch: Batch,
     ids: Vec<u64>,
     forced: bool,
-) -> Result<Rows, Box<Response>> {
+) -> Result<Rows, LoadFailure> {
     let keys: Vec<String> = ids.iter().map(|id| batch.key(*id)).collect();
     let found = state.cache.lookup_many(&keys, state.clock.now_ms()).await;
     let now = state.clock.now_ms();
@@ -302,13 +302,7 @@ pub async fn rows(
                         stale = true;
                         entry
                     }
-                    _ => {
-                        return Err(Box::new(passthrough::failed(
-                            failure,
-                            &pool,
-                            Source::CurseForge,
-                        )));
-                    }
+                    _ => return Err(failure),
                 }
             }
         };

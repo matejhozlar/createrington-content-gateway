@@ -307,6 +307,7 @@ export interface components {
       | "UNKNOWN_VERSION"
       | "UNKNOWN_LOADER"
       | "UNKNOWN_RUNTIME"
+      | "UNKNOWN_ROUTE"
       | "UPSTREAM_TIMEOUT"
       | "UPSTREAM_UNREACHABLE"
       | "UPSTREAM_TOO_LARGE"
@@ -358,7 +359,7 @@ export interface components {
       snapshot: string;
     };
     /**
-     * @description The mod loaders whose versions the gateway lists.
+     * @description The mod loaders whose versions the gateway lists, named in any case in a path or a query.
      * @enum {string}
      */
     Loader: "neoforge" | "forge" | "fabric";
@@ -897,6 +898,15 @@ export interface operations {
         };
         content: {
           "application/json": components["schemas"]["LoaderVersions"];
+        };
+      };
+      /** @description `INVALID_QUERY`: `minecraft` given more than once */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
         };
       };
       /** @description No valid consumer token */

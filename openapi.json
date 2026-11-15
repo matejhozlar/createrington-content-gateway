@@ -524,6 +524,16 @@
               }
             }
           },
+          "400": {
+            "description": "`INVALID_QUERY`: `minecraft` given more than once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "401": {
             "description": "No valid consumer token",
             "content": {
@@ -1342,6 +1352,7 @@
           "UNKNOWN_VERSION",
           "UNKNOWN_LOADER",
           "UNKNOWN_RUNTIME",
+          "UNKNOWN_ROUTE",
           "UPSTREAM_TIMEOUT",
           "UPSTREAM_UNREACHABLE",
           "UPSTREAM_TOO_LARGE",
@@ -1452,7 +1463,7 @@
       },
       "Loader": {
         "type": "string",
-        "description": "The mod loaders whose versions the gateway lists.",
+        "description": "The mod loaders whose versions the gateway lists, named in any case in a path or a query.",
         "enum": [
           "neoforge",
           "forge",

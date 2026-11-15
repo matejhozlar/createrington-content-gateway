@@ -74,10 +74,13 @@ return 0
 
 /// Why calls were not let through: the minute's budget is spent, the upstream answered 429 and the hold has not ended,
 /// or the request needs more calls than a whole minute allows, which no retry can fix.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Refusal {
+    #[error("the budget of this minute is spent, the next call can go out in {retry_after_ms} ms")]
     Spent { retry_after_ms: u64 },
+    #[error("the upstream answered 429, every call waits {retry_after_ms} ms")]
     Hold { retry_after_ms: u64 },
+    #[error("{calls} calls are more than the {limit_per_minute} a minute allows")]
     TooLarge { calls: u32, limit_per_minute: u32 },
 }
 

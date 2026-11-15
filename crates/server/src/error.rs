@@ -26,6 +26,7 @@ pub enum ErrorCode {
     UnknownVersion,
     UnknownLoader,
     UnknownRuntime,
+    UnknownRoute,
     UpstreamTimeout,
     UpstreamUnreachable,
     UpstreamTooLarge,
@@ -149,6 +150,14 @@ impl ApiError {
         )
     }
 
+    pub fn unknown_route() -> Self {
+        Self::new(
+            StatusCode::NOT_FOUND,
+            ErrorCode::UnknownRoute,
+            "no route of the gateway answers this path, see /v1/openapi.json",
+        )
+    }
+
     pub fn unknown_runtime(what: &str, platform: &str) -> Self {
         Self::new(
             StatusCode::NOT_FOUND,
@@ -158,28 +167,15 @@ impl ApiError {
     }
 
     pub fn upstream(failure: UpstreamFailure, source: &str) -> Self {
-        match failure {
-            UpstreamFailure::Timeout => Self::new(
-                StatusCode::GATEWAY_TIMEOUT,
-                ErrorCode::UpstreamTimeout,
-                format!("{source} did not answer in time"),
-            ),
-            UpstreamFailure::Unreachable => Self::new(
-                StatusCode::BAD_GATEWAY,
-                ErrorCode::UpstreamUnreachable,
-                format!("{source} could not be reached"),
-            ),
-            UpstreamFailure::TooLarge => Self::new(
-                StatusCode::BAD_GATEWAY,
-                ErrorCode::UpstreamTooLarge,
-                format!("{source} answered with more than the gateway keeps"),
-            ),
-            UpstreamFailure::Unreadable => Self::new(
-                StatusCode::BAD_GATEWAY,
-                ErrorCode::UpstreamUnreadable,
-                format!("{source} answered with something the gateway cannot read"),
-            ),
-        }
+        let (status, code) = match failure {
+            UpstreamFailure::Timeout => (StatusCode::GATEWAY_TIMEOUT, ErrorCode::UpstreamTimeout),
+            UpstreamFailure::Unreachable => {
+                (StatusCode::BAD_GATEWAY, ErrorCode::UpstreamUnreachable)
+            }
+            UpstreamFailure::TooLarge => (StatusCode::BAD_GATEWAY, ErrorCode::UpstreamTooLarge),
+            UpstreamFailure::Unreadable => (StatusCode::BAD_GATEWAY, ErrorCode::UpstreamUnreadable),
+        };
+        Self::new(status, code, format!("{source} {failure}"))
     }
 
     pub fn refused(refusal: Refusal, pool: &str, source: &str) -> Self {
