@@ -27,7 +27,7 @@ use crate::{
 
 pub const CURSEFORGE_CDN: &str = "https://mediafilez.forgecdn.net";
 pub const CDN_TIMEOUT: Duration = Duration::from_secs(10);
-const CDN_WAIT: Duration = Duration::from_secs(20);
+pub const CDN_WAIT: Duration = Duration::from_secs(20);
 const CDN_AT_ONCE: usize = 8;
 const CDN_FOUND_MS: u64 = HOUR_MS;
 const CDN_NOT_FOUND_MS: u64 = 10 * MINUTE_MS;
@@ -39,6 +39,7 @@ const MOST_FILES: usize = 1000;
 pub struct Cdn {
     client: reqwest::Client,
     base: String,
+    wait: Duration,
 }
 
 impl Cdn {
@@ -46,6 +47,7 @@ impl Cdn {
         base: impl Into<String>,
         user_agent: &str,
         timeout: Duration,
+        wait: Duration,
     ) -> reqwest::Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
@@ -53,6 +55,7 @@ impl Cdn {
                 .user_agent(user_agent)
                 .build()?,
             base: base.into(),
+            wait,
         })
     }
 
@@ -452,8 +455,9 @@ async fn check_cdn(
             }
         }
     };
-    if tokio::time::timeout(CDN_WAIT, collect).await.is_err() {
-        tracing::warn!("CurseForge's CDN could not be asked about every file within {CDN_WAIT:?}");
+    let wait = state.cdn.wait;
+    if tokio::time::timeout(wait, collect).await.is_err() {
+        tracing::warn!("CurseForge's CDN could not be asked about every file within {wait:?}");
     }
     verdicts
 }
@@ -511,10 +515,11 @@ async fn head(
 
 #[cfg(test)]
 mod tests {
+    use axum::http::Request;
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::{config::DEFAULT_USER_AGENT, curseforge::TIMEOUT, test_support::*};
+    use crate::{app::Timeouts, config::DEFAULT_USER_AGENT, curseforge::TIMEOUT, test_support::*};
 
     const JEI_SHA1: &str = "3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e";
     const SODIUM_SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -740,6 +745,7 @@ mod tests {
         let many: Vec<String> = (0..1001).map(|id| id.to_string()).collect();
         let got = resolve(&gateway, &format!(r#"{{"fileIds":[{}]}}"#, many.join(","))).await;
         assert_eq!(got.status, StatusCode::BAD_REQUEST);
+        assert_eq!(got.json()["code"], "INVALID_BODY");
         assert_eq!(mock.calls(), 0);
     }
 
@@ -782,7 +788,7 @@ mod tests {
 
     #[test]
     fn builds_the_cdn_address_like_curseforge_does() {
-        let cdn = Cdn::new(CURSEFORGE_CDN, DEFAULT_USER_AGENT, CDN_TIMEOUT).unwrap();
+        let cdn = Cdn::new(CURSEFORGE_CDN, DEFAULT_USER_AGENT, CDN_TIMEOUT, CDN_WAIT).unwrap();
         assert_eq!(
             cdn.url(4567890, "Create-1.20.1 (v0.5.1f)!'*.jar"),
             "https://mediafilez.forgecdn.net/files/4567/890/Create-1.20.1%20%28v0.5.1f%29%21%27%2A.jar"
@@ -790,6 +796,171 @@ mod tests {
         assert_eq!(
             cdn.url(999, "ü.jar"),
             "https://mediafilez.forgecdn.net/files/0/999/%C3%BC.jar"
+        );
+    }
+
+    fn only_on_the_cdn(head: Reply) -> impl Fn(usize, &Seen) -> Reply + Send + Sync + 'static {
+        let (status, headers) = (head.status, head.headers);
+        move |_, seen| match seen.uri.as_str() {
+            "/v1/mods/files" => reply(
+                200,
+                files_answer(&[file(1003, "create.jar", 30, CREATE_SHA1, None)]),
+            ),
+            "/v2/version_files" => reply(200, "{}"),
+            "/files/1/3/create.jar" => Reply {
+                status,
+                headers: headers.clone(),
+                body: String::new(),
+            },
+            uri => panic!("unexpected {uri}"),
+        }
+    }
+
+    fn heads(mock: &Mock) -> usize {
+        mock.seen()
+            .iter()
+            .filter(|seen| seen.method == "HEAD")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_curseforge_that_does_not_answer_in_time_is_a_504() {
+        let (mock, _never) = Mock::held(only_on_the_cdn(cdn_reply(200, "30"))).await;
+        let gateway = gateway_with(
+            &mock,
+            GatewayWith {
+                timeouts: Timeouts {
+                    curseforge: Duration::from_millis(50),
+                    ..Timeouts::default()
+                },
+                ..GatewayWith::default()
+            },
+        );
+        let got = resolve(&gateway, r#"{"fileIds":[1003]}"#).await;
+        assert_eq!(got.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(got.json()["code"], "UPSTREAM_TIMEOUT");
+    }
+
+    #[tokio::test]
+    async fn a_cdn_error_asks_for_a_retry_and_is_not_kept() {
+        let mock = Mock::start(Duration::ZERO, only_on_the_cdn(cdn_reply(503, "0"))).await;
+        let gateway = gateway(&mock);
+        for asked in 1..=2 {
+            let got = resolve(&gateway, r#"{"fileIds":[1003]}"#).await;
+            let file = &got.json()["files"][0];
+            assert_eq!(file["source"], Value::Null);
+            assert_eq!(file["retry"], true);
+            assert_eq!(heads(&mock), asked);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cdn_that_does_not_answer_asks_for_a_retry() {
+        let (mock, _never) = Mock::held_when(
+            |seen| seen.method == "HEAD",
+            only_on_the_cdn(cdn_reply(200, "30")),
+        )
+        .await;
+        let gateway = gateway_with(
+            &mock,
+            GatewayWith {
+                timeouts: Timeouts {
+                    cdn: Duration::from_millis(50),
+                    ..Timeouts::default()
+                },
+                ..GatewayWith::default()
+            },
+        );
+        let got = resolve(&gateway, r#"{"fileIds":[1003]}"#).await;
+        let file = &got.json()["files"][0];
+        assert_eq!(file["source"], Value::Null);
+        assert_eq!(file["retry"], true);
+    }
+
+    #[tokio::test]
+    async fn checks_still_running_when_the_cdn_wait_ends_ask_for_a_retry() {
+        let (mock, _never) = Mock::held_when(
+            |seen| seen.method == "HEAD",
+            only_on_the_cdn(cdn_reply(200, "30")),
+        )
+        .await;
+        let gateway = gateway_with(
+            &mock,
+            GatewayWith {
+                timeouts: Timeouts {
+                    cdn_wait: Duration::from_millis(50),
+                    ..Timeouts::default()
+                },
+                ..GatewayWith::default()
+            },
+        );
+        let got = tokio::time::timeout(
+            Timeouts::default().cdn / 2,
+            resolve(&gateway, r#"{"fileIds":[1003]}"#),
+        )
+        .await
+        .expect("the wait ended the check before the CDN client gave up");
+        assert_eq!(got.status, StatusCode::OK);
+        let file = &got.json()["files"][0];
+        assert_eq!(file["source"], Value::Null);
+        assert_eq!(file["retry"], true);
+    }
+
+    #[tokio::test]
+    async fn a_modrinth_link_on_another_host_is_not_given_out() {
+        let mock = Mock::start(Duration::ZERO, |_, seen| match seen.uri.as_str() {
+            "/v1/mods/files" => reply(
+                200,
+                files_answer(&[file(1003, "create.jar", 30, CREATE_SHA1, None)]),
+            ),
+            "/v2/version_files" => reply(
+                200,
+                json!({ CREATE_SHA1: { "id": "v", "files": [
+                    { "hashes": { "sha1": CREATE_SHA1 }, "url": "https://elsewhere.example.com/create.jar", "filename": "create.jar", "size": 30 },
+                    { "hashes": { "sha1": CREATE_SHA1 }, "url": "http://cdn.modrinth.com/data/p/versions/v/create.jar", "filename": "create.jar", "size": 30 }
+                ] } })
+                .to_string(),
+            ),
+            "/files/1/3/create.jar" => cdn_reply(200, "30"),
+            uri => panic!("unexpected {uri}"),
+        })
+        .await;
+        let gateway = gateway(&mock);
+        let got = resolve(&gateway, r#"{"fileIds":[1003]}"#).await;
+        let file = &got.json()["files"][0];
+        assert_eq!(file["source"], "curseforge-cdn");
+        assert_eq!(file["url"], format!("{}/files/1/3/create.jar", mock.base));
+    }
+
+    #[tokio::test]
+    async fn no_cache_asks_every_source_again() {
+        let mock = Mock::start(Duration::ZERO, only_on_the_cdn(cdn_reply(200, "30"))).await;
+        let gateway = gateway(&mock);
+        resolve(&gateway, r#"{"fileIds":[1003]}"#).await;
+        let kept = resolve(&gateway, r#"{"fileIds":[1003]}"#).await;
+        assert_eq!(kept.json()["files"][0]["source"], "curseforge-cdn");
+        assert_eq!(mock.calls(), 3);
+
+        let forced = send(
+            &gateway.router,
+            Request::post("/v1/resolve")
+                .header("content-type", "application/json")
+                .header("cache-control", "no-cache"),
+            r#"{"fileIds":[1003]}"#,
+        )
+        .await;
+        assert_eq!(forced.json()["files"][0]["source"], "curseforge-cdn");
+        let asked: Vec<String> = mock.seen()[3..]
+            .iter()
+            .map(|seen| format!("{} {}", seen.method, seen.uri))
+            .collect();
+        assert_eq!(
+            asked,
+            [
+                "POST /v1/mods/files",
+                "POST /v2/version_files",
+                "HEAD /files/1/3/create.jar"
+            ]
         );
     }
 }

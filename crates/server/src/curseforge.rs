@@ -339,7 +339,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_misses_make_one_call() {
-        let mock = Mock::start(Duration::from_millis(100), |_, _| reply(200, "{}")).await;
+        let (mock, gate) = Mock::held(|_, _| reply(200, "{}")).await;
         let gateway = gateway(&mock);
         let requests: Vec<_> = (0..5)
             .map(|_| {
@@ -347,6 +347,11 @@ mod tests {
                 tokio::spawn(async move { get(&router, "/v1/curseforge/mods/1").await })
             })
             .collect();
+        until("four requests joining the first", || {
+            gateway.state.cache.joined() == 4
+        })
+        .await;
+        gate.open();
         let mut caches = Vec::new();
         for request in requests {
             caches.push(request.await.unwrap().header("x-cache").unwrap().to_owned());
@@ -364,15 +369,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_call_finishes_and_is_recorded_after_its_caller_is_gone() {
-        let mock = Mock::start(Duration::from_millis(200), |_, _| reply(200, "{}")).await;
+        let (mock, gate) = Mock::held(|_, _| reply(200, "{}")).await;
         let gateway = gateway(&mock);
         let caller = {
             let router = gateway.router.clone();
             tokio::spawn(async move { get(&router, "/v1/curseforge/mods/1").await })
         };
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        until("the call to reach CurseForge", || mock.calls() == 1).await;
         caller.abort();
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        gate.open();
+        until("the load to finish", || {
+            gateway.state.cache.loads_running() == 0
+        })
+        .await;
 
         assert_eq!(mock.calls(), 1);
         assert_eq!(gateway.state.cache.loads_running(), 0);
@@ -392,27 +401,30 @@ mod tests {
 
     #[tokio::test]
     async fn no_cache_does_not_join_a_load_that_may_not_ask_curseforge() {
-        let mock = Mock::start(Duration::from_millis(200), |call, _| {
-            reply(200, format!("{{\"call\":{call}}}"))
-        })
-        .await;
+        let (mock, gate) = Mock::held(|_, _| reply(200, "{}")).await;
         let gateway = gateway(&mock);
         let plain = {
             let router = gateway.router.clone();
             tokio::spawn(async move { get(&router, "/v1/curseforge/mods/1").await })
         };
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        let forced = send(
-            &gateway.router,
-            Request::get("/v1/curseforge/mods/1").header("cache-control", "no-cache"),
-            "",
-        )
-        .await;
-        plain.await.unwrap();
+        until("the plain call to reach CurseForge", || mock.calls() == 1).await;
+        let forced = {
+            let router = gateway.router.clone();
+            tokio::spawn(async move {
+                send(
+                    &router,
+                    Request::get("/v1/curseforge/mods/1").header("cache-control", "no-cache"),
+                    "",
+                )
+                .await
+            })
+        };
+        until("the forced call to reach CurseForge", || mock.calls() == 2).await;
+        gate.open();
 
-        assert_eq!(forced.header("x-cache"), Some("miss"));
-        assert_eq!(forced.body, r#"{"call":1}"#);
-        assert_eq!(mock.calls(), 2);
+        assert_eq!(plain.await.unwrap().header("x-cache"), Some("miss"));
+        assert_eq!(forced.await.unwrap().header("x-cache"), Some("miss"));
+        assert_eq!(gateway.state.cache.joined(), 0);
     }
 
     #[tokio::test]
@@ -457,6 +469,9 @@ mod tests {
         assert_eq!(stale.status, StatusCode::OK);
         assert_eq!(stale.header("x-cache"), Some("stale"));
         assert_eq!(stale.body, r#"{"data":"old"}"#);
+        let snapshot = gateway.state.budget.snapshot().await;
+        let counts = &snapshot.days[0].pools[0].counts;
+        assert_eq!((counts.calls, counts.hits), (2, 1));
 
         gateway.clock.advance(DAY_MS);
         let gone = get(&gateway.router, "/v1/curseforge/mods/1").await;
@@ -555,7 +570,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_curseforge_that_does_not_answer_in_time_is_a_504() {
-        let mock = Mock::start(Duration::from_millis(500), |_, _| reply(200, "{}")).await;
+        let (mock, _never) = Mock::held(|_, _| reply(200, "{}")).await;
         let gateway = gateway_with(
             &mock,
             GatewayWith {
@@ -604,5 +619,37 @@ mod tests {
         assert_eq!(found("mods/jei"), None);
         assert_eq!(found("mods/238222/files/latest"), None);
         assert_eq!(found("games"), None);
+    }
+
+    #[tokio::test]
+    async fn a_curseforge_that_cannot_be_reached_is_a_502() {
+        let router = crate::app::router(test_state(vec![consumer("app", TOKEN, &["launcher"])]));
+        let got = get(&router, "/v1/curseforge/mods/1").await;
+        assert_eq!(got.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(got.json()["code"], "UPSTREAM_UNREACHABLE");
+        assert_eq!(got.header("x-cache"), None);
+    }
+
+    #[tokio::test]
+    async fn an_answer_larger_than_the_gateway_keeps_is_a_502_and_not_kept() {
+        let mock = Mock::start(Duration::ZERO, |_, _| {
+            reply(200, "x".repeat(32 * 1024 * 1024 + 1))
+        })
+        .await;
+        let gateway = gateway(&mock);
+        for _ in 0..2 {
+            let got = get(&gateway.router, "/v1/curseforge/mods/1").await;
+            assert_eq!(got.status, StatusCode::BAD_GATEWAY);
+            assert_eq!(got.json()["code"], "UPSTREAM_TOO_LARGE");
+        }
+        assert_eq!(mock.calls(), 2);
+    }
+
+    #[test]
+    fn a_route_with_a_query_is_not_shared_with_the_batches() {
+        assert_eq!(share_of(&["mods", "1"], None), Some(Share::Mod(1)));
+        assert_eq!(share_of(&["mods", "1"], Some("")), Some(Share::Mod(1)));
+        assert_eq!(share_of(&["mods", "1"], Some("gameId=432")), None);
+        assert_eq!(share_of(&["mods", "1", "files", "10"], Some("x=1")), None);
     }
 }

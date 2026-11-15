@@ -111,28 +111,109 @@ impl RedisStore {
     }
 
     fn mark_up(&self) {
+        if let Some(news) = self.came_up() {
+            tracing::info!("{news}");
+        }
+    }
+
+    fn came_up(&self) -> Option<&'static str> {
         let mut link = self.link();
         link.paused_until = None;
-        let before = std::mem::replace(&mut link.state, LinkState::Up);
-        drop(link);
-        match before {
-            LinkState::Untried => tracing::info!("Redis connected"),
-            LinkState::Down => {
-                tracing::info!("Redis answers again, the budget and the cache use it again")
-            }
-            LinkState::Up => {}
+        match std::mem::replace(&mut link.state, LinkState::Up) {
+            LinkState::Untried => Some("Redis connected"),
+            LinkState::Down => Some("Redis answers again, the budget and the cache use it again"),
+            LinkState::Up => None,
         }
     }
 
     fn mark_down(&self, reason: &str) {
+        if let Some(news) = self.went_down(reason) {
+            tracing::warn!("{news}");
+        }
+    }
+
+    fn went_down(&self, reason: &str) -> Option<String> {
         let mut link = self.link();
         link.paused_until = Some(Instant::now() + PAUSE_AFTER_FAILURE);
-        let before = std::mem::replace(&mut link.state, LinkState::Down);
-        drop(link);
-        if before != LinkState::Down {
-            tracing::warn!(
+        (std::mem::replace(&mut link.state, LinkState::Down) != LinkState::Down).then(|| {
+            format!(
                 "Redis failed, the budget and the cache use memory until it answers again: {reason}"
-            );
-        }
+            )
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+
+    use super::*;
+
+    fn store() -> RedisStore {
+        RedisStore::open("redis://127.0.0.1:1", "content-gateway-test").unwrap()
+    }
+
+    async fn fail(store: &RedisStore) -> Option<()> {
+        store
+            .run(|_| async { Err(io::Error::other("refused").into()) })
+            .await
+    }
+
+    async fn answer(store: &RedisStore) -> (Option<u8>, bool) {
+        let asked = AtomicBool::new(false);
+        let answered = store
+            .run(|_| async {
+                asked.store(true, Ordering::SeqCst);
+                Ok(7)
+            })
+            .await;
+        (answered, asked.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn a_failure_skips_redis_until_the_pause_ends() {
+        let store = store();
+        assert_eq!(answer(&store).await, (Some(7), true));
+        assert_eq!(fail(&store).await, None);
+        assert_eq!(store.link().state, LinkState::Down);
+
+        assert_eq!(answer(&store).await, (None, false));
+
+        store.link().paused_until = Some(Instant::now() - Duration::from_millis(1));
+        assert_eq!(answer(&store).await, (Some(7), true));
+        let link = store.link();
+        assert_eq!((link.state, link.paused_until), (LinkState::Up, None));
+    }
+
+    #[tokio::test]
+    async fn says_once_when_redis_fails_and_once_when_it_answers_again() {
+        let store = store();
+        assert_eq!(store.came_up(), Some("Redis connected"));
+        assert_eq!(store.came_up(), None);
+        assert_eq!(
+            store.went_down("refused").as_deref(),
+            Some(
+                "Redis failed, the budget and the cache use memory until it answers again: refused"
+            )
+        );
+        assert_eq!(store.went_down("refused again"), None);
+        assert_eq!(
+            store.came_up(),
+            Some("Redis answers again, the budget and the cache use it again")
+        );
+        assert_eq!(store.came_up(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_operation_without_an_answer_within_a_second_counts_as_a_failure() {
+        let store = store();
+        let answered: Option<()> = store.run_even_if_paused(|_| std::future::pending()).await;
+        assert_eq!(answered, None);
+        let link = store.link();
+        assert_eq!(link.state, LinkState::Down);
+        assert!(link.paused_until.is_some());
     }
 }

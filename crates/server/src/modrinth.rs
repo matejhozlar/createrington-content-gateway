@@ -547,9 +547,10 @@ pub async fn version_files(
 
 #[cfg(test)]
 mod tests {
+    use axum::http::Request;
 
     use super::*;
-    use crate::{app::Timeouts, test_support::*};
+    use crate::{app::Timeouts, passthrough::MINUTE_MS, test_support::*};
 
     const JEI: &str = "3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e";
     const SODIUM: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -722,7 +723,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_modrinth_that_does_not_answer_in_time_is_a_504() {
-        let mock = Mock::start(Duration::from_millis(500), |_, _| reply(200, "{}")).await;
+        let (mock, _never) = Mock::held(|_, _| reply(200, "{}")).await;
         let gateway = gateway_with(
             &mock,
             GatewayWith {
@@ -924,5 +925,206 @@ mod tests {
         assert_eq!(found("user/mezz"), Some(HOUR_MS));
         assert_eq!(found("version_file/abc"), None);
         assert_eq!(found("statistics"), None);
+    }
+
+    fn every_hash(_: usize, seen: &Seen) -> Reply {
+        let versions: Vec<String> = asked_in(seen)
+            .iter()
+            .map(|hash| format!(r#""{hash}":{}"#, version(hash, "mod.jar")))
+            .collect();
+        reply(200, format!("{{{}}}", versions.join(",")))
+    }
+
+    fn hashes(count: u64) -> Vec<String> {
+        (1..=count).map(|n| format!("{n:040x}")).collect()
+    }
+
+    fn hashes_body(hashes: &[String]) -> String {
+        serde_json::json!({ "hashes": hashes }).to_string()
+    }
+
+    fn asked_in(seen: &Seen) -> Vec<String> {
+        let asked: serde_json::Value = serde_json::from_str(&seen.body).unwrap();
+        asked["hashes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|hash| hash.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn asks_for_a_hundred_hashes_a_call_and_counts_each_call() {
+        let mock = Mock::start(Duration::ZERO, every_hash).await;
+        let gateway = gateway(&mock);
+        let wanted = hashes(250);
+
+        let got = post_json(
+            &gateway.router,
+            "/v1/modrinth/version_files",
+            &hashes_body(&wanted),
+        )
+        .await;
+        assert_eq!(got.status, StatusCode::OK);
+        assert_eq!(got.json().as_object().unwrap().len(), 250);
+
+        let mut sizes: Vec<usize> = mock
+            .seen()
+            .iter()
+            .map(|seen| asked_in(seen).len())
+            .collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, [50, 100, 100]);
+        let mut asked: Vec<String> = mock.seen().iter().flat_map(asked_in).collect();
+        asked.sort();
+        assert_eq!(asked, wanted);
+        assert_eq!(gateway.state.modrinth_budget.snapshot().await.used, 3);
+    }
+
+    #[tokio::test]
+    async fn hashes_needing_more_calls_than_a_minute_allows_are_refused_whole() {
+        let mock = Mock::start(Duration::ZERO, every_hash).await;
+        let gateway = gateway_with(
+            &mock,
+            GatewayWith {
+                limit: 2,
+                ..GatewayWith::default()
+            },
+        );
+        let got = post_json(
+            &gateway.router,
+            "/v1/modrinth/version_files",
+            &hashes_body(&hashes(201)),
+        )
+        .await;
+        assert_eq!(got.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(got.json()["code"], "REQUEST_TOO_LARGE");
+        assert_eq!(mock.calls(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_spent_budget_refuses_a_hash_lookup_and_keeps_nothing() {
+        let mock = Mock::start(Duration::ZERO, every_hash).await;
+        let gateway = gateway_with(
+            &mock,
+            GatewayWith {
+                limit: 1,
+                ..GatewayWith::default()
+            },
+        );
+        get(&gateway.router, &format!("/v1/modrinth/version_file/{JEI}")).await;
+
+        let refused = get(
+            &gateway.router,
+            &format!("/v1/modrinth/version_file/{SODIUM}"),
+        )
+        .await;
+        assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(refused.json()["code"], "BUDGET_SPENT");
+        assert!(refused.header("retry-after").is_some());
+        assert_eq!(mock.calls(), 1);
+
+        gateway.clock.advance(MINUTE_MS);
+        let later = get(
+            &gateway.router,
+            &format!("/v1/modrinth/version_file/{SODIUM}"),
+        )
+        .await;
+        assert_eq!(later.header("x-cache"), Some("miss"));
+        assert_eq!(mock.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn version_files_joins_a_lookup_of_the_same_hash_already_running() {
+        let (mock, gate) = Mock::held(every_hash).await;
+        let gateway = gateway(&mock);
+        let single = {
+            let router = gateway.router.clone();
+            tokio::spawn(
+                async move { get(&router, &format!("/v1/modrinth/version_file/{JEI}")).await },
+            )
+        };
+        until("the single lookup to reach Modrinth", || mock.calls() == 1).await;
+        let joined = {
+            let router = gateway.router.clone();
+            tokio::spawn(async move {
+                post_json(
+                    &router,
+                    "/v1/modrinth/version_files",
+                    &format!(r#"{{"hashes":["{JEI}"]}}"#),
+                )
+                .await
+            })
+        };
+        until("version_files joining it", || {
+            gateway.state.cache.joined() == 1
+        })
+        .await;
+        gate.open();
+
+        let got = joined.await.unwrap();
+        assert_eq!(got.header("x-cache"), Some("hit"));
+        assert_eq!(got.json()[JEI]["files"][0]["filename"], "mod.jar");
+        assert_eq!(single.await.unwrap().header("x-cache"), Some("miss"));
+        assert_eq!(mock.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_is_not_versions_by_hash_is_unreadable_and_not_kept() {
+        let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "[]")).await;
+        let gateway = gateway(&mock);
+        for _ in 0..2 {
+            let got = get(&gateway.router, &format!("/v1/modrinth/version_file/{JEI}")).await;
+            assert_eq!(got.status, StatusCode::BAD_GATEWAY);
+            assert_eq!(got.json()["code"], "UPSTREAM_UNREADABLE");
+        }
+        assert_eq!(mock.calls(), 2);
+    }
+
+    #[tokio::test]
+    async fn no_cache_asks_modrinth_again_for_kept_hashes() {
+        let mock = Mock::start(Duration::ZERO, every_hash).await;
+        let gateway = gateway(&mock);
+        get(&gateway.router, &format!("/v1/modrinth/version_file/{JEI}")).await;
+
+        let single = send(
+            &gateway.router,
+            Request::get(format!("/v1/modrinth/version_file/{JEI}"))
+                .header("cache-control", "no-cache"),
+            "",
+        )
+        .await;
+        assert_eq!(single.header("x-cache"), Some("miss"));
+        assert_eq!(mock.calls(), 2);
+
+        let many = send(
+            &gateway.router,
+            Request::post("/v1/modrinth/version_files")
+                .header("content-type", "application/json")
+                .header("cache-control", "no-cache"),
+            &format!(r#"{{"hashes":["{JEI}","{SODIUM}"]}}"#),
+        )
+        .await;
+        assert_eq!(many.header("x-cache"), Some("miss"));
+        assert_eq!(mock.calls(), 3);
+        assert_eq!(asked_in(&mock.seen()[2]), [JEI, SODIUM]);
+    }
+
+    #[tokio::test]
+    async fn a_hash_lookup_modrinth_does_not_answer_in_time_is_a_504() {
+        let (mock, _never) = Mock::held(every_hash).await;
+        let gateway = gateway_with(
+            &mock,
+            GatewayWith {
+                timeouts: Timeouts {
+                    modrinth: Duration::from_millis(50),
+                    ..Timeouts::default()
+                },
+                ..GatewayWith::default()
+            },
+        );
+        let got = get(&gateway.router, &format!("/v1/modrinth/version_file/{JEI}")).await;
+        assert_eq!(got.status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(got.json()["code"], "UPSTREAM_TIMEOUT");
     }
 }

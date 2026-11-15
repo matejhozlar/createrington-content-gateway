@@ -64,6 +64,8 @@ pub struct AnswerCache {
     entries: Cache<String, Kept>,
     loading: Mutex<HashMap<String, Waiting>>,
     redis: Option<Arc<RedisStore>>,
+    #[cfg(test)]
+    joined: std::sync::atomic::AtomicUsize,
 }
 
 type Loaded = Result<Arc<Entry>, LoadFailure>;
@@ -141,6 +143,8 @@ impl AnswerCache {
                 .build(),
             loading: Mutex::default(),
             redis,
+            #[cfg(test)]
+            joined: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -237,6 +241,9 @@ impl AnswerCache {
             .get(key)
             .filter(|waiting| waiting.has_changed().is_ok())
         {
+            #[cfg(test)]
+            self.joined
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return (waiting.clone(), None);
         }
         let (finisher, waiting) = watch::channel(None);
@@ -269,6 +276,11 @@ impl AnswerCache {
     #[cfg(test)]
     pub(crate) fn loads_running(&self) -> usize {
         self.loading().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn joined(&self) -> usize {
+        self.joined.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn loading(&self) -> std::sync::MutexGuard<'_, HashMap<String, Waiting>> {
@@ -477,6 +489,36 @@ mod tests {
         let mut cut = encode(&entry("one"));
         cut.truncate(10);
         assert_eq!(decode(cut), None);
+    }
+
+    #[test]
+    fn a_stored_row_outside_its_body_is_no_entry() {
+        let body = Bytes::from_static(b"{\"data\":[1]}");
+        let kept = Entry {
+            row: Some(body.slice(9..10)),
+            ..Entry::new(
+                Answer {
+                    status: StatusCode::OK,
+                    content_type: None,
+                    body: body.clone(),
+                },
+                1_000,
+                60_000,
+            )
+        };
+        let stored = encode(&kept);
+        assert_eq!(decode(stored.clone()).unwrap(), kept);
+        let row_at = 1 + 2 + 3 * 8 + 1 + 1;
+        let with_row = |start: u32, end: u32| {
+            let mut stored = stored.clone();
+            stored[row_at..row_at + 4].copy_from_slice(&start.to_be_bytes());
+            stored[row_at + 4..row_at + 8].copy_from_slice(&end.to_be_bytes());
+            decode(stored)
+        };
+        let length = u32::try_from(body.len()).unwrap();
+        assert!(with_row(0, length).is_some());
+        assert_eq!(with_row(0, length + 1), None);
+        assert_eq!(with_row(5, 4), None);
     }
 
     #[tokio::test]
