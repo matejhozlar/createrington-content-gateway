@@ -120,21 +120,30 @@ export interface PassthroughAnswer {
 
 export type CurseForgeAnswer = PassthroughAnswer;
 
-/** An answer the gateway gave itself instead of passing one on; `code` is `null` when it was not the gateway's JSON error. */
+/**
+ * An answer that is not the one asked for: the gateway's own error, or, from the gateway's own routes, anything
+ * but its JSON (an upstream's failure passed on by `resolve()`, a page from something else at the base URL).
+ * `code` is `null` unless it was the gateway's JSON error.
+ */
 export class ContentGatewayError extends Error {
   readonly status: number;
   readonly code: ErrorCode | null;
   readonly pool: string | null;
-  /** When the next call can go out, on a refused call. */
+  /** When the next call can go out, on a refused call: the body's `retryAfterMs`, else `Retry-After`. */
   readonly retryAfterMs: number | null;
 
-  constructor(status: number, error: ApiError | null, fallback: string) {
+  constructor(
+    status: number,
+    error: ApiError | null,
+    fallback: string,
+    retryAfterMs: number | null = null,
+  ) {
     super(error?.message ?? fallback);
     this.name = "ContentGatewayError";
     this.status = status;
     this.code = error?.code ?? null;
     this.pool = error?.pool ?? null;
-    this.retryAfterMs = error?.retryAfterMs ?? null;
+    this.retryAfterMs = error?.retryAfterMs ?? retryAfterMs;
   }
 }
 
@@ -181,25 +190,23 @@ export class ContentGateway {
 
   /** `GET /v1/healthz`, which needs no token. */
   async health(signal?: AbortSignal): Promise<Health> {
-    const { body } = await this.send({
+    return this.own({
       method: "GET",
       path: "/v1/healthz",
       authenticated: false,
       signal,
     });
-    return body as Health;
   }
 
   /** `GET /v1/budget`: this minute's calls, the 429 hold and the daily counts of the last `days` UTC days. */
   async budget(options: BudgetOptions = {}): Promise<BudgetSnapshot> {
-    const { body } = await this.send({
+    return this.own({
       method: "GET",
       path: "/v1/budget",
       query: options.days === undefined ? undefined : { days: options.days },
       authenticated: true,
       signal: options.signal,
     });
-    return body as BudgetSnapshot;
   }
 
   /** Sends `api.curseforge.com/v1/<path>` (such as `mods/search`) through the gateway; CurseForge's answer comes back whatever its status, and only the gateway's own answers throw `ContentGatewayError`. */
@@ -276,12 +283,12 @@ export class ContentGateway {
     });
   }
 
-  /** `POST /v1/resolve`: a download address per CurseForge file id. */
+  /** `POST /v1/resolve`: a download address per CurseForge file id. CurseForge's own failure, which the gateway passes on, throws as a `ContentGatewayError` with its status. */
   async resolve(
     fileIds: readonly number[],
     options: ResolveOptions = {},
   ): Promise<Resolved> {
-    const { body } = await this.send({
+    return this.own({
       method: "POST",
       path: "/v1/resolve",
       body: {
@@ -295,21 +302,19 @@ export class ContentGateway {
       timeoutMs: options.timeoutMs ?? RESOLVE_TIMEOUT_MS,
       signal: options.signal,
     });
-    return body as Resolved;
   }
 
   /** `GET /v1/minecraft/versions`: the Minecraft versions Mojang lists, newest first. */
   async minecraftVersions(
     options: MinecraftVersionsOptions = {},
   ): Promise<MinecraftVersions> {
-    const { body } = await this.send({
+    return this.own({
       method: "GET",
       path: "/v1/minecraft/versions",
       query: { type: options.type, loader: options.loader },
       authenticated: true,
       signal: options.signal,
     });
-    return body as MinecraftVersions;
   }
 
   /** `GET /v1/minecraft/versions/<id>`: one version with the Java major it needs. Throws `UNKNOWN_VERSION` as a `ContentGatewayError`. */
@@ -317,13 +322,12 @@ export class ContentGateway {
     id: string,
     signal?: AbortSignal,
   ): Promise<MinecraftVersionDetails> {
-    const { body } = await this.send({
+    return this.own({
       method: "GET",
       path: `/v1/minecraft/versions/${encodeURIComponent(id)}`,
       authenticated: true,
       signal,
     });
-    return body as MinecraftVersionDetails;
   }
 
   /** `GET /v1/minecraft/loaders/<loader>/versions`: a loader's builds, newest first. */
@@ -331,14 +335,13 @@ export class ContentGateway {
     loader: Loader,
     options: LoaderVersionsOptions = {},
   ): Promise<LoaderVersions> {
-    const { body } = await this.send({
+    return this.own({
       method: "GET",
       path: `/v1/minecraft/loaders/${loader}/versions`,
       query: { minecraft: options.minecraft },
       authenticated: true,
       signal: options.signal,
     });
-    return body as LoaderVersions;
   }
 
   /** `GET /v1/minecraft/java`: a Java runtime Mojang ships for `platform` (Mojang's name, such as `linux` or `windows-x64`), with the address of its manifest of files. Throws `UNKNOWN_RUNTIME` as a `ContentGatewayError`. */
@@ -346,7 +349,7 @@ export class ContentGateway {
     platform: string,
     options: JavaRuntimeOptions,
   ): Promise<JavaRuntime> {
-    const { body } = await this.send({
+    return this.own({
       method: "GET",
       path: "/v1/minecraft/java",
       query: {
@@ -357,7 +360,20 @@ export class ContentGateway {
       authenticated: true,
       signal: options.signal,
     });
-    return body as JavaRuntime;
+  }
+
+  private async own<T>(options: SendOptions): Promise<T> {
+    const { response, body } = await this.send(options);
+    const cache = response.headers.get(CACHE_HEADER);
+    if (response.ok && cache === null && isObject(body)) return body as T;
+    const answered = `${response.status} answer to ${options.method} ${options.path}`;
+    throw new ContentGatewayError(
+      response.status,
+      null,
+      isCacheStatus(cache)
+        ? `the ${answered} is an upstream's, passed on by the gateway (X-Cache: ${cache})`
+        : `the ${answered} is not the gateway's JSON`,
+    );
   }
 
   private async passthrough(options: SendOptions): Promise<PassthroughAnswer> {
@@ -367,7 +383,10 @@ export class ContentGateway {
       throw new ContentGatewayError(
         response.status,
         null,
-        `the answer to ${options.method} ${options.path} did not come through the gateway: no X-Cache header`,
+        `the answer to ${options.method} ${options.path} did not come through the gateway: ` +
+          (cache === null
+            ? "no X-Cache header"
+            : `X-Cache ${JSON.stringify(cache)} is not one the gateway sends`),
       );
     }
     return {
@@ -425,9 +444,14 @@ export class ContentGateway {
         error,
         `the gateway answered ${response.status} to ${options.method} ${options.path}` +
           (typeof answer === "string" && answer !== "" ? `: ${answer}` : ""),
+        wait,
       );
     }
   }
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function isCacheStatus(value: string | null): value is CacheStatus {
