@@ -17,7 +17,7 @@ pub const STALE_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
 const FORMAT: u8 = 1;
 
-/// One answer CurseForge gave, kept as it came: status, content type and body bytes.
+/// One answer an upstream gave, kept as it came: status, content type and body bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Answer {
     pub status: StatusCode,
@@ -69,7 +69,7 @@ pub struct AnswerCache {
 /// What a load ended with, handed to every request that waited on it.
 pub type Loaded = Result<Arc<Entry>, LoadFailure>;
 
-/// A load's outcome, and whether it called CurseForge or found the answer kept meanwhile.
+/// A load's outcome, and whether it called the upstream or found the answer kept meanwhile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
     pub loaded: Loaded,

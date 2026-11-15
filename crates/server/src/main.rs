@@ -75,7 +75,7 @@ async fn main() -> ExitCode {
     let state = match AppState::from_config(&config, redis) {
         Ok(state) => Arc::new(state),
         Err(error) => {
-            tracing::error!("cannot set up the CurseForge client: {error}");
+            tracing::error!("cannot set up the upstream clients: {error}");
             return ExitCode::FAILURE;
         }
     };

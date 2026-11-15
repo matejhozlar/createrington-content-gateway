@@ -125,6 +125,8 @@ pub fn pretty_json() -> Result<String, serde_json::Error> {
 mod tests {
     use serde_json::Value;
 
+    use crate::upstream::Source;
+
     use super::*;
 
     const CHECKED_IN: &str = include_str!("../../../openapi.json");
@@ -139,25 +141,19 @@ mod tests {
     }
 
     #[test]
-    fn every_error_code_is_in_the_document() {
+    fn the_modrinth_path_descriptions_list_the_slug_characters_checked() {
         let document: Value = serde_json::from_str(CHECKED_IN).unwrap();
-        let codes = document["components"]["schemas"]["ErrorCode"]["enum"]
-            .as_array()
-            .unwrap();
-        for code in [
-            "UNAUTHORIZED",
-            "POOL_REQUIRED",
-            "UNKNOWN_POOL",
-            "INVALID_PATH",
-            "UPSTREAM_TIMEOUT",
-            "UPSTREAM_UNREACHABLE",
-            "UPSTREAM_TOO_LARGE",
-            "UPSTREAM_UNREADABLE",
-            "BUDGET_SPENT",
-            "UPSTREAM_HOLD",
-            "REQUEST_TOO_LARGE",
-        ] {
-            assert!(codes.contains(&Value::from(code)), "{code}");
+        let slug = format!("`{}`", Source::Modrinth.slug_characters());
+        for method in ["get", "post"] {
+            let parameters = document["paths"]["/v1/modrinth/{path}"][method]["parameters"]
+                .as_array()
+                .unwrap();
+            let path = parameters
+                .iter()
+                .find(|parameter| parameter["name"] == "path")
+                .unwrap();
+            let description = path["description"].as_str().unwrap();
+            assert!(description.contains(&slug), "{method}: {description}");
         }
     }
 

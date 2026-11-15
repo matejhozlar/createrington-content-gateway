@@ -29,11 +29,27 @@ impl Source {
         }
     }
 
-    /// What a cache key of this source starts with. CurseForge's keys have no prefix, as the first release stored them.
-    pub fn key(self, key: &str) -> String {
+    /// The characters a path segment of this source may hold besides letters, digits, `-` and `_`.
+    pub fn slug_characters(self) -> &'static str {
         match self {
-            Self::CurseForge => key.to_owned(),
-            Self::Modrinth => format!("modrinth:{key}"),
+            Self::CurseForge => "",
+            Self::Modrinth => ".+!()~',@$",
+        }
+    }
+
+    /// What this source's cache and budget keys start with. CurseForge's have none, as the first release stored them.
+    pub fn namespace(self) -> &'static str {
+        match self {
+            Self::CurseForge => "",
+            Self::Modrinth => "modrinth",
+        }
+    }
+
+    /// A cache key of this source, under its namespace.
+    pub fn key(self, key: &str) -> String {
+        match self.namespace() {
+            "" => key.to_owned(),
+            namespace => format!("{namespace}:{key}"),
         }
     }
 }

@@ -157,18 +157,19 @@ fn gateway_with(
     }];
     let state = Arc::new(AppState {
         budget: Budget::new(
+            Source::CurseForge,
             limit,
             pools.iter().map(|pool| ("app", *pool)),
             clock.clone(),
             redis.clone(),
         ),
         modrinth_budget: Budget::new(
+            Source::Modrinth,
             limit,
             pools.iter().map(|pool| ("app", *pool)),
             clock.clone(),
             redis.clone(),
-        )
-        .named("modrinth", "Modrinth"),
+        ),
         upstream: Upstream::new(
             Source::CurseForge,
             format!("{}/v1", mock.base),

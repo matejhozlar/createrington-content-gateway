@@ -13,7 +13,7 @@ use redis::{Script, Value, aio::ConnectionManager};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::{app::AppState, error::ApiError, redis_store::RedisStore};
+use crate::{app::AppState, error::ApiError, redis_store::RedisStore, upstream};
 
 const MINUTE_MS: u64 = 60_000;
 const DAY_MS: u64 = 24 * 60 * MINUTE_MS;
@@ -87,7 +87,7 @@ impl Clock for SystemClock {
     }
 }
 
-/// Why calls were not let through: the minute's budget is spent, CurseForge answered 429 and the hold has not ended,
+/// Why calls were not let through: the minute's budget is spent, the upstream answered 429 and the hold has not ended,
 /// or the request needs more calls than a whole minute allows, which no retry can fix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
@@ -100,7 +100,7 @@ pub enum Refusal {
 pub struct Budget {
     limit_per_minute: u32,
     history_days: u32,
-    name: &'static str,
+    upstream: upstream::Source,
     pools: Vec<PoolKey>,
     clock: Arc<dyn Clock>,
     memory: Arc<Mutex<Counts>>,
@@ -137,15 +137,15 @@ struct MinuteCounts {
 /// What one pool did on one UTC day.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 pub struct DayCounts {
-    /// Calls that reached CurseForge.
+    /// Calls that reached the upstream.
     pub calls: u64,
     /// Requests answered without a call: from the cache, or by joining a call already in flight.
     pub hits: u64,
     /// Calls the budget refused.
     pub withheld: u64,
-    /// Calls CurseForge answered 403.
+    /// Calls the upstream answered 403.
     pub forbidden: u64,
-    /// Calls CurseForge answered 429.
+    /// Calls the upstream answered 429.
     pub throttled: u64,
 }
 
@@ -246,7 +246,9 @@ struct Stored {
 }
 
 impl Budget {
+    /// The budget of `upstream`, with its Redis keys under the upstream's namespace.
     pub fn new<C, P>(
+        upstream: upstream::Source,
         limit_per_minute: u32,
         pools: impl IntoIterator<Item = (C, P)>,
         clock: Arc<dyn Clock>,
@@ -259,30 +261,20 @@ impl Budget {
         Self {
             limit_per_minute,
             history_days: DEFAULT_HISTORY_DAYS,
-            name: "CurseForge",
+            upstream,
             pools: pools
                 .into_iter()
                 .map(|(consumer, pool)| (consumer.into(), pool.into()))
                 .collect(),
             clock,
             memory: Arc::default(),
-            redis: redis.map(|store| Arc::new(Shared::new(store, ""))),
+            redis: redis.map(|store| Arc::new(Shared::new(store, upstream.namespace()))),
         }
     }
 
     /// Keeps `days` UTC days of daily counts instead of the default, 1 up.
     pub fn keeping_days(mut self, days: u32) -> Self {
         self.history_days = days.max(1);
-        self
-    }
-
-    /// Makes this the budget of another upstream, with its Redis keys under `budget:{namespace}:`.
-    pub fn named(mut self, namespace: &'static str, name: &'static str) -> Self {
-        self.name = name;
-        self.redis = self
-            .redis
-            .take()
-            .map(|redis| Arc::new(Shared::new(redis.store.clone(), namespace)));
         self
     }
 
@@ -308,7 +300,7 @@ impl Budget {
         verdict
     }
 
-    /// Records one call CurseForge answered with `status`, or `None` when it gave no answer. A 429 starts the hold.
+    /// Records one call the upstream answered with `status`, or `None` when it gave no answer. A 429 starts the hold.
     pub async fn record(
         &self,
         consumer: &str,
@@ -349,7 +341,7 @@ impl Budget {
         self.write_days_soon();
     }
 
-    /// Counts one request answered without a call to CurseForge: from the cache, or by joining a call already made.
+    /// Counts one request answered without a call upstream: from the cache, or by joining a call already made.
     pub fn record_hit(&self, consumer: &str, pool: &str) {
         let now = self.clock.now_ms();
         let key = self.key(consumer, pool);
@@ -368,7 +360,7 @@ impl Budget {
         if lost > 0 {
             tracing::warn!(
                 "Redis did not take the last daily counts of the {} budget, {lost} of them are lost",
-                self.name
+                self.upstream.name()
             );
         }
     }
@@ -979,15 +971,28 @@ mod tests {
         fn keeping_days(limit: u32, clock: &Arc<TestClock>, days: u32) -> Self {
             let mut budgets = vec![(
                 Source::Memory,
-                Budget::new(limit, POOLS, clock.clone(), None).keeping_days(days),
+                Budget::new(
+                    upstream::Source::CurseForge,
+                    limit,
+                    POOLS,
+                    clock.clone(),
+                    None,
+                )
+                .keeping_days(days),
             )];
             let redis = test_redis_url().map(|url| (url, unique_prefix()));
             if let Some((url, prefix)) = &redis {
                 let store = RedisStore::open(url, prefix.clone()).unwrap();
                 budgets.push((
                     Source::Redis,
-                    Budget::new(limit, POOLS, clock.clone(), Some(Arc::new(store)))
-                        .keeping_days(days),
+                    Budget::new(
+                        upstream::Source::CurseForge,
+                        limit,
+                        POOLS,
+                        clock.clone(),
+                        Some(Arc::new(store)),
+                    )
+                    .keeping_days(days),
                 ));
             }
             Self { redis, budgets }
@@ -1255,7 +1260,14 @@ mod tests {
     #[tokio::test]
     async fn keeps_the_configured_days_in_memory() {
         let clock = TestClock::at(NOV_3_2026_20H);
-        let budget = Budget::new(300, POOLS, clock.clone(), None).keeping_days(3);
+        let budget = Budget::new(
+            upstream::Source::CurseForge,
+            300,
+            POOLS,
+            clock.clone(),
+            None,
+        )
+        .keeping_days(3);
         for _ in 0..5 {
             budget.record("app", "app", Some(200), None).await;
             clock.advance(DAY_MS);
@@ -1314,6 +1326,7 @@ mod tests {
         let clock = TestClock::at(NOV_3_2026_20H);
         let open = || {
             Budget::new(
+                upstream::Source::CurseForge,
                 5,
                 POOLS,
                 clock.clone(),
@@ -1360,6 +1373,7 @@ mod tests {
         let clock = TestClock::at(NOV_3_2026_20H);
         let open = || {
             Budget::new(
+                upstream::Source::CurseForge,
                 5,
                 POOLS,
                 clock.clone(),
@@ -1391,12 +1405,19 @@ mod tests {
         let clock = TestClock::at(NOV_3_2026_20H);
         let store = RedisStore::open(&url, prefix.clone()).unwrap();
         store.skip_for_a_while();
-        let before = Budget::new(5, POOLS, clock.clone(), Some(Arc::new(store)));
+        let before = Budget::new(
+            upstream::Source::CurseForge,
+            5,
+            POOLS,
+            clock.clone(),
+            Some(Arc::new(store)),
+        );
         before.record("app", "app", Some(200), None).await;
         before.write_days_at_exit().await;
         drop(before);
 
         let after = Budget::new(
+            upstream::Source::CurseForge,
             5,
             POOLS,
             clock,
@@ -1417,7 +1438,14 @@ mod tests {
         let prefix = unique_prefix();
         let clock = TestClock::at(NOV_3_2026_20H);
         let store = Arc::new(RedisStore::open(&url, prefix.clone()).unwrap());
-        let budget = Budget::new(300, POOLS, clock.clone(), Some(store.clone())).keeping_days(14);
+        let budget = Budget::new(
+            upstream::Source::CurseForge,
+            300,
+            POOLS,
+            clock.clone(),
+            Some(store.clone()),
+        )
+        .keeping_days(14);
         for _ in 0..20 {
             budget.record("app", "app", Some(200), None).await;
             budget.write_days_at_exit().await;
@@ -1459,7 +1487,14 @@ mod tests {
         let prefix = unique_prefix();
         let clock = TestClock::at(NOV_3_2026_20H);
         let store = Arc::new(RedisStore::open(&url, prefix.clone()).unwrap());
-        let long = Budget::new(300, POOLS, clock.clone(), Some(store.clone())).keeping_days(90);
+        let long = Budget::new(
+            upstream::Source::CurseForge,
+            300,
+            POOLS,
+            clock.clone(),
+            Some(store.clone()),
+        )
+        .keeping_days(90);
         for _ in 0..80 {
             long.record("app", "app", Some(200), None).await;
             long.write_days_at_exit().await;
@@ -1467,7 +1502,14 @@ mod tests {
         }
         assert_eq!(day_keys(&store).await.len(), 80);
 
-        let short = Budget::new(300, POOLS, clock.clone(), Some(store.clone())).keeping_days(14);
+        let short = Budget::new(
+            upstream::Source::CurseForge,
+            300,
+            POOLS,
+            clock.clone(),
+            Some(store.clone()),
+        )
+        .keeping_days(14);
         short.record("app", "app", Some(200), None).await;
         short.write_days_at_exit().await;
         let days = day_keys(&store).await;
@@ -1497,7 +1539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_named_budget_keeps_its_own_keys() {
+    async fn a_modrinth_budget_keeps_its_own_keys() {
         let Some(url) = test_redis_url() else {
             eprintln!("{TEST_REDIS_ENV} is not set, skipped");
             return;
@@ -1505,9 +1547,20 @@ mod tests {
         let prefix = unique_prefix();
         let clock = TestClock::at(NOV_3_2026_20H);
         let store = Arc::new(RedisStore::open(&url, prefix.clone()).unwrap());
-        let curseforge = Budget::new(5, POOLS, clock.clone(), Some(store.clone()));
-        let shared = Budget::new(5, POOLS, clock.clone(), Some(store.clone()));
-        let modrinth = shared.named("modrinth", "Modrinth");
+        let curseforge = Budget::new(
+            upstream::Source::CurseForge,
+            5,
+            POOLS,
+            clock.clone(),
+            Some(store.clone()),
+        );
+        let modrinth = Budget::new(
+            upstream::Source::Modrinth,
+            5,
+            POOLS,
+            clock.clone(),
+            Some(store.clone()),
+        );
         curseforge.admit("app", "app", 5).await.unwrap();
         curseforge.record("app", "app", Some(200), None).await;
         assert_eq!(modrinth.admit("app", "app", 5).await, Ok(()));
@@ -1540,6 +1593,7 @@ mod tests {
         let clock = TestClock::at(NOV_3_2026_20H);
         let open = || {
             Budget::new(
+                upstream::Source::CurseForge,
                 5,
                 POOLS,
                 clock.clone(),
@@ -1562,7 +1616,13 @@ mod tests {
     async fn falls_back_to_memory_when_redis_does_not_answer() {
         let clock = TestClock::at(NOV_3_2026_20H);
         let store = RedisStore::open("redis://127.0.0.1:1", unique_prefix()).unwrap();
-        let budget = Budget::new(2, POOLS, clock.clone(), Some(Arc::new(store)));
+        let budget = Budget::new(
+            upstream::Source::CurseForge,
+            2,
+            POOLS,
+            clock.clone(),
+            Some(Arc::new(store)),
+        );
 
         assert_eq!(budget.admit("app", "app", 2).await, Ok(()));
         assert!(budget.admit("app", "app", 1).await.is_err());

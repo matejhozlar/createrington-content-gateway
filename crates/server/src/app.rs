@@ -60,6 +60,7 @@ impl AppState {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         Ok(Self {
             budget: Budget::new(
+                Source::CurseForge,
                 config.budget_per_minute,
                 pools.iter().copied(),
                 clock.clone(),
@@ -67,13 +68,13 @@ impl AppState {
             )
             .keeping_days(config.budget_history_days),
             modrinth_budget: Budget::new(
+                Source::Modrinth,
                 config.modrinth_per_minute,
                 pools.iter().copied(),
                 clock.clone(),
                 redis.clone(),
             )
-            .keeping_days(config.budget_history_days)
-            .named("modrinth", "Modrinth"),
+            .keeping_days(config.budget_history_days),
             upstream: Upstream::new(
                 Source::CurseForge,
                 CURSEFORGE_API,
@@ -150,8 +151,14 @@ pub(crate) fn test_state(consumers: Vec<Consumer>) -> Arc<AppState> {
         })
         .collect();
     Arc::new(AppState {
-        budget: Budget::new(300, pools.clone(), Arc::new(SystemClock), None),
-        modrinth_budget: Budget::new(300, pools, Arc::new(SystemClock), None),
+        budget: Budget::new(
+            Source::CurseForge,
+            300,
+            pools.clone(),
+            Arc::new(SystemClock),
+            None,
+        ),
+        modrinth_budget: Budget::new(Source::Modrinth, 300, pools, Arc::new(SystemClock), None),
         upstream: Upstream::new(
             Source::CurseForge,
             "http://127.0.0.1:9/v1",

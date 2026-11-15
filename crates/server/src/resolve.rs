@@ -189,8 +189,10 @@ struct Candidate {
     size: u64,
 }
 
-/// A download address for each CurseForge file: CurseForge's own link, else Modrinth's copy of the file found by
-/// its SHA-1, else the file's built address on CurseForge's CDN when a HEAD answers 200 with the file's size.
+/// A download address for each CurseForge file.
+///
+/// The address is CurseForge's own link, else Modrinth's copy of the file found by its SHA-1, else the file's built
+/// address on CurseForge's CDN when a HEAD answers 200 with the file's size.
 ///
 /// The files are read from the cache like `POST /v1/curseforge/mods/files`, and the CurseForge calls for the ones
 /// not kept count against the budget. Modrinth answers and CDN verdicts are kept for an hour, misses for 10
