@@ -46,13 +46,13 @@ Every process that calls the gateway is a consumer with its own bearer token (at
 ```json
 [
   { "name": "app", "token": "…", "pools": ["launcher", "app"] },
-  { "name": "sandbox", "token": "…", "pools": ["jobs"] }
+  { "name": "jobs", "token": "…", "pools": ["jobs"] }
 ]
 ```
 
-Names and pools are lowercase letters, digits and `-`. A request sends `Authorization: Bearer <token>`, and `X-Budget-Pool: <pool>` when its token has more than one pool. One ceiling per minute covers all pools; every pool is counted on its own.
+Names and pools are 1 to 64 lowercase letters, digits and `-`, starting with a letter or digit. A request sends `Authorization: Bearer <token>`, and `X-Budget-Pool: <pool>` when its token has more than one pool. One ceiling per minute covers all pools; every pool is counted on its own.
 
-An empty value counts as unset. An invalid value stops the gateway at startup with a message naming the variable. `.env.example` lists every variable. The gateway does not read a `.env` file by itself: export the variables, or pass the file with `docker run --env-file .env`.
+An empty value counts as unset. An invalid value stops the gateway at startup with a message saying what is wrong. `.env.example` lists every variable. The gateway does not read a `.env` file by itself: export the variables, or let `docker compose` or `docker run --env-file .env` pass the file.
 
 Two more variables are read at build time, not at runtime. `/v1/healthz` reports them, and they are `null` when unset:
 
@@ -72,16 +72,25 @@ Every key starts with `content-gateway:`. TLS (`rediss://`) is not supported, ke
 ### Docker
 
 ```bash
+cp .env.example .env   # then set CURSEFORGE_API_KEY and CONTENT_GATEWAY_TOKEN (or CONTENT_GATEWAY_CONSUMERS)
+docker compose up -d
+curl http://127.0.0.1:5005/v1/healthz
+```
+
+[`compose.yaml`](compose.yaml) runs the newest release image next to a Redis of its own (`maxmemory 1gb`, `volatile-lru`, its data in a volume, no port published). Over the values in `.env` it sets `CONTENT_GATEWAY_HOST=0.0.0.0` and `CONTENT_GATEWAY_PORT=5005` inside the container and `REDIS_URL` to that Redis, and it publishes the port on `127.0.0.1` only. To pin a release, replace `latest` in the file with its version; `docker compose up -d --build` builds this checkout instead.
+
+Without compose, build and run the image yourself:
+
+```bash
 docker build -t content-gateway \
   --build-arg CONTENT_GATEWAY_COMMIT="$(git rev-parse HEAD)" \
   --build-arg CONTENT_GATEWAY_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" .
-cp .env.example .env   # then set CURSEFORGE_API_KEY and CONTENT_GATEWAY_TOKEN (or CONTENT_GATEWAY_CONSUMERS)
 docker run --rm --env-file .env -p 127.0.0.1:5005:5005 content-gateway
 ```
 
-The image is a static binary on a distroless base. Inside the container the gateway listens on `0.0.0.0`; publish the port on `127.0.0.1` as above. The build keeps downloaded crates and compiled dependencies in BuildKit cache mounts, so a rebuild after an update only compiles what changed.
+The image is a static binary on a distroless base. It sets `CONTENT_GATEWAY_HOST=0.0.0.0`, since inside a container the gateway has to listen there for a published port to reach it, so leave the host unset in `.env` (`.env.example` leaves it commented out). Publish the port on `127.0.0.1` as above. The build keeps downloaded crates and compiled dependencies in BuildKit cache mounts, so a rebuild after an update only compiles what changed.
 
-Every release also publishes this image as `ghcr.io/matejhozlar/createrington-content-gateway:<version>` for amd64 and arm64, and the static binaries for both, `openapi.json` and a `SHA256SUMS` on the [GitHub release](https://github.com/matejhozlar/createrington-content-gateway/releases), so running a release needs neither the toolchain nor Docker.
+Every release publishes this image as `ghcr.io/matejhozlar/createrington-content-gateway:<version>` (and `latest` for the newest) for amd64 and arm64, and the static binaries for both, `openapi.json` and a `SHA256SUMS` on the [GitHub release](https://github.com/matejhozlar/createrington-content-gateway/releases), so running a release needs neither the toolchain nor Docker.
 
 ### As a host process
 
@@ -186,29 +195,49 @@ Run the gateway on loopback or a private network only, with your own CurseForge 
 
 ```bash
 cargo fmt --all
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-pnpm install        # Prettier, the pre-commit hook, the Infisical CLI and the client's dependencies
-cargo run           # the gateway on 127.0.0.1:5005 with the variables exported in the shell
-pnpm dev            # the same with the env injected from Infisical, for the maintainers
-pnpm openapi        # rewrite openapi.json and the client's generated types after a route or type changed
-pnpm test           # the TypeScript client's tests; pnpm typecheck and pnpm build likewise
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo deny --locked check       # advisories, licences, bans and sources (cargo install cargo-deny)
+cargo machete                   # unused dependencies (cargo install cargo-machete)
+pnpm install                    # Prettier, the pre-commit hook, the Infisical CLI and the client's dependencies
+cargo run                       # the gateway on 127.0.0.1:5005 with the variables exported in the shell
+pnpm dev                        # the same with the env injected from Infisical, for the maintainers
+pnpm openapi                    # rewrite openapi.json and the clients' generated types after a route or type changed
+pnpm test                       # the TypeScript client's tests; pnpm typecheck and pnpm build likewise
 pnpm format:check
+pnpm audit --audit-level=high
 ```
+
+The Python client's checks (ruff, mypy, pytest and its generate check) run with uv in `packages/python-client`, see [its README](packages/python-client/README.md).
 
 `openapi.json`, `packages/client/src/generated/openapi.ts` and `packages/python-client/src/content_gateway/generated.py` are generated and checked in: `cargo test` fails when the document no longer matches the server, and each client's generate check fails when its types no longer match the document. `pnpm openapi` rewrites all three; the Python step needs [uv](https://docs.astral.sh/uv/), which also runs the Python client's own checks (see its README).
 
 Every pull request runs these checks in CI. The same jobs exist as a Gitea Actions workflow (`.gitea/workflows/ci.yml`) and as a GitHub Actions workflow (`.github/workflows/ci.yml`), sharing the composite actions under `.ci/actions`, so the checks are the same wherever the repository is hosted.
 
+The budget's tests also run against a real Redis when `CONTENT_GATEWAY_TEST_REDIS_URL` names one, for example `docker run --rm -p 127.0.0.1:6390:6379 redis:8.10-alpine` and `CONTENT_GATEWAY_TEST_REDIS_URL=redis://127.0.0.1:6390/0 cargo test`. Each test uses its own key prefix and deletes its keys; CI runs them against a throwaway Redis.
+
+### Running your own copy of the workflows
+
+The GitHub workflows run on GitHub's `ubuntu-latest` runners and need no setup for CI. The Gitea workflows are the maintainers' own setup:
+
+- Jobs run on self-hosted runners labelled `oracle` (the Node and Python jobs, the client publish) and `hetzner` (the Rust jobs and the deploy). A Gitea fork registers runners with those labels or changes `runs-on`; otherwise its jobs wait for a runner forever.
+- `.ci/actions/setup-rust` uses caches that persist on the runner when the runner's own environment sets `CI_PERSISTENT_RUST=1` and `CI_RUST_CACHE` to a directory mounted into every job, holding the `cargo` and `rustup` homes and sccache. Without those two variables the jobs restore the cargo caches with `actions/cache` instead, so a fork needs neither.
+- `.infisical.json` names the maintainers' [Infisical](https://infisical.com/) project, which `pnpm dev` reads its variables from. It holds no secret. A fork deletes it, or points it at its own project with `infisical init`, and otherwise runs `cargo run` with the variables exported.
+
 ### Releasing
 
-A server release is the `vX.Y.Z` tag on the release merge into `main`. On GitHub, `.github/workflows/release.yml` checks the tag against `package.json` and `Cargo.toml`, builds the binaries and the image, and publishes the release with the notes from that version's section of `CHANGELOG.md`, then publishes the Python client to PyPI when its version is not there yet. The image package GHCR creates on the first push is private: make it public once in the package's settings on GitHub, or the `docker pull` above fails for everyone else.
+A server release is the `vX.Y.Z` tag on the release merge into `main`. On GitHub, `.github/workflows/release.yml` checks the tag against `package.json` and `Cargo.toml`, builds the binaries and the image, and publishes the release with the notes from that version's section of `CHANGELOG.md`, then publishes the Python client to PyPI when its version is not there yet. The image package GHCR creates on the first push is private: make it public once in the package's settings on GitHub, or pulling the image, as `compose.yaml` does, fails for everyone else.
 
 ### Releasing the client
 
 The client package is versioned with [changesets](https://github.com/changesets/changesets), apart from the server. A change to `packages/client` comes with a changeset written on its branch (`pnpm changeset`); CI refuses a changed client without one. The release PR runs `pnpm version-packages`, which turns the changesets into the version bump and the package's `CHANGELOG.md` entry, and the merge into `main` publishes that version to the npm registry named by the `NPM_PUBLISH_REGISTRY` repository variable (`.gitea/workflows/publish-client.yml`, with the registry token in the `NPM_PUBLISH_TOKEN` secret). A version the registry already has is not published again, and a merge that still carries unconsumed changesets fails instead of publishing.
 
-The budget's tests also run against a real Redis when `CONTENT_GATEWAY_TEST_REDIS_URL` names one, for example `docker run --rm -p 127.0.0.1:6390:6379 redis:8.10-alpine` and `CONTENT_GATEWAY_TEST_REDIS_URL=redis://127.0.0.1:6390/0 cargo test`. Each test uses its own key prefix and deletes its keys; CI runs them against a throwaway Redis.
+## Contributing
+
+- Branch off `dev` and open the pull request into `dev`. `main` only receives the release merge from `dev`.
+- Commit messages are `type(scope): description`: the type is one of `feat`, `fix`, `chore`, `refactor`, `docs`, `test` and `perf`, the scope `server` or `client` (left out when a change spans both), and the description lowercase and imperative, without a period at the end.
+- A change under `packages/client` comes with a changeset (`pnpm changeset`); CI refuses it without one. A change to the Python client bumps its version in `pyproject.toml` and adds a `CHANGELOG.md` entry by hand. The gateway's own version and `CHANGELOG.md` are left to the release.
+- Run the checks under [Development](#development) before pushing; a route or type change also needs `pnpm openapi`.
 
 ## License
 
