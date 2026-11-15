@@ -1,5 +1,12 @@
 # @createrington/content-gateway-client
 
+## 0.3.1
+
+### Patch Changes
+
+- 9c26df3: The gateway's own routes (`health`, `budget`, `resolve` and the version lists) throw `ContentGatewayError` on any answer that is not the gateway's JSON object instead of returning it typed as their result: a page from something else at the base URL, an empty success, or CurseForge's own failure that `resolve` passes on with its status. A thrown error's `retryAfterMs` falls back to `Retry-After` when the body carries none, and an `X-Cache` value the gateway does not send is named as such instead of reported as a missing header.
+- e0ea008: The generated types' docs follow the gateway's document: daily counts speak of the upstream instead of CurseForge, Modrinth paths list the slug characters they accept, and `algorithm` on `version_files` says another algorithm passes through to Modrinth.
+
 ## 0.3.0
 
 ### Minor Changes
