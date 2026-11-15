@@ -55,7 +55,7 @@ pub async fn serve(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::{sync::Arc, time::Instant};
 
     use axum::routing::get;
     use tokio::{
@@ -115,10 +115,18 @@ mod tests {
 
     #[tokio::test]
     async fn gives_up_on_a_request_that_never_finishes() {
-        let hanging = Router::new().route("/hang", get(std::future::pending::<&'static str>));
+        let arrived = Arc::new(tokio::sync::Notify::new());
+        let signal = arrived.clone();
+        let hanging = Router::new().route(
+            "/hang",
+            get(move || async move {
+                signal.notify_one();
+                std::future::pending::<&'static str>().await
+            }),
+        );
         let (address, shutdown, task) = start(hanging).await;
         let _stream = send(address, "/hang").await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        arrived.notified().await;
 
         let started = Instant::now();
         shutdown.send(()).unwrap();
