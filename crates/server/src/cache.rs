@@ -66,7 +66,6 @@ pub struct AnswerCache {
     redis: Option<Arc<RedisStore>>,
 }
 
-/// What a load ended with, handed to every request that waited on it.
 type Loaded = Result<Arc<Entry>, LoadFailure>;
 
 /// A load's outcome, and whether it called the upstream or found the answer kept meanwhile.

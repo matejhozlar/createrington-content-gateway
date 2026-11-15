@@ -26,7 +26,6 @@ const DAYS_TRIMMED: u64 = 31;
 pub const DEFAULT_HISTORY_DAYS: u32 = 90;
 /// The most days of daily counts that can be kept.
 pub const MAX_HISTORY_DAYS: u32 = 3660;
-/// Days `/v1/budget` answers when not asked for a number.
 const DEFAULT_SNAPSHOT_DAYS: u32 = 14;
 const HTTP_FORBIDDEN: u16 = 403;
 const HTTP_TOO_MANY_REQUESTS: u16 = 429;

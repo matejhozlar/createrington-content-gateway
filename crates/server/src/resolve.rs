@@ -56,7 +56,6 @@ impl Cdn {
         })
     }
 
-    /// The address of a file on the CDN, built from its id and name the way CurseForge's own links are.
     fn url(&self, file_id: u64, file_name: &str) -> String {
         format!(
             "{}/files/{}/{}/{}",
