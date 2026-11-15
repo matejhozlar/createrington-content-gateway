@@ -643,10 +643,12 @@ pub async fn minecraft_version(
     .into_response()
 }
 
-/// A loader's builds, newest first: NeoForge from its Maven, Forge's promoted builds (the recommended and the
-/// latest per Minecraft version, which is what pickers show), Fabric's loaders from its meta. `minecraft` keeps
-/// only the builds for that version; for Fabric, whose loader is not tied to one, that means all of them when
-/// Fabric supports the version and none otherwise. Each list is kept for an hour.
+/// A loader's builds, newest first.
+///
+/// NeoForge's come from its Maven, Forge's are its promoted builds (the recommended and the latest per Minecraft
+/// version, which is what pickers show), Fabric's are the loaders from its meta. `minecraft` keeps only the builds
+/// for that version; for Fabric, whose loader is not tied to one, that means all of them when Fabric supports the
+/// version and none otherwise. Each list is kept for an hour.
 #[utoipa::path(
     get,
     path = "/v1/minecraft/loaders/{loader}/versions",

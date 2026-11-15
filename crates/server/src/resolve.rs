@@ -44,11 +44,15 @@ pub struct Cdn {
 }
 
 impl Cdn {
-    pub fn new(base: impl Into<String>, timeout: Duration) -> reqwest::Result<Self> {
+    pub fn new(
+        base: impl Into<String>,
+        user_agent: &str,
+        timeout: Duration,
+    ) -> reqwest::Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(timeout)
-                .user_agent(modrinth::DEFAULT_USER_AGENT)
+                .user_agent(user_agent)
                 .build()?,
             base: base.into(),
         })
@@ -189,8 +193,10 @@ struct Candidate {
     size: u64,
 }
 
-/// A download address for each CurseForge file: CurseForge's own link, else Modrinth's copy of the file found by
-/// its SHA-1, else the file's built address on CurseForge's CDN when a HEAD answers 200 with the file's size.
+/// A download address for each CurseForge file.
+///
+/// The address is CurseForge's own link, else Modrinth's copy of the file found by its SHA-1, else the file's built
+/// address on CurseForge's CDN when a HEAD answers 200 with the file's size.
 ///
 /// The files are read from the cache like `POST /v1/curseforge/mods/files`, and the CurseForge calls for the ones
 /// not kept count against the budget. Modrinth answers and CDN verdicts are kept for an hour, misses for 10
@@ -215,6 +221,7 @@ struct Candidate {
         (status = 502, description = "CurseForge could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`", body = ApiError),
         (status = 503, description = "The CurseForge call was refused: `BUDGET_SPENT` this minute or `UPSTREAM_HOLD` after a 429", body = ApiError, headers(("Retry-After" = u64, description = "Seconds until the next call can go out"))),
         (status = 504, description = "CurseForge did not answer in time, `UPSTREAM_TIMEOUT`", body = ApiError),
+        (status = "default", description = "Any other status CurseForge answered the file lookup with, with its body as it came, marked `X-Cache`. Only the gateway's own answers lack `X-Cache`"),
     )
 )]
 pub async fn resolve(
@@ -511,7 +518,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::{curseforge::TIMEOUT, test_support::*};
+    use crate::{config::DEFAULT_USER_AGENT, curseforge::TIMEOUT, test_support::*};
 
     const JEI_SHA1: &str = "3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e";
     const SODIUM_SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -636,6 +643,11 @@ mod tests {
         );
         let heads: Vec<&Seen> = seen.iter().filter(|seen| seen.method == "HEAD").collect();
         assert_eq!(heads.len(), 2);
+        assert!(
+            heads
+                .iter()
+                .all(|head| head.user_agent.as_deref() == Some(USER_AGENT))
+        );
         assert_eq!(gateway.state.budget.snapshot().await.used, 1);
 
         let again = resolve(&gateway, r#"{"fileIds":[1003,1004]}"#).await;
@@ -770,7 +782,7 @@ mod tests {
 
     #[test]
     fn builds_the_cdn_address_like_curseforge_does() {
-        let cdn = Cdn::new(CURSEFORGE_CDN, CDN_TIMEOUT).unwrap();
+        let cdn = Cdn::new(CURSEFORGE_CDN, DEFAULT_USER_AGENT, CDN_TIMEOUT).unwrap();
         assert_eq!(
             cdn.url(4567890, "Create-1.20.1 (v0.5.1f)!'*.jar"),
             "https://mediafilez.forgecdn.net/files/4567/890/Create-1.20.1%20%28v0.5.1f%29%21%27%2A.jar"

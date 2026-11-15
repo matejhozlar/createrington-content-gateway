@@ -15,6 +15,7 @@ env:
 
 jobs:
   publish:
+    if: github.ref == 'refs/heads/main'
     runs-on: oracle
     env:
       NPM_PUBLISH_REGISTRY: ${{ vars.NPM_PUBLISH_REGISTRY }}
@@ -36,6 +37,15 @@ jobs:
             echo "$pending"
             exit 1
           fi
+
+      - name: Check the generated types
+        run: pnpm --filter @createrington/content-gateway-client generate:check
+
+      - name: Typecheck
+        run: pnpm --filter @createrington/content-gateway-client typecheck
+
+      - name: Test
+        run: pnpm --filter @createrington/content-gateway-client test
 
       - name: Build
         run: pnpm --filter @createrington/content-gateway-client build

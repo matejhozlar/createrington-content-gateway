@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.7 (2026-11-15)
+
+- [add] Add `CONTENT_GATEWAY_USER_AGENT`, the one User-Agent the gateway sends to every host it calls: CurseForge's API and CDN, Modrinth, Mojang, NeoForge's Maven, Forge and Fabric's meta. Before, CurseForge's API and CDN always saw `content-gateway/<version>` while the rest saw `MODRINTH_USER_AGENT`. `MODRINTH_USER_AGENT` is still read when the new variable is unset, and the default stays `content-gateway/<version>`
+- [add] Add a `compose.yaml` that runs the release image next to a Redis of its own (`maxmemory 1gb`, `volatile-lru`, data in a volume, no port published), listening on `0.0.0.0` inside the container and published on `127.0.0.1:5005` only; `docker compose up -d --build` builds the checkout instead
+- [fix] Name the right upstream in the gateway's refusals on Modrinth routes: a spent Modrinth budget, a Modrinth 429 hold and a request needing more Modrinth calls than a minute allows now say Modrinth instead of CurseForge, and `INVALID_PATH` on `/v1/modrinth/*` names Modrinth and lists the slug characters (`.+!()~',@$`) its paths accept
+- [fix] Correct the OpenAPI document: the Modrinth path parameters list the slug characters the gateway accepts, `algorithm` on `POST /v1/modrinth/version_files` says another algorithm passes through to Modrinth uncached instead of claiming only `sha1` is supported, `POST /v1/resolve` documents that it answers with CurseForge's own status and body (marked `X-Cache`) when the file lookup fails, and the budget's daily counts speak of the upstream rather than CurseForge
+- [fix] Leave `CONTENT_GATEWAY_HOST` commented out in `.env.example`, so a container started with `docker run --env-file .env` or compose keeps listening on `0.0.0.0` as the image sets it instead of on an unreachable `127.0.0.1`
+- [fix] Make the example deploy workflow put the previous `.env` back when the gateway does not answer after a redeploy of the same commit, where only `.env` was replaced, and report the last health probe's error when it gives up
+- [chore] Install the Infisical CLI in the example deploy workflow from the version `pnpm-lock.yaml` pins, keep the Infisical API URL to the step that logs in, write the new `.env` with owner-only permissions, and pull the health probe image once before the deploy
+- [chore] Document `cargo deny`, `cargo machete`, `pnpm audit` and the Redis-backed budget tests in the README's development commands, and how to run your own copy of the CI and deploy workflows
+
 ## v0.1.6 (2026-11-06)
 
 - [add] Add `GET /v1/minecraft/java?platform=<platform>&major=<n>` (or `&component=<name>`), serving the Java runtimes Mojang ships with its launcher for a platform (`linux`, `linux-i386`, `mac-os`, `mac-os-arm64`, `windows-x64`, `windows-x86`, `windows-arm64`): the runtime's `component`, `major`, `version` and release date, and the `url`, `sha1` and `size` of Mojang's manifest of its files. `major` picks the newest non-snapshot runtime of that Java major (the later released one on equal versions), `component` names one exactly, and `404 UNKNOWN_RUNTIME` answers when Mojang ships no such runtime for the platform. Mojang's list is cached and served stale like the other version lists, draws on no budget, and the runtime's files never pass through the gateway

@@ -22,7 +22,7 @@ use crate::{
     budget::{Budget, TestClock},
     cache::AnswerCache,
     config::{ApiKey, Consumer, Token},
-    curseforge, modrinth,
+    modrinth,
     redis_store::RedisStore,
     resolve::{self, Cdn},
     upstream::{Source, Upstream},
@@ -157,23 +157,24 @@ fn gateway_with(
     }];
     let state = Arc::new(AppState {
         budget: Budget::new(
+            Source::CurseForge,
             limit,
             pools.iter().map(|pool| ("app", *pool)),
             clock.clone(),
             redis.clone(),
         ),
         modrinth_budget: Budget::new(
+            Source::Modrinth,
             limit,
             pools.iter().map(|pool| ("app", *pool)),
             clock.clone(),
             redis.clone(),
-        )
-        .named("modrinth", "Modrinth"),
+        ),
         upstream: Upstream::new(
             Source::CurseForge,
             format!("{}/v1", mock.base),
             Some(ApiKey::new(KEY)),
-            curseforge::USER_AGENT,
+            USER_AGENT,
             timeout,
         )
         .unwrap(),
@@ -185,7 +186,7 @@ fn gateway_with(
             modrinth::TIMEOUT,
         )
         .unwrap(),
-        cdn: Cdn::new(mock.base.clone(), resolve::CDN_TIMEOUT).unwrap(),
+        cdn: Cdn::new(mock.base.clone(), USER_AGENT, resolve::CDN_TIMEOUT).unwrap(),
         meta: Meta::new(
             mock.base.clone(),
             mock.base.clone(),

@@ -7,10 +7,7 @@ use std::{
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
-use crate::{
-    budget::{DEFAULT_HISTORY_DAYS, MAX_HISTORY_DAYS},
-    modrinth,
-};
+use crate::budget::{DEFAULT_HISTORY_DAYS, MAX_HISTORY_DAYS};
 
 const HOST_ENV: &str = "CONTENT_GATEWAY_HOST";
 const PORT_ENV: &str = "CONTENT_GATEWAY_PORT";
@@ -22,6 +19,7 @@ const MODRINTH_BUDGET_ENV: &str = "CONTENT_GATEWAY_MODRINTH_PER_MINUTE";
 const HISTORY_DAYS_ENV: &str = "CONTENT_GATEWAY_BUDGET_HISTORY_DAYS";
 const REDIS_ENV: &str = "REDIS_URL";
 const API_KEY_ENV: &str = "CURSEFORGE_API_KEY";
+const USER_AGENT_ENV: &str = "CONTENT_GATEWAY_USER_AGENT";
 const MODRINTH_USER_AGENT_ENV: &str = "MODRINTH_USER_AGENT";
 const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const DEFAULT_PORT: u16 = 5005;
@@ -29,6 +27,8 @@ const DEFAULT_BUDGET_PER_MINUTE: u32 = 300;
 const DEFAULT_MODRINTH_PER_MINUTE: u32 = 300;
 const MIN_TOKEN_LENGTH: usize = 32;
 const MAX_NAME_LENGTH: usize = 64;
+/// What the gateway calls itself to every upstream unless `CONTENT_GATEWAY_USER_AGENT` says otherwise.
+pub const DEFAULT_USER_AGENT: &str = concat!("content-gateway/", env!("CARGO_PKG_VERSION"));
 pub const DEFAULT_LOG: &str = "info";
 pub const DEFAULT_CONSUMER: &str = "default";
 pub const DEFAULT_POOL: &str = "default";
@@ -42,7 +42,7 @@ pub struct Config {
     pub budget_history_days: u32,
     pub redis_url: Option<RedisUrl>,
     pub curseforge_api_key: ApiKey,
-    pub modrinth_user_agent: String,
+    pub user_agent: String,
 }
 
 /// A process allowed to call the gateway, and the budget pools it may draw from.
@@ -277,19 +277,19 @@ impl Config {
             .map(|key| ApiKey(key.trim().to_owned()))
             .ok_or(ConfigError::NoApiKey)?;
 
-        let modrinth_user_agent = match lookup(MODRINTH_USER_AGENT_ENV) {
-            Some(value) => {
+        let user_agent = match [USER_AGENT_ENV, MODRINTH_USER_AGENT_ENV]
+            .into_iter()
+            .find_map(|name| lookup(name).map(|value| (name, value)))
+        {
+            Some((name, value)) => {
                 let agent = value.trim().to_owned();
                 if agent.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
                     agent
                 } else {
-                    return Err(ConfigError::UserAgent {
-                        name: MODRINTH_USER_AGENT_ENV,
-                        value,
-                    });
+                    return Err(ConfigError::UserAgent { name, value });
                 }
             }
-            None => modrinth::DEFAULT_USER_AGENT.to_owned(),
+            None => DEFAULT_USER_AGENT.to_owned(),
         };
 
         Ok(Self {
@@ -300,7 +300,7 @@ impl Config {
             budget_history_days,
             redis_url,
             curseforge_api_key,
-            modrinth_user_agent,
+            user_agent,
         })
     }
 }
@@ -520,25 +520,57 @@ mod tests {
     }
 
     #[test]
-    fn says_who_it_is_to_modrinth_unless_told_what_to_say() {
+    fn says_who_it_is_unless_told_what_to_say() {
         assert_eq!(
-            config_with_token(&[]).unwrap().modrinth_user_agent,
-            modrinth::DEFAULT_USER_AGENT
+            config_with_token(&[]).unwrap().user_agent,
+            DEFAULT_USER_AGENT
         );
         assert_eq!(
-            config_with_token(&[(
-                MODRINTH_USER_AGENT_ENV,
-                " my-app/1.0 (https://example.com) "
-            )])
-            .unwrap()
-            .modrinth_user_agent,
+            config_with_token(&[(USER_AGENT_ENV, " my-app/1.0 (https://example.com) ")])
+                .unwrap()
+                .user_agent,
             "my-app/1.0 (https://example.com)"
         );
         assert_eq!(
-            config_with_token(&[(MODRINTH_USER_AGENT_ENV, "my-app/1.0\nX: y")]),
+            config_with_token(&[(USER_AGENT_ENV, "my-app/1.0\nX: y")]),
+            Err(ConfigError::UserAgent {
+                name: USER_AGENT_ENV,
+                value: "my-app/1.0\nX: y".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn takes_the_modrinth_name_when_the_general_one_is_unset() {
+        assert_eq!(
+            config_with_token(&[(MODRINTH_USER_AGENT_ENV, "old-name/1.0")])
+                .unwrap()
+                .user_agent,
+            "old-name/1.0"
+        );
+        assert_eq!(
+            config_with_token(&[
+                (USER_AGENT_ENV, "new-name/1.0"),
+                (MODRINTH_USER_AGENT_ENV, "old-name/1.0"),
+            ])
+            .unwrap()
+            .user_agent,
+            "new-name/1.0"
+        );
+        assert_eq!(
+            config_with_token(&[
+                (USER_AGENT_ENV, ""),
+                (MODRINTH_USER_AGENT_ENV, "old-name/1.0")
+            ])
+            .unwrap()
+            .user_agent,
+            "old-name/1.0"
+        );
+        assert_eq!(
+            config_with_token(&[(MODRINTH_USER_AGENT_ENV, "old\tname")]),
             Err(ConfigError::UserAgent {
                 name: MODRINTH_USER_AGENT_ENV,
-                value: "my-app/1.0\nX: y".to_owned(),
+                value: "old\tname".to_owned(),
             })
         );
     }

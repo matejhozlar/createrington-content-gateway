@@ -40,9 +40,9 @@ pub const fn fresh(found_ms: u64, not_found_ms: Option<u64>) -> Option<Freshness
     })
 }
 
-/// Whether `segment` may be sent to `source`: letters, digits, `-`, `_` and for Modrinth its slug characters.
+/// Whether `segment` may be sent to `source`: letters, digits, `-`, `_` and the source's slug characters.
 pub fn valid_segment(source: Source, segment: &str) -> bool {
-    let slug_byte = |byte: u8| source == Source::Modrinth && b".+!()~',@$".contains(&byte);
+    let slug_byte = |byte: u8| source.slug_characters().as_bytes().contains(&byte);
     !segment.is_empty()
         && segment != "."
         && segment != ".."
@@ -100,7 +100,7 @@ pub async fn passthrough(state: Arc<AppState>, source: Source, request: Request)
         .iter()
         .all(|segment| valid_segment(source, segment))
     {
-        return ApiError::invalid_path().into_response();
+        return ApiError::invalid_path(source).into_response();
     }
     let query = uri.query().map(str::to_owned);
     let forced = wants_fresh(&headers);
@@ -399,7 +399,9 @@ pub fn respond(answer: &Answer, cache: &'static str) -> Response {
 pub fn failed(failure: LoadFailure, pool: &Pool, source: Source) -> Response {
     match failure {
         LoadFailure::Answered(answer) => respond(&answer, "miss"),
-        LoadFailure::Refused(refusal) => ApiError::refused(refusal, &pool.name).into_response(),
+        LoadFailure::Refused(refusal) => {
+            ApiError::refused(refusal, &pool.name, source.name()).into_response()
+        }
         LoadFailure::Upstream(failure) => {
             ApiError::upstream(failure, source.name()).into_response()
         }

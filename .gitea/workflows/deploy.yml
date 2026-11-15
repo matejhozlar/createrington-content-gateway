@@ -12,8 +12,8 @@ concurrency:
 
 env:
   DEPLOY_DIR: ${{ vars.DEPLOY_DIR }}
-  INFISICAL_API_URL: ${{ secrets.INFISICAL_API_URL }}
   INFISICAL_PROJECT_ID: ${{ vars.INFISICAL_PROJECT_ID }}
+  HUSKY: "0"
 
 jobs:
   deploy:
@@ -54,6 +54,10 @@ jobs:
           fi
           docker buildx version
 
+      - name: Pull the health probe image
+        shell: bash
+        run: bash .gitea/scripts/healthz.sh --pull
+
       - name: Build the static binary
         shell: bash
         run: |
@@ -65,31 +69,29 @@ jobs:
             .
           test -x build/content-gateway
 
-      - name: Ensure the Infisical CLI
-        shell: bash
-        run: |
-          command -v infisical >/dev/null 2>&1 && exit 0
-          if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=; fi
-          curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | $SUDO bash
-          $SUDO apt-get install -y infisical
+      - name: Install the Infisical CLI pinned in the lockfile
+        uses: ./.ci/actions/setup
 
       - name: Write the runtime env from Infisical
         shell: bash
         env:
+          INFISICAL_API_URL: ${{ secrets.INFISICAL_API_URL }}
           INFISICAL_CLIENT_ID: ${{ secrets.INFISICAL_CLIENT_ID }}
           INFISICAL_CLIENT_SECRET: ${{ secrets.INFISICAL_CLIENT_SECRET }}
         run: |
-          TOKEN=$(infisical login \
+          umask 077
+          trap 'rm -f "$DEPLOY_DIR/.env.new"' EXIT
+          rm -f "$DEPLOY_DIR/.env.new"
+          TOKEN=$(pnpm exec infisical login \
             --method=universal-auth \
             --client-id="$INFISICAL_CLIENT_ID" \
             --client-secret="$INFISICAL_CLIENT_SECRET" \
             --plain --silent)
           echo "::add-mask::$TOKEN"
-          INFISICAL_TOKEN="$TOKEN" infisical export \
+          INFISICAL_TOKEN="$TOKEN" pnpm exec infisical export \
             --projectId="$INFISICAL_PROJECT_ID" --env=prod --format=dotenv \
             > "$DEPLOY_DIR/.env.new"
           if ! grep -Eq "^CURSEFORGE_API_KEY=['\"]?[^'\"[:space:]]" "$DEPLOY_DIR/.env.new"; then
-            rm -f "$DEPLOY_DIR/.env.new"
             echo "::error::The export of the prod environment holds no CURSEFORGE_API_KEY; the gateway cannot start from it. Check the project id and the machine identity's access to prod"
             exit 1
           fi
@@ -97,6 +99,7 @@ jobs:
           chown --reference="$DEPLOY_DIR" "$DEPLOY_DIR/.env.new"
           if [ -f "$DEPLOY_DIR/.env" ]; then
             cp -p "$DEPLOY_DIR/.env" "$DEPLOY_DIR/.env.previous"
+            echo "ENV_ROTATED=true" >> "$GITHUB_ENV"
           fi
           mv "$DEPLOY_DIR/.env.new" "$DEPLOY_DIR/.env"
 
@@ -108,7 +111,7 @@ jobs:
           running=$(bash .gitea/scripts/healthz.sh "$DEPLOY_DIR" 2>/dev/null || true)
           if [ ! -f "$DEPLOY_DIR/content-gateway" ]; then
             echo "First deploy, there is no previous build to keep"
-          elif [ "${running#*\"commit\":\"$COMMIT\"}" = "$running" ]; then
+          elif [ "${running#*\"commit\":\""$COMMIT"\"}" = "$running" ]; then
             mv "$DEPLOY_DIR/content-gateway" "$DEPLOY_DIR/content-gateway.previous"
             echo "ROTATED=true" >> "$GITHUB_ENV"
           else
@@ -121,38 +124,56 @@ jobs:
       - name: Wait for the new build to answer
         shell: bash
         run: |
-          for attempt in $(seq 1 30); do
-            health=$(bash .gitea/scripts/healthz.sh "$DEPLOY_DIR" 2>/dev/null || true)
-            if [ "${health#*\"commit\":\"$COMMIT\"}" != "$health" ] && [ "${health#*\"builtAt\":\"$BUILT_AT\"}" != "$health" ]; then
+          errors=$(mktemp)
+          for _ in $(seq 1 30); do
+            health=$(bash .gitea/scripts/healthz.sh "$DEPLOY_DIR" 2>"$errors" || true)
+            if [ "${health#*\"commit\":\""$COMMIT"\"}" != "$health" ] && [ "${health#*\"builtAt\":\""$BUILT_AT"\"}" != "$health" ]; then
               echo "$health"
               exit 0
             fi
             sleep 2
           done
-          echo "::error::The gateway did not answer /v1/healthz with commit $COMMIT built at $BUILT_AT within 60 s. Last answer: ${health:-none}"
+          echo "::error::The gateway did not answer /v1/healthz with commit $COMMIT built at $BUILT_AT within $SECONDS s. Last answer: ${health:-none}"
+          if [ -s "$errors" ]; then
+            echo "The last probe reported:"
+            cat "$errors"
+          fi
           exit 1
 
-      - name: Put the previous build back when the new one did not answer
+      - name: Put back what this run replaced when the gateway did not answer
         if: failure()
         shell: bash
         run: |
-          if [ "${ROTATED:-}" != true ] || [ ! -f "$DEPLOY_DIR/content-gateway.previous" ]; then
-            echo "Nothing to roll back: the previous build was not replaced"
-            exit 0
+          restored=
+          kept=
+          if [ "${ROTATED:-}" = true ] && [ -f "$DEPLOY_DIR/content-gateway.previous" ]; then
+            mv "$DEPLOY_DIR/content-gateway" "$DEPLOY_DIR/content-gateway.failed"
+            mv "$DEPLOY_DIR/content-gateway.previous" "$DEPLOY_DIR/content-gateway"
+            restored="the previous build"
+            kept="content-gateway.failed"
           fi
-          mv "$DEPLOY_DIR/content-gateway" "$DEPLOY_DIR/content-gateway.failed"
-          mv "$DEPLOY_DIR/content-gateway.previous" "$DEPLOY_DIR/content-gateway"
-          if [ -f "$DEPLOY_DIR/.env.previous" ]; then
+          if [ "${ENV_ROTATED:-}" = true ] && [ -f "$DEPLOY_DIR/.env.previous" ]; then
             cp -p "$DEPLOY_DIR/.env" "$DEPLOY_DIR/.env.failed"
             mv "$DEPLOY_DIR/.env.previous" "$DEPLOY_DIR/.env"
+            restored="${restored:+$restored and }the previous .env"
+            kept="${kept:+$kept and }.env.failed"
+          fi
+          if [ -z "$restored" ]; then
+            echo "Nothing to roll back: this run replaced neither the build nor .env"
+            exit 0
           fi
           touch "$DEPLOY_DIR/.restart-trigger"
-          for attempt in $(seq 1 30); do
-            if health=$(bash .gitea/scripts/healthz.sh "$DEPLOY_DIR" 2>/dev/null); then
-              echo "::warning::Rolled back to the previous build, which answers: $health. The failed build is content-gateway.failed"
+          errors=$(mktemp)
+          for _ in $(seq 1 30); do
+            if health=$(bash .gitea/scripts/healthz.sh "$DEPLOY_DIR" 2>"$errors"); then
+              echo "::warning::Rolled back to $restored, which answers: $health. What failed is kept as $kept"
               exit 0
             fi
             sleep 2
           done
-          echo "::error::Rolled back to the previous build, but it does not answer /v1/healthz either. The failed build is content-gateway.failed"
+          echo "::error::Rolled back to $restored, but the gateway does not answer /v1/healthz either. What failed is kept as $kept"
+          if [ -s "$errors" ]; then
+            echo "The last probe reported:"
+            cat "$errors"
+          fi
           exit 1

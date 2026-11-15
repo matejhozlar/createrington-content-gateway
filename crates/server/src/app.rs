@@ -60,6 +60,7 @@ impl AppState {
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
         Ok(Self {
             budget: Budget::new(
+                Source::CurseForge,
                 config.budget_per_minute,
                 pools.iter().copied(),
                 clock.clone(),
@@ -67,34 +68,34 @@ impl AppState {
             )
             .keeping_days(config.budget_history_days),
             modrinth_budget: Budget::new(
+                Source::Modrinth,
                 config.modrinth_per_minute,
                 pools.iter().copied(),
                 clock.clone(),
                 redis.clone(),
             )
-            .keeping_days(config.budget_history_days)
-            .named("modrinth", "Modrinth"),
+            .keeping_days(config.budget_history_days),
             upstream: Upstream::new(
                 Source::CurseForge,
                 CURSEFORGE_API,
                 Some(config.curseforge_api_key.clone()),
-                curseforge::USER_AGENT,
+                &config.user_agent,
                 curseforge::TIMEOUT,
             )?,
             modrinth: Upstream::new(
                 Source::Modrinth,
                 MODRINTH_API,
                 None,
-                &config.modrinth_user_agent,
+                &config.user_agent,
                 modrinth::TIMEOUT,
             )?,
-            cdn: Cdn::new(CURSEFORGE_CDN, resolve::CDN_TIMEOUT)?,
+            cdn: Cdn::new(CURSEFORGE_CDN, &config.user_agent, resolve::CDN_TIMEOUT)?,
             meta: Meta::new(
                 MOJANG_META,
                 NEOFORGE_MAVEN,
                 FORGE_FILES,
                 FABRIC_META,
-                &config.modrinth_user_agent,
+                &config.user_agent,
                 versions::TIMEOUT,
             )?,
             cache: AnswerCache::new(redis),
@@ -150,13 +151,19 @@ pub(crate) fn test_state(consumers: Vec<Consumer>) -> Arc<AppState> {
         })
         .collect();
     Arc::new(AppState {
-        budget: Budget::new(300, pools.clone(), Arc::new(SystemClock), None),
-        modrinth_budget: Budget::new(300, pools, Arc::new(SystemClock), None),
+        budget: Budget::new(
+            Source::CurseForge,
+            300,
+            pools.clone(),
+            Arc::new(SystemClock),
+            None,
+        ),
+        modrinth_budget: Budget::new(Source::Modrinth, 300, pools, Arc::new(SystemClock), None),
         upstream: Upstream::new(
             Source::CurseForge,
             "http://127.0.0.1:9/v1",
             Some(crate::config::ApiKey::new("unused")),
-            curseforge::USER_AGENT,
+            crate::config::DEFAULT_USER_AGENT,
             curseforge::TIMEOUT,
         )
         .unwrap(),
@@ -164,17 +171,22 @@ pub(crate) fn test_state(consumers: Vec<Consumer>) -> Arc<AppState> {
             Source::Modrinth,
             "http://127.0.0.1:9/v2",
             None,
-            modrinth::DEFAULT_USER_AGENT,
+            crate::config::DEFAULT_USER_AGENT,
             modrinth::TIMEOUT,
         )
         .unwrap(),
-        cdn: Cdn::new("http://127.0.0.1:9", resolve::CDN_TIMEOUT).unwrap(),
+        cdn: Cdn::new(
+            "http://127.0.0.1:9",
+            crate::config::DEFAULT_USER_AGENT,
+            resolve::CDN_TIMEOUT,
+        )
+        .unwrap(),
         meta: Meta::new(
             "http://127.0.0.1:9",
             "http://127.0.0.1:9",
             "http://127.0.0.1:9",
             "http://127.0.0.1:9",
-            modrinth::DEFAULT_USER_AGENT,
+            crate::config::DEFAULT_USER_AGENT,
             versions::TIMEOUT,
         )
         .unwrap(),

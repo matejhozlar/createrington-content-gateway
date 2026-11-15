@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+image=curlimages/curl:8.16.0
+
+if [ "$1" = --pull ]; then
+  docker pull --quiet "$image"
+  exit
+fi
+
 dir=$1
 
 value() {
@@ -16,5 +23,5 @@ case "$host" in
   *:*) host="[$host]" ;;
 esac
 
-docker run --rm --network host curlimages/curl:8.16.0 \
+docker run --rm --pull never --network host "$image" \
   -fsS --max-time 5 "http://${host}:${port:-5005}/v1/healthz"

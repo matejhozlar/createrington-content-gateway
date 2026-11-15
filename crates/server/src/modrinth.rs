@@ -26,8 +26,6 @@ use crate::{
 
 pub const MODRINTH_API: &str = "https://api.modrinth.com/v2";
 pub const TIMEOUT: Duration = Duration::from_secs(10);
-/// Modrinth asks every client to say who it is; this is what the gateway says unless `MODRINTH_USER_AGENT` is set.
-pub const DEFAULT_USER_AGENT: &str = concat!("content-gateway/", env!("CARGO_PKG_VERSION"));
 /// How many hashes one `POST /v1/modrinth/version_files` may ask for.
 pub const MOST_HASHES: usize = 1000;
 const HASHES_PER_CALL: usize = 100;
@@ -82,7 +80,7 @@ pub struct VersionFilesRequest {
     /// SHA-1 hashes of the wanted files, 40 hex digits each, up to 1000.
     #[schema(example = json!(["3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e"]))]
     pub hashes: Vec<String>,
-    /// Only `sha1` is supported.
+    /// `sha1`, kept per hash. Any other algorithm sends the body to Modrinth as it came, uncached.
     #[serde(default = "sha1")]
     #[schema(example = "sha1")]
     pub algorithm: String,
@@ -357,7 +355,7 @@ fn json() -> HeaderValue {
     tag = "modrinth",
     security(("bearer" = [])),
     params(
-        ("path" = String, Path, description = "The path under `api.modrinth.com/v2/`, such as `search`, `project/sodium` or `version_file/{sha1}`: segments of letters, digits, `-` and `_`", example = "search"),
+        ("path" = String, Path, description = "The path under `api.modrinth.com/v2/`, such as `search`, `project/sodium` or `version_file/{sha1}`: segments of letters, digits, `-`, `_` and any of `.+!()~',@$`", example = "search"),
         ("X-Budget-Pool" = Option<String>, Header, description = "The pool the call draws from. Required when the token has more than one pool"),
         ("Cache-Control" = Option<String>, Header, description = "`no-cache` asks Modrinth again instead of answering from the cache"),
     ),
@@ -405,14 +403,14 @@ pub async fn passthrough_get(
     tag = "modrinth",
     security(("bearer" = [])),
     params(
-        ("path" = String, Path, description = "The path under `api.modrinth.com/v2/`, such as `version_files` or `version_files/update`: segments of letters, digits, `-` and `_`", example = "version_files"),
+        ("path" = String, Path, description = "The path under `api.modrinth.com/v2/`, such as `version_files` or `version_files/update`: segments of letters, digits, `-`, `_` and any of `.+!()~',@$`", example = "version_files"),
         ("X-Budget-Pool" = Option<String>, Header, description = "The pool the call draws from. Required when the token has more than one pool"),
         ("Cache-Control" = Option<String>, Header, description = "`no-cache` asks Modrinth again instead of answering from the cache"),
     ),
     request_body(content = VersionFilesRequest, description = "The JSON body Modrinth expects at this path; this shape for `version_files`", content_type = "application/json"),
     responses(
         (status = 200, description = "Modrinth's answer, as it came, or the versions found keyed by hash for `version_files`", body = Value, headers(("X-Cache" = String, description = "`hit` when every hash was kept, `miss` when Modrinth was asked, `stale` an old answer given because Modrinth could not be asked"))),
-        (status = 400, description = "`INVALID_PATH`, `INVALID_BODY` (no hashes, more than 1000, or another algorithm), `INVALID_HASH`, `POOL_REQUIRED` or `UNKNOWN_POOL`", body = ApiError),
+        (status = 400, description = "`INVALID_PATH`, `INVALID_BODY` (no hashes or more than 1000), `INVALID_HASH`, `POOL_REQUIRED` or `UNKNOWN_POOL`", body = ApiError),
         (status = 401, description = "No valid consumer token", body = ApiError),
         (status = 413, description = "The hashes need more calls than a whole minute allows, `REQUEST_TOO_LARGE`; split them", body = ApiError),
         (status = 502, description = "Modrinth could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`", body = ApiError),
@@ -489,9 +487,6 @@ pub async fn version_files(
         return ApiError::invalid_body("a JSON object with `hashes`, a list of SHA-1 hashes")
             .into_response();
     };
-    if !request.algorithm.eq_ignore_ascii_case("sha1") {
-        return ApiError::invalid_body("only the `sha1` algorithm is supported").into_response();
-    }
     if request.hashes.is_empty() {
         return ApiError::invalid_body("`hashes` must list at least one SHA-1").into_response();
     }
@@ -671,7 +666,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refuses_a_bad_hash_body_or_algorithm() {
+    async fn refuses_a_bad_hash_or_body() {
         let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "{}")).await;
         let gateway = gateway(&mock, 300, TIMEOUT);
 
@@ -790,6 +785,10 @@ mod tests {
         let got = get(&gateway.router, "/v1/modrinth/project/sodium").await;
         assert_eq!(got.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(got.json()["code"], "UPSTREAM_HOLD");
+        assert_eq!(
+            got.json()["message"],
+            "Modrinth answered 429, every call waits until the hold ends"
+        );
         assert_eq!(got.json()["retryAfterMs"], 7_000);
 
         let held = get(&gateway.router, "/v1/modrinth/search?query=x").await;
@@ -860,6 +859,15 @@ mod tests {
             let got = get(&gateway.router, uri).await;
             assert_eq!(got.status, StatusCode::BAD_REQUEST, "{uri}");
             assert_eq!(got.json()["code"], "INVALID_PATH", "{uri}");
+            let named = if uri.starts_with("/v1/modrinth/") {
+                "a Modrinth path"
+            } else {
+                "a CurseForge path"
+            };
+            assert!(
+                got.json()["message"].as_str().unwrap().starts_with(named),
+                "{uri}"
+            );
         }
         assert_eq!(mock.calls(), 1);
     }
