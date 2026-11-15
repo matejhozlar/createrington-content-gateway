@@ -25,8 +25,6 @@ pub const MINUTE_MS: u64 = 60_000;
 pub const HOUR_MS: u64 = 60 * MINUTE_MS;
 pub const DAY_MS: u64 = 24 * HOUR_MS;
 const X_CACHE: HeaderName = HeaderName::from_static("x-cache");
-/// The slug characters a Modrinth path segment may hold besides letters, digits, `-` and `_`.
-pub const MODRINTH_SLUG_CHARACTERS: &str = ".+!()~',@$";
 
 /// How long an answer of a route stays fresh, found and (when a 404 is kept) not found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,11 +40,9 @@ pub const fn fresh(found_ms: u64, not_found_ms: Option<u64>) -> Option<Freshness
     })
 }
 
-/// Whether `segment` may be sent to `source`: letters, digits, `-`, `_` and for Modrinth its slug characters.
+/// Whether `segment` may be sent to `source`: letters, digits, `-`, `_` and the source's slug characters.
 pub fn valid_segment(source: Source, segment: &str) -> bool {
-    let slug_byte = |byte: u8| {
-        source == Source::Modrinth && MODRINTH_SLUG_CHARACTERS.as_bytes().contains(&byte)
-    };
+    let slug_byte = |byte: u8| source.slug_characters().as_bytes().contains(&byte);
     !segment.is_empty()
         && segment != "."
         && segment != ".."

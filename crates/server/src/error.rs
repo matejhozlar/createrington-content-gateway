@@ -8,7 +8,6 @@ use utoipa::ToSchema;
 
 use crate::{
     budget::Refusal,
-    passthrough::MODRINTH_SLUG_CHARACTERS,
     upstream::{Source, UpstreamFailure},
 };
 
@@ -88,15 +87,15 @@ impl ApiError {
     }
 
     pub fn invalid_path(source: Source) -> Self {
-        let extra = match source {
-            Source::CurseForge => String::new(),
-            Source::Modrinth => format!(" and any of {MODRINTH_SLUG_CHARACTERS}"),
+        let characters = match source.slug_characters() {
+            "" => "- and _".to_owned(),
+            slug => format!("-, _ and any of {slug}"),
         };
         Self::new(
             StatusCode::BAD_REQUEST,
             ErrorCode::InvalidPath,
             format!(
-                "a {} path is segments of letters, digits, - and _{extra}, separated by single slashes",
+                "a {} path is segments of letters, digits, {characters}, separated by single slashes",
                 source.name()
             ),
         )

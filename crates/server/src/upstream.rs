@@ -29,6 +29,14 @@ impl Source {
         }
     }
 
+    /// The characters a path segment of this source may hold besides letters, digits, `-` and `_`.
+    pub fn slug_characters(self) -> &'static str {
+        match self {
+            Self::CurseForge => "",
+            Self::Modrinth => ".+!()~',@$",
+        }
+    }
+
     /// What this source's cache and budget keys start with. CurseForge's have none, as the first release stored them.
     pub fn namespace(self) -> &'static str {
         match self {
