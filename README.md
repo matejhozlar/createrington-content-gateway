@@ -209,7 +209,7 @@ pnpm format:check
 pnpm audit --audit-level=high
 ```
 
-`cargo test` skips the tests that need Redis and lists them as ignored. To run them as well, point `CONTENT_GATEWAY_TEST_REDIS_URL` at a Redis (each test keeps its keys under a prefix of its own and deletes them) and run `cargo test --workspace --locked -- --include-ignored`, as CI does.
+`cargo test` skips the tests that need Redis and lists them as ignored. To run them as well, point `CONTENT_GATEWAY_TEST_REDIS_URL` at a Redis (each test keeps its keys under a prefix of its own and deletes them when it passes, so use a Redis you can empty) and run `cargo test --workspace --locked -- --include-ignored`, as CI does.
 
 The Python client's checks (ruff, mypy, pytest and its generate check) run with uv in `packages/python-client`, see [its README](packages/python-client/README.md).
 
