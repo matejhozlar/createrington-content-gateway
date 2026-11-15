@@ -44,11 +44,15 @@ pub struct Cdn {
 }
 
 impl Cdn {
-    pub fn new(base: impl Into<String>, timeout: Duration) -> reqwest::Result<Self> {
+    pub fn new(
+        base: impl Into<String>,
+        user_agent: &str,
+        timeout: Duration,
+    ) -> reqwest::Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(timeout)
-                .user_agent(modrinth::DEFAULT_USER_AGENT)
+                .user_agent(user_agent)
                 .build()?,
             base: base.into(),
         })
@@ -514,7 +518,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::{curseforge::TIMEOUT, test_support::*};
+    use crate::{config::DEFAULT_USER_AGENT, curseforge::TIMEOUT, test_support::*};
 
     const JEI_SHA1: &str = "3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e";
     const SODIUM_SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -639,6 +643,11 @@ mod tests {
         );
         let heads: Vec<&Seen> = seen.iter().filter(|seen| seen.method == "HEAD").collect();
         assert_eq!(heads.len(), 2);
+        assert!(
+            heads
+                .iter()
+                .all(|head| head.user_agent.as_deref() == Some(USER_AGENT))
+        );
         assert_eq!(gateway.state.budget.snapshot().await.used, 1);
 
         let again = resolve(&gateway, r#"{"fileIds":[1003,1004]}"#).await;
@@ -773,7 +782,7 @@ mod tests {
 
     #[test]
     fn builds_the_cdn_address_like_curseforge_does() {
-        let cdn = Cdn::new(CURSEFORGE_CDN, CDN_TIMEOUT).unwrap();
+        let cdn = Cdn::new(CURSEFORGE_CDN, DEFAULT_USER_AGENT, CDN_TIMEOUT).unwrap();
         assert_eq!(
             cdn.url(4567890, "Create-1.20.1 (v0.5.1f)!'*.jar"),
             "https://mediafilez.forgecdn.net/files/4567/890/Create-1.20.1%20%28v0.5.1f%29%21%27%2A.jar"

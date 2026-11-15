@@ -26,8 +26,6 @@ use crate::{
 
 pub const MODRINTH_API: &str = "https://api.modrinth.com/v2";
 pub const TIMEOUT: Duration = Duration::from_secs(10);
-/// Modrinth asks every client to say who it is; this is what the gateway says unless `MODRINTH_USER_AGENT` is set.
-pub const DEFAULT_USER_AGENT: &str = concat!("content-gateway/", env!("CARGO_PKG_VERSION"));
 /// How many hashes one `POST /v1/modrinth/version_files` may ask for.
 pub const MOST_HASHES: usize = 1000;
 const HASHES_PER_CALL: usize = 100;

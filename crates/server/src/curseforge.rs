@@ -18,8 +18,6 @@ use crate::{
 
 pub const CURSEFORGE_API: &str = "https://api.curseforge.com/v1";
 pub const TIMEOUT: Duration = Duration::from_secs(10);
-/// What CurseForge sees as the caller.
-pub const USER_AGENT: &str = concat!("content-gateway/", env!("CARGO_PKG_VERSION"));
 
 /// The cache table of the CurseForge routes.
 pub fn freshness(segments: &[&str]) -> Option<Freshness> {
@@ -212,6 +210,7 @@ mod tests {
             "/v1/mods/search?gameId=432&searchFilter=jei%20mod"
         );
         assert_eq!(seen[0].key.as_deref(), Some(KEY));
+        assert_eq!(seen[0].user_agent.as_deref(), Some(USER_AGENT));
     }
 
     #[tokio::test]
