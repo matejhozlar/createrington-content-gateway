@@ -1,3 +1,8 @@
+#[cfg(test)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MINUTE_MS: u64 = 60_000;
@@ -22,22 +27,22 @@ impl Clock for SystemClock {
 }
 
 #[cfg(test)]
-pub(crate) struct TestClock(std::sync::atomic::AtomicU64);
+pub(crate) struct TestClock(AtomicU64);
 
 #[cfg(test)]
 impl TestClock {
-    pub(crate) fn at(ms: u64) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self(std::sync::atomic::AtomicU64::new(ms)))
+    pub(crate) fn at(ms: u64) -> Arc<Self> {
+        Arc::new(Self(AtomicU64::new(ms)))
     }
 
     pub(crate) fn advance(&self, ms: u64) {
-        self.0.fetch_add(ms, std::sync::atomic::Ordering::SeqCst);
+        self.0.fetch_add(ms, Ordering::SeqCst);
     }
 }
 
 #[cfg(test)]
 impl Clock for TestClock {
     fn now_ms(&self) -> u64 {
-        self.0.load(std::sync::atomic::Ordering::SeqCst)
+        self.0.load(Ordering::SeqCst)
     }
 }
