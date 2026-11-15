@@ -1351,6 +1351,13 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description Any other status CurseForge answered the file lookup with, with its body as it came, marked `X-Cache`. Only the gateway's own answers lack `X-Cache` */
+      default: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
     };
   };
 }

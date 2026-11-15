@@ -88,6 +88,44 @@ describe("the gateway's own routes", () => {
     expect(thrown.message).toContain("Bearer");
     expect(thrown.retryAfterMs).toBeNull();
   });
+
+  it("throws on a success that is not the gateway's JSON", async () => {
+    gateway.reply(
+      {
+        status: 200,
+        headers: { "content-type": "text/html" },
+        body: "<html>another service</html>",
+      },
+      { status: 200, body: "" },
+      json(200, [1, 2]),
+    );
+    for (const call of [
+      () => client().health(),
+      () => client().budget(),
+      () => client().minecraftVersions(),
+    ]) {
+      const error = (await call().catch(
+        (error: unknown) => error,
+      )) as ContentGatewayError;
+      expect(error).toBeInstanceOf(ContentGatewayError);
+      expect(error.status).toBe(200);
+      expect(error.code).toBeNull();
+      expect(error.message).toContain("is not the gateway's JSON");
+    }
+  });
+
+  it("throws CurseForge's failure that resolve passes on", async () => {
+    gateway.reply(json(500, { error: "boom" }, "miss"));
+    const error = (await client()
+      .resolve([1])
+      .catch((error: unknown) => error)) as ContentGatewayError;
+    expect(error).toBeInstanceOf(ContentGatewayError);
+    expect(error.status).toBe(500);
+    expect(error.code).toBeNull();
+    expect(error.message).toBe(
+      "the 500 answer to POST /v1/resolve is an upstream's, passed on by the gateway (X-Cache: miss)",
+    );
+  });
 });
 
 describe("the CurseForge passthrough", () => {
@@ -426,6 +464,15 @@ describe("the CurseForge passthrough", () => {
     expect(gateway.seen).toHaveLength(2);
   });
 
+  it("tells when to come back from Retry-After when the body says nothing", async () => {
+    gateway.reply({ status: 503, headers: { "retry-after": "7" }, body: "" });
+    const error = (await client()
+      .curseforge("mods/1")
+      .catch((error: unknown) => error)) as ContentGatewayError;
+    expect(error.code).toBeNull();
+    expect(error.retryAfterMs).toBe(7_000);
+  });
+
   it("gives up on an answer that takes longer than the timeout", async () => {
     gateway.reply({ ...json(200, {}, "miss"), delayMs: 300 });
     const error = (await client({ timeoutMs: 50 })
@@ -467,6 +514,17 @@ describe("the CurseForge passthrough", () => {
       .catch((error: unknown) => error)) as ContentGatewayError;
     expect(error).toBeInstanceOf(ContentGatewayError);
     expect(error.code).toBeNull();
-    expect(error.message).toContain("X-Cache");
+    expect(error.message).toContain("no X-Cache header");
+  });
+
+  it("names an X-Cache value the gateway does not send", async () => {
+    gateway.reply(json(200, { data: [] }, "warm"));
+    const error = (await client()
+      .curseforge("mods/1")
+      .catch((error: unknown) => error)) as ContentGatewayError;
+    expect(error).toBeInstanceOf(ContentGatewayError);
+    expect(error.message).toContain(
+      'X-Cache "warm" is not one the gateway sends',
+    );
   });
 });

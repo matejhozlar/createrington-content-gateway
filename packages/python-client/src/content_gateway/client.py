@@ -61,7 +61,7 @@ class PassthroughAnswer:
 
 
 class ContentGatewayError(Exception):
-    """An answer the gateway gave itself instead of passing one on; `code` is `None` when it was not the gateway's JSON error."""
+    """An answer that is not the one asked for: the gateway's own error, or, from the gateway's own routes, anything but its JSON (an upstream's failure passed on by `resolve()`, a page from something else at the base URL); `code` is `None` unless it was the gateway's JSON error, and `retry_after_ms` is the body's `retryAfterMs`, else `Retry-After`."""
 
     status: int
     code: ErrorCode | None
@@ -69,13 +69,20 @@ class ContentGatewayError(Exception):
     retry_after_ms: int | None
     message: str
 
-    def __init__(self, status: int, error: ApiError | None, fallback: str) -> None:
-        super().__init__(status, error, fallback)
+    def __init__(
+        self,
+        status: int,
+        error: ApiError | None,
+        fallback: str,
+        retry_after_ms: int | None = None,
+    ) -> None:
+        super().__init__(status, error, fallback, retry_after_ms)
         self.message = error["message"] if error is not None else fallback
         self.status = status
         self.code = error["code"] if error is not None else None
         self.pool = error.get("pool") if error is not None else None
-        self.retry_after_ms = error.get("retryAfterMs") if error is not None else None
+        from_body = error.get("retryAfterMs") if error is not None else None
+        self.retry_after_ms = from_body if from_body is not None else retry_after_ms
 
     def __str__(self) -> str:
         return self.message
@@ -131,7 +138,23 @@ class _Gateway:
         fallback = f"the gateway answered {response.status_code} to {request.method} {request.path}"
         if isinstance(body, str) and body != "":
             fallback += f": {body}"
-        raise ContentGatewayError(response.status_code, error, fallback)
+        raise ContentGatewayError(
+            response.status_code, error, fallback, None if wait is None else round(wait * 1000)
+        )
+
+    @staticmethod
+    def _own_answer(request: _Request, response: httpx.Response, body: Any) -> Any:
+        cache = response.headers.get(_CACHE_HEADER)
+        if response.is_success and cache is None and isinstance(body, dict):
+            return body
+        answered = f"{response.status_code} answer to {request.method} {request.path}"
+        raise ContentGatewayError(
+            response.status_code,
+            _as_api_error(body),
+            f"the {answered} is not the gateway's JSON"
+            if cache is None
+            else f"the {answered} is an upstream's, passed on by the gateway (X-Cache: {cache})",
+        )
 
     @staticmethod
     def _passthrough_answer(
@@ -143,7 +166,11 @@ class _Gateway:
                 response.status_code,
                 None,
                 f"the answer to {request.method} {request.path} did not come through the gateway: "
-                "no X-Cache header",
+                + (
+                    "no X-Cache header"
+                    if cache is None
+                    else f"X-Cache {json.dumps(cache)} is not one the gateway sends"
+                ),
             )
         return PassthroughAnswer(
             status=response.status_code,
@@ -261,11 +288,11 @@ class ContentGateway(_Gateway):
 
     def health(self) -> Health:
         """`GET /v1/healthz`, which needs no token."""
-        return cast(Health, self._send(_Request("GET", "/v1/healthz", authenticated=False))[1])
+        return cast(Health, self._own(_Request("GET", "/v1/healthz", authenticated=False)))
 
     def budget(self, *, days: int | None = None) -> BudgetSnapshot:
         """`GET /v1/budget`: this minute's calls, the 429 hold and the daily counts of the last `days` UTC days."""
-        return cast(BudgetSnapshot, self._send(self._budget_request(days))[1])
+        return cast(BudgetSnapshot, self._own(self._budget_request(days)))
 
     def curseforge(
         self,
@@ -357,34 +384,36 @@ class ContentGateway(_Gateway):
         wait_up_to: float | None = None,
         timeout: float = RESOLVE_TIMEOUT,
     ) -> Resolved:
-        """`POST /v1/resolve`: a download address per CurseForge file id."""
+        """`POST /v1/resolve`: a download address per CurseForge file id; CurseForge's own failure, which the gateway passes on, raises `ContentGatewayError` with its status."""
         request = self._resolve_request(
             file_ids, cdn=cdn, pool=pool, fresh=fresh, wait_up_to=wait_up_to, timeout=timeout
         )
-        return cast(Resolved, self._send(request)[1])
+        return cast(Resolved, self._own(request))
 
     def minecraft_versions(
         self, *, type: VersionFilter | None = None, loader: Loader | None = None
     ) -> MinecraftVersions:
         """`GET /v1/minecraft/versions`: the Minecraft versions Mojang lists, newest first."""
-        return cast(
-            MinecraftVersions, self._send(self._minecraft_versions_request(type, loader))[1]
-        )
+        return cast(MinecraftVersions, self._own(self._minecraft_versions_request(type, loader)))
 
     def minecraft_version(self, id: str) -> MinecraftVersionDetails:
         """`GET /v1/minecraft/versions/<id>`: one version with the Java major it needs; `UNKNOWN_VERSION` raises."""
-        return cast(MinecraftVersionDetails, self._send(self._minecraft_version_request(id))[1])
+        return cast(MinecraftVersionDetails, self._own(self._minecraft_version_request(id)))
 
     def loader_versions(self, loader: Loader, *, minecraft: str | None = None) -> LoaderVersions:
         """`GET /v1/minecraft/loaders/<loader>/versions`: a loader's builds, newest first."""
-        return cast(LoaderVersions, self._send(self._loader_versions_request(loader, minecraft))[1])
+        return cast(LoaderVersions, self._own(self._loader_versions_request(loader, minecraft)))
 
     def java_runtime(
         self, platform: str, *, major: int | None = None, component: str | None = None
     ) -> JavaRuntime:
         """`GET /v1/minecraft/java`: a Java runtime Mojang ships for `platform`, by `major` or by `component`; `UNKNOWN_RUNTIME` raises."""
         request = self._java_runtime_request(platform, major, component)
-        return cast(JavaRuntime, self._send(request)[1])
+        return cast(JavaRuntime, self._own(request))
+
+    def _own(self, request: _Request) -> Any:
+        response, body = self._send(request)
+        return self._own_answer(request, response, body)
 
     def _passthrough(self, request: _Request) -> PassthroughAnswer:
         response, body = self._send(request)
@@ -433,13 +462,11 @@ class AsyncContentGateway(_Gateway):
 
     async def health(self) -> Health:
         """`GET /v1/healthz`, which needs no token."""
-        sent = await self._send(_Request("GET", "/v1/healthz", authenticated=False))
-        return cast(Health, sent[1])
+        return cast(Health, await self._own(_Request("GET", "/v1/healthz", authenticated=False)))
 
     async def budget(self, *, days: int | None = None) -> BudgetSnapshot:
         """`GET /v1/budget`: this minute's calls, the 429 hold and the daily counts of the last `days` UTC days."""
-        sent = await self._send(self._budget_request(days))
-        return cast(BudgetSnapshot, sent[1])
+        return cast(BudgetSnapshot, await self._own(self._budget_request(days)))
 
     async def curseforge(
         self,
@@ -531,38 +558,41 @@ class AsyncContentGateway(_Gateway):
         wait_up_to: float | None = None,
         timeout: float = RESOLVE_TIMEOUT,
     ) -> Resolved:
-        """`POST /v1/resolve`: a download address per CurseForge file id."""
+        """`POST /v1/resolve`: a download address per CurseForge file id; CurseForge's own failure, which the gateway passes on, raises `ContentGatewayError` with its status."""
         request = self._resolve_request(
             file_ids, cdn=cdn, pool=pool, fresh=fresh, wait_up_to=wait_up_to, timeout=timeout
         )
-        sent = await self._send(request)
-        return cast(Resolved, sent[1])
+        return cast(Resolved, await self._own(request))
 
     async def minecraft_versions(
         self, *, type: VersionFilter | None = None, loader: Loader | None = None
     ) -> MinecraftVersions:
         """`GET /v1/minecraft/versions`: the Minecraft versions Mojang lists, newest first."""
-        sent = await self._send(self._minecraft_versions_request(type, loader))
-        return cast(MinecraftVersions, sent[1])
+        request = self._minecraft_versions_request(type, loader)
+        return cast(MinecraftVersions, await self._own(request))
 
     async def minecraft_version(self, id: str) -> MinecraftVersionDetails:
         """`GET /v1/minecraft/versions/<id>`: one version with the Java major it needs; `UNKNOWN_VERSION` raises."""
-        sent = await self._send(self._minecraft_version_request(id))
-        return cast(MinecraftVersionDetails, sent[1])
+        request = self._minecraft_version_request(id)
+        return cast(MinecraftVersionDetails, await self._own(request))
 
     async def loader_versions(
         self, loader: Loader, *, minecraft: str | None = None
     ) -> LoaderVersions:
         """`GET /v1/minecraft/loaders/<loader>/versions`: a loader's builds, newest first."""
-        sent = await self._send(self._loader_versions_request(loader, minecraft))
-        return cast(LoaderVersions, sent[1])
+        request = self._loader_versions_request(loader, minecraft)
+        return cast(LoaderVersions, await self._own(request))
 
     async def java_runtime(
         self, platform: str, *, major: int | None = None, component: str | None = None
     ) -> JavaRuntime:
         """`GET /v1/minecraft/java`: a Java runtime Mojang ships for `platform`, by `major` or by `component`; `UNKNOWN_RUNTIME` raises."""
-        sent = await self._send(self._java_runtime_request(platform, major, component))
-        return cast(JavaRuntime, sent[1])
+        request = self._java_runtime_request(platform, major, component)
+        return cast(JavaRuntime, await self._own(request))
+
+    async def _own(self, request: _Request) -> Any:
+        response, body = await self._send(request)
+        return self._own_answer(request, response, body)
 
     async def _passthrough(self, request: _Request) -> PassthroughAnswer:
         response, body = await self._send(request)

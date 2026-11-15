@@ -217,6 +217,7 @@ struct Candidate {
         (status = 502, description = "CurseForge could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`", body = ApiError),
         (status = 503, description = "The CurseForge call was refused: `BUDGET_SPENT` this minute or `UPSTREAM_HOLD` after a 429", body = ApiError, headers(("Retry-After" = u64, description = "Seconds until the next call can go out"))),
         (status = 504, description = "CurseForge did not answer in time, `UPSTREAM_TIMEOUT`", body = ApiError),
+        (status = "default", description = "Any other status CurseForge answered the file lookup with, with its body as it came, marked `X-Cache`. Only the gateway's own answers lack `X-Cache`"),
     )
 )]
 pub async fn resolve(

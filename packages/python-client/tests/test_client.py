@@ -201,6 +201,54 @@ def test_an_answer_that_did_not_come_through_the_gateway_raises(
     assert "no X-Cache header" in str(raised.value)
 
 
+def test_an_unknown_cache_status_is_named(fake: FakeGateway, gateway: ContentGateway) -> None:
+    fake.reply(200, {"data": []}, headers={"x-cache": "warm"})
+    with pytest.raises(ContentGatewayError, match='X-Cache "warm" is not one the gateway sends'):
+        gateway.curseforge("mods/1")
+
+
+def test_an_own_route_raises_on_a_success_that_is_not_its_json(
+    fake: FakeGateway, gateway: ContentGateway
+) -> None:
+    fake.reply(200, text="<html>another service</html>", headers={"content-type": "text/html"})
+    fake.reply(200)
+    fake.reply(200, [1, 2])
+    calls: list[Callable[[], object]] = [
+        gateway.health,
+        gateway.budget,
+        gateway.minecraft_versions,
+    ]
+    for call in calls:
+        with pytest.raises(ContentGatewayError) as raised:
+            call()
+        assert raised.value.status == 200
+        assert raised.value.code is None
+        assert "is not the gateway's JSON" in str(raised.value)
+
+
+def test_resolve_raises_the_curseforge_failure_it_passes_on(
+    fake: FakeGateway, gateway: ContentGateway
+) -> None:
+    fake.reply(500, {"error": "boom"}, headers={"x-cache": "miss"})
+    with pytest.raises(ContentGatewayError) as raised:
+        gateway.resolve([1])
+    assert raised.value.status == 500
+    assert raised.value.code is None
+    assert str(raised.value) == (
+        "the 500 answer to POST /v1/resolve is an upstream's, passed on by the gateway (X-Cache: miss)"
+    )
+
+
+def test_retry_after_fills_the_error_when_the_body_says_nothing(
+    fake: FakeGateway, gateway: ContentGateway
+) -> None:
+    fake.reply(503, headers={"retry-after": "7"})
+    with pytest.raises(ContentGatewayError) as raised:
+        gateway.curseforge("mods/1")
+    assert raised.value.code is None
+    assert raised.value.retry_after_ms == 7000
+
+
 def test_a_bad_gateway_page_raises_with_its_text(
     fake: FakeGateway, gateway: ContentGateway
 ) -> None:
@@ -366,9 +414,15 @@ def test_async_client_sends_the_same_requests(fake: FakeGateway) -> None:
             await gateway.budget()
             fake.reply(200, {}, headers={"x-cache": "miss"})
             await gateway.modrinth_version_files(["a"])
+            fake.reply(502, {"error": "boom"}, headers={"x-cache": "miss"})
+            with pytest.raises(ContentGatewayError, match="passed on by the gateway"):
+                await gateway.resolve([1])
+            fake.reply(200, text="", headers={"content-type": "text/plain"})
+            with pytest.raises(ContentGatewayError, match="is not the gateway's JSON"):
+                await gateway.health()
 
     run(scenario)
-    assert len(fake.requests) == 9
+    assert len(fake.requests) == 11
 
 
 def test_async_wait_up_to_sleeps_out_a_refusal(
