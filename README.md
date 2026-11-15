@@ -106,7 +106,7 @@ RestartSec=5
 User=content-gateway
 ```
 
-`.gitea/workflows/deploy.yml` is an example of that deploy as a Gitea Actions workflow: it builds the binary when a release merges into `main`, writes `.env` from [Infisical](https://infisical.com/), keeps the previous binary and `.env` as `content-gateway.previous` and `.env.previous`, touches `.restart-trigger` for a systemd path unit that restarts the service, and waits until `/v1/healthz` reports the deployed commit and build time; when it does not, the previous build is put back and restarted. The directory and the Infisical project come from the `DEPLOY_DIR` and `INFISICAL_PROJECT_ID` repository variables, the Infisical credentials from secrets.
+`.gitea/workflows/deploy.yml` is an example of that deploy as a Gitea Actions workflow: it builds the binary when a release merges into `main`, writes `.env` from [Infisical](https://infisical.com/), keeps the previous binary and `.env` as `content-gateway.previous` and `.env.previous`, touches `.restart-trigger` for a systemd path unit that restarts the service, and waits until `/v1/healthz` reports the deployed commit and build time; when it does not, whatever the run replaced (the binary, `.env` or both, so also a bad value on a redeploy of the same commit) is put back and restarted. The Infisical CLI is the one `pnpm-lock.yaml` pins. The directory and the Infisical project come from the `DEPLOY_DIR` and `INFISICAL_PROJECT_ID` repository variables, the Infisical credentials from secrets.
 
 ## Endpoints
 
