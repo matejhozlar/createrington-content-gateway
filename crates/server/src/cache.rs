@@ -13,7 +13,7 @@ use tokio::sync::watch;
 
 use crate::redis_store::RedisStore;
 
-pub const STALE_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+const STALE_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
 const FORMAT: u8 = 1;
 
@@ -66,8 +66,7 @@ pub struct AnswerCache {
     redis: Option<Arc<RedisStore>>,
 }
 
-/// What a load ended with, handed to every request that waited on it.
-pub type Loaded = Result<Arc<Entry>, LoadFailure>;
+type Loaded = Result<Arc<Entry>, LoadFailure>;
 
 /// A load's outcome, and whether it called the upstream or found the answer kept meanwhile.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +122,7 @@ impl Expiry<String, Kept> for KeepUntilStale {
     }
 }
 
+#[cfg(test)]
 impl Default for AnswerCache {
     fn default() -> Self {
         Self::new(None)

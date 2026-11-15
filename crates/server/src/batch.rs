@@ -21,7 +21,7 @@ use crate::{
 
 use crate::passthrough::{HOUR_MS, MINUTE_MS};
 
-pub const IDS_PER_CALL: usize = 100;
+const IDS_PER_CALL: usize = 100;
 
 /// A CurseForge batch route answered per id: `POST /mods`, `POST /mods/files` and `POST /fingerprints`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

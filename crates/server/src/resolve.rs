@@ -28,8 +28,6 @@ use crate::{
 pub const CURSEFORGE_CDN: &str = "https://mediafilez.forgecdn.net";
 pub const CDN_TIMEOUT: Duration = Duration::from_secs(10);
 const CDN_WAIT: Duration = Duration::from_secs(20);
-/// The longest a `POST /v1/resolve` can take: CurseForge's timeout, then Modrinth's, then the CDN wait.
-pub const LONGEST: Duration = Duration::from_secs(40);
 const CDN_AT_ONCE: usize = 8;
 const CDN_FOUND_MS: u64 = HOUR_MS;
 const CDN_NOT_FOUND_MS: u64 = 10 * MINUTE_MS;
@@ -58,8 +56,7 @@ impl Cdn {
         })
     }
 
-    /// The address of a file on the CDN, built from its id and name the way CurseForge's own links are.
-    pub fn url(&self, file_id: u64, file_name: &str) -> String {
+    fn url(&self, file_id: u64, file_name: &str) -> String {
         format!(
             "{}/files/{}/{}/{}",
             self.base,
@@ -748,7 +745,10 @@ mod tests {
 
     #[test]
     fn the_longest_call_is_the_three_sources_in_a_row() {
-        assert_eq!(TIMEOUT + modrinth::TIMEOUT + CDN_WAIT, LONGEST);
+        assert_eq!(
+            TIMEOUT + modrinth::TIMEOUT + CDN_WAIT,
+            Duration::from_secs(40)
+        );
     }
 
     #[tokio::test]

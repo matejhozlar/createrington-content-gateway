@@ -221,14 +221,6 @@ impl ApiError {
         }
     }
 
-    pub fn status(&self) -> StatusCode {
-        self.status
-    }
-
-    pub fn code(&self) -> ErrorCode {
-        self.code
-    }
-
     fn new(status: StatusCode, code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             status,

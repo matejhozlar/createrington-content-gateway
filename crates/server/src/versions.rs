@@ -127,7 +127,7 @@ pub enum VersionFilter {
 }
 
 /// The query of `GET /v1/minecraft/versions`.
-#[derive(Debug, Default, Deserialize, IntoParams)]
+#[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct VersionsQuery {
     /// `release` (the default), `snapshot` (snapshots only) or `all` (every kind, old betas and alphas included).
@@ -138,7 +138,7 @@ pub struct VersionsQuery {
 }
 
 /// The query of `GET /v1/minecraft/loaders/{loader}/versions`.
-#[derive(Debug, Default, Deserialize, IntoParams)]
+#[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct LoaderQuery {
     /// Only the builds for this Minecraft version, such as `1.21.1`.
@@ -187,7 +187,7 @@ pub struct MinecraftVersionDetails {
 }
 
 /// The query of `GET /v1/minecraft/java`: a platform and either a Java major or a runtime component.
-#[derive(Debug, Default, Deserialize, IntoParams)]
+#[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct JavaQuery {
     /// Mojang's name for the platform: `linux`, `linux-i386`, `mac-os`, `mac-os-arm64`, `windows-x64`, `windows-x86` or `windows-arm64`.

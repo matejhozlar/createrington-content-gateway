@@ -26,8 +26,7 @@ use crate::{
 
 pub const MODRINTH_API: &str = "https://api.modrinth.com/v2";
 pub const TIMEOUT: Duration = Duration::from_secs(10);
-/// How many hashes one `POST /v1/modrinth/version_files` may ask for.
-pub const MOST_HASHES: usize = 1000;
+const MOST_HASHES: usize = 1000;
 const HASHES_PER_CALL: usize = 100;
 const FOUND_MS: u64 = HOUR_MS;
 const NOT_FOUND_MS: u64 = 10 * MINUTE_MS;
@@ -83,6 +82,10 @@ pub struct VersionFilesRequest {
     /// `sha1`, kept per hash. Any other algorithm sends the body to Modrinth as it came, uncached.
     #[serde(default = "sha1")]
     #[schema(example = "sha1")]
+    #[expect(
+        dead_code,
+        reason = "documents the body; `sha1_body` reads the algorithm"
+    )]
     pub algorithm: String,
 }
 

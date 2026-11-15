@@ -10,13 +10,12 @@ use subtle::ConstantTimeEq;
 
 use crate::{app::AppState, config::Consumer, error::ApiError};
 
-pub const POOL_HEADER: &str = "x-budget-pool";
+const POOL_HEADER: &str = "x-budget-pool";
 
-/// The consumer a request authenticated as, put into the request's extensions by `authenticate`.
 #[derive(Debug, Clone)]
-pub struct Caller {
-    pub consumer: Arc<str>,
-    pub pools: Arc<[Arc<str>]>,
+struct Caller {
+    consumer: Arc<str>,
+    pools: Arc<[Arc<str>]>,
 }
 
 impl From<&Consumer> for Caller {
