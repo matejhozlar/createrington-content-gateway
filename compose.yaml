@@ -1,0 +1,33 @@
+# The gateway next to a Redis of its own. Copy .env.example to .env, set
+# CURSEFORGE_API_KEY and CONTENT_GATEWAY_TOKEN (or CONTENT_GATEWAY_CONSUMERS),
+# then run `docker compose up -d`. `docker compose up -d --build` builds this
+# checkout instead of pulling the release image.
+services:
+  gateway:
+    image: ghcr.io/matejhozlar/createrington-content-gateway:latest
+    build: .
+    env_file: .env
+    environment:
+      CONTENT_GATEWAY_HOST: 0.0.0.0
+      CONTENT_GATEWAY_PORT: "5005"
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "127.0.0.1:5005:5005"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:8.10-alpine
+    command:
+      - redis-server
+      - --maxmemory
+      - 1gb
+      - --maxmemory-policy
+      - volatile-lru
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+volumes:
+  redis-data:
