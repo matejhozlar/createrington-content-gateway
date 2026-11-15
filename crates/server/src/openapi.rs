@@ -83,7 +83,7 @@ pub const API_VERSION: &str = "1";
     )),
     modifiers(&Bearer)
 )]
-pub struct ApiDoc;
+struct ApiDoc;
 
 struct Bearer;
 

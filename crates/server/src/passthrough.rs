@@ -41,7 +41,7 @@ pub const fn fresh(found_ms: u64, not_found_ms: Option<u64>) -> Option<Freshness
 }
 
 /// Whether `segment` may be sent to `source`: letters, digits, `-`, `_` and the source's slug characters.
-pub fn valid_segment(source: Source, segment: &str) -> bool {
+fn valid_segment(source: Source, segment: &str) -> bool {
     let slug_byte = |byte: u8| source.slug_characters().as_bytes().contains(&byte);
     !segment.is_empty()
         && segment != "."

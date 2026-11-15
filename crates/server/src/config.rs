@@ -30,8 +30,8 @@ const MAX_NAME_LENGTH: usize = 64;
 /// What the gateway calls itself to every upstream unless `CONTENT_GATEWAY_USER_AGENT` says otherwise.
 pub const DEFAULT_USER_AGENT: &str = concat!("content-gateway/", env!("CARGO_PKG_VERSION"));
 pub const DEFAULT_LOG: &str = "info";
-pub const DEFAULT_CONSUMER: &str = "default";
-pub const DEFAULT_POOL: &str = "default";
+const DEFAULT_CONSUMER: &str = "default";
+const DEFAULT_POOL: &str = "default";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
@@ -60,6 +60,7 @@ pub struct Consumer {
 pub struct Token(String);
 
 impl Token {
+    #[cfg(test)]
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
@@ -80,6 +81,7 @@ impl fmt::Debug for Token {
 pub struct ApiKey(String);
 
 impl ApiKey {
+    #[cfg(test)]
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }

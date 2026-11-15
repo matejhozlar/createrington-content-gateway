@@ -93,13 +93,12 @@ impl RedisStore {
         }
     }
 
-    /// Whether Redis answers a `PING`. Connects when no connection was made yet.
-    pub async fn ping(&self) -> bool {
+    /// Sends Redis a `PING`, which connects when no connection was made yet.
+    pub async fn ping(&self) {
         self.run(|mut connection| async move {
             redis::cmd("PING").query_async::<()>(&mut connection).await
         })
-        .await
-        .is_some()
+        .await;
     }
 
     #[cfg(test)]

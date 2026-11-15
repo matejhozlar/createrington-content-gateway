@@ -27,7 +27,7 @@ pub const DEFAULT_HISTORY_DAYS: u32 = 90;
 /// The most days of daily counts that can be kept.
 pub const MAX_HISTORY_DAYS: u32 = 3660;
 /// Days `/v1/budget` answers when not asked for a number.
-pub const DEFAULT_SNAPSHOT_DAYS: u32 = 14;
+const DEFAULT_SNAPSHOT_DAYS: u32 = 14;
 const HTTP_FORBIDDEN: u16 = 403;
 const HTTP_TOO_MANY_REQUESTS: u16 = 429;
 const ADMITTED: i64 = 0;
@@ -181,7 +181,7 @@ pub struct UpstreamBudget {
     pub limit_per_minute: u32,
     #[serde(skip)]
     #[schema(ignore)]
-    pub history_days: u32,
+    history_days: u32,
     /// Calls admitted this minute.
     pub used: u32,
     /// Calls refused this minute.
@@ -194,7 +194,7 @@ pub struct UpstreamBudget {
     pub held_until: Option<String>,
     #[serde(skip)]
     #[schema(ignore)]
-    pub source: Source,
+    source: Source,
     /// Every pool of every consumer, this minute.
     pub pools: Vec<PoolSnapshot>,
     /// The UTC days asked for, today first; a day without a single count is left out.
@@ -202,7 +202,7 @@ pub struct UpstreamBudget {
 }
 
 /// The query of `/v1/budget`.
-#[derive(Debug, Default, Deserialize, IntoParams)]
+#[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct HistoryQuery {
     /// UTC days to answer, today included, 1 up; 14 when left out, and more than the days kept answers the days kept.
@@ -365,7 +365,7 @@ impl Budget {
         }
     }
 
-    /// The budget with the last 14 UTC days, at most the days kept.
+    #[cfg(test)]
     pub async fn snapshot(&self) -> UpstreamBudget {
         self.history(DEFAULT_SNAPSHOT_DAYS).await
     }
