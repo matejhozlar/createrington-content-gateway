@@ -42,17 +42,15 @@ impl<T> Given<T> {
     }
 }
 
-/// A load a request started for one of its ids. Dropped without `finish`, every request waiting on it gets
-/// `Unreachable`.
-pub struct Won<I> {
-    pub id: I,
-    pub key: String,
+struct Won<I> {
+    id: I,
+    key: String,
     load_key: String,
     finisher: Finisher,
 }
 
 impl<I> Won<I> {
-    pub fn finish(self, cache: &AnswerCache, outcome: Outcome) {
+    fn finish(self, cache: &AnswerCache, outcome: Outcome) {
         cache.finish(&self.load_key, self.finisher, outcome);
     }
 }
@@ -66,11 +64,7 @@ enum Slot<V> {
     },
 }
 
-/// What `read` makes of the entry of each id, in the order of `ids`: from the cache while the entry is fresh, else
-/// from the load of its key. `fetch` gets the loads this request started whose answer was not kept meanwhile, and
-/// must finish each. An entry `read` makes nothing of counts as not kept, and an older entry stands in for a load
-/// that failed in a way that allows it.
-pub async fn many<I, V, F, Fut>(
+async fn many<I, V, F, Fut>(
     state: &Arc<AppState>,
     ids: Vec<I>,
     key: impl Fn(&I) -> String,
@@ -192,7 +186,9 @@ async fn run<I, V, F, Fut>(
     }
 }
 
-/// `many` for one key, whose load `fetch` runs and whose outcome it returns.
+/// What `read` makes of the entry of `key`: from the cache while the entry is fresh, else from the load of the key,
+/// which `fetch` runs unless another request is loading it or the answer was kept meanwhile. An entry `read` makes
+/// nothing of counts as not kept, and an older entry stands in for a load that failed in a way that allows it.
 pub async fn one<V, Fut>(
     state: &Arc<AppState>,
     key: String,
@@ -247,7 +243,8 @@ fn row(entry: &Arc<Entry>) -> Option<Option<Bytes>> {
     entry.fits_a_batch().then(|| entry.row.clone())
 }
 
-/// The row of each id the upstream knows, in the order of `ids`, counted against the budget of the route's source.
+/// The row of each id the upstream knows, in the order of `ids`, each kept and loaded by the rules of `one`, counted
+/// against the budget of the route's source.
 pub async fn rows<R: PerId>(
     state: &Arc<AppState>,
     pool: &Pool,
