@@ -31,12 +31,15 @@ from .generated import (
     PoolSnapshot,
     Resolved,
     ResolvedFile,
+    ResolveRequest,
     RuntimeManifest,
     Source,
     UpstreamBudget,
+    VersionFilesRequest,
     VersionFilter,
     VersionType,
 )
+from .generated import Source as BudgetSource
 
 __all__ = [
     "DEFAULT_TIMEOUT",
@@ -45,6 +48,7 @@ __all__ = [
     "ApiError",
     "AsyncContentGateway",
     "BudgetSnapshot",
+    "BudgetSource",
     "CacheStatus",
     "ContentGateway",
     "ContentGatewayError",
@@ -66,11 +70,13 @@ __all__ = [
     "PassthroughAnswer",
     "PoolSnapshot",
     "Query",
+    "ResolveRequest",
     "Resolved",
     "ResolvedFile",
     "RuntimeManifest",
     "Source",
     "UpstreamBudget",
+    "VersionFilesRequest",
     "VersionFilter",
     "VersionType",
     "modrinth_file_url",
