@@ -1,6 +1,14 @@
 # content-gateway-client
 
-## 0.2.2
+## 0.3.0
+
+`ContentGatewayError.retry_after` gives `retry_after_ms` in seconds, the unit of `timeout` and `wait_up_to`.
+
+`java_runtime` has two overloads, so a type checker refuses a call with neither or both of `major` and `component`; the run-time check stays.
+
+New exports: `ResolveRequest` and `VersionFilesRequest`, the bodies `resolve` and `modrinth_version_files` send, and `BudgetSource`, the TypeScript client's name for the budget's `Source`, which stays exported too.
+
+The package ships its licence file, the README links the repository instead of a relative path that is dead on PyPI, and the classifiers name every supported Python minor, 3.11 to 3.14.
 
 New error code `UNKNOWN_ROUTE`: the gateway now answers a path none of its routes serves with its JSON error, `404 UNKNOWN_ROUTE`, instead of an empty 404.
 
