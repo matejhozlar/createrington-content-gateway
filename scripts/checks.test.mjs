@@ -5,6 +5,7 @@ import { topHeading, versionProblems } from "./check-python-version.mjs";
 import {
   envNames,
   inReadmeTable,
+  licenceProblems,
   linesWith,
   lockedVersion,
   versionIn,
@@ -138,5 +139,22 @@ test("the version needs the top changelog heading whatever changed", () => {
     sourceChanged: false,
   });
   assert.match(problem, /top heading .* is ## 0\.2\.2, but .* says 0\.3\.0/);
+  assert.deepEqual(rest, []);
+});
+
+test("a package licence must be the root one, line endings aside", () => {
+  const root = ["MIT License", "", "Copyright (c) 2026", ""].join("\n");
+  assert.deepEqual(
+    licenceProblems(root, {
+      "packages/client/LICENSE": root,
+      "packages/python-client/LICENSE": root.replaceAll("\n", "\r\n"),
+    }),
+    [],
+  );
+  const [problem, ...rest] = licenceProblems(root, {
+    "packages/client/LICENSE": root,
+    "packages/python-client/LICENSE": root.replace("2026", "2025"),
+  });
+  assert.match(problem, /^packages\/python-client\/LICENSE differs/);
   assert.deepEqual(rest, []);
 });

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { git } from "./git.mjs";
 
@@ -96,15 +96,36 @@ function envProblems() {
   ]);
 }
 
+export function licenceProblems(root, copies) {
+  const normalize = (text) => text.replaceAll("\r\n", "\n");
+  return Object.entries(copies)
+    .filter(([, text]) => normalize(text) !== normalize(root))
+    .map(
+      ([path]) =>
+        `${path} differs from the root LICENSE: copy the root one over it`,
+    );
+}
+
+function packageLicenceProblems() {
+  const copies = Object.fromEntries(
+    readdirSync("packages")
+      .map((name) => `packages/${name}/LICENSE`)
+      .filter((path) => existsSync(path))
+      .map((path) => [path, read(path)]),
+  );
+  return licenceProblems(read("LICENSE"), copies);
+}
+
 if (import.meta.url === pathToFileURL(process.argv[1]).href) {
   const problems = [
     ...versionProblems(),
     ...emDashProblems(),
     ...envProblems(),
+    ...packageLicenceProblems(),
   ];
   for (const problem of problems) console.error(problem);
   if (problems.length > 0) process.exit(1);
   console.log(
-    "Versions agree, no tracked file holds an em dash, and every variable is documented",
+    "Versions agree, no tracked file holds an em dash, every variable is documented, and every package licence is the root one",
   );
 }
