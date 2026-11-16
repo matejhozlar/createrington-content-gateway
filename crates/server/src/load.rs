@@ -113,8 +113,9 @@ where
             },
         ));
     }
-    if !won.is_empty() {
-        tokio::spawn(run(state.clone(), won, forced, read, fetch));
+    if let Some(first) = won.first() {
+        let (key, keys) = (first.key.clone(), won.len());
+        spawn_load(run(state.clone(), won, forced, read, fetch), key, keys);
     }
 
     let mut values = Vec::with_capacity(slots.len());
@@ -134,7 +135,7 @@ where
                         outcome.loaded
                     }
                     None => {
-                        tracing::warn!(%key, "a load ended without an answer");
+                        tracing::debug!(%key, "a load this request waited on ended without an answer");
                         Err(LoadFailure::Lost)
                     }
                 };
@@ -285,8 +286,25 @@ async fn fetch<R: PerId>(state: Arc<AppState>, pool: Pool, route: R, won: Vec<Wo
     let mut won = won.into_iter().peekable();
     while won.peek().is_some() {
         let chunk: Vec<Won<R::Id>> = won.by_ref().take(R::PER_CALL).collect();
-        tokio::spawn(fetch_chunk(state.clone(), pool.clone(), route, chunk));
+        let Some(key) = chunk.first().map(|load| load.key.clone()) else {
+            break;
+        };
+        let keys = chunk.len();
+        spawn_load(
+            fetch_chunk(state.clone(), pool.clone(), route, chunk),
+            key,
+            keys,
+        );
     }
+}
+
+fn spawn_load(load: impl Future<Output = ()> + Send + 'static, key: String, keys: usize) {
+    let running = tokio::spawn(load);
+    tokio::spawn(async move {
+        if let Err(error) = running.await {
+            tracing::warn!(%key, keys, %error, "a load ended without an answer");
+        }
+    });
 }
 
 async fn fetch_chunk<R: PerId>(state: Arc<AppState>, pool: Pool, route: R, chunk: Vec<Won<R::Id>>) {
