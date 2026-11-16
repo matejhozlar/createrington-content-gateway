@@ -60,6 +60,13 @@ if counted > used then
   redis.call('HSET', KEYS[1], 'used', counted)
   used = counted
 end
+for i = 8, #ARGV, 2 do
+  local field = 'used:' .. ARGV[i]
+  local pool_used = tonumber(redis.call('HGET', KEYS[1], field) or '0') or 0
+  if tonumber(ARGV[i + 1]) > pool_used then
+    redis.call('HSET', KEYS[1], field, ARGV[i + 1])
+  end
+end
 local verdict = {code_admitted}
 if calls > limit then
   verdict = {code_too_large}
@@ -552,9 +559,15 @@ impl Budget {
         calls: u32,
         now: u64,
     ) -> Option<(Verdict, u64)> {
-        let (counted, held_until_ms) = {
+        let (counted, held_until_ms, pools_counted) = {
             let state = self.lock(now);
-            (state.used, state.held_until_ms)
+            let pools_counted: Vec<(String, u32)> = state
+                .pools
+                .iter()
+                .filter(|(_, counts)| counts.used > 0)
+                .map(|(pool, counts)| (pool_field(pool), counts.used))
+                .collect();
+            (state.used, state.held_until_ms, pools_counted)
         };
         let mut invocation = redis.admit.key(redis.minute_key(now));
         invocation
@@ -566,6 +579,9 @@ impl Budget {
             .arg(counted)
             .arg(pool_field(pool))
             .arg(MINUTE_KEY_TTL_MS);
+        for (field, used) in pools_counted {
+            invocation.arg(field).arg(used);
+        }
         let (code, held_until_ms) = redis
             .store
             .run(|mut connection| async move {
@@ -1761,7 +1777,7 @@ mod tests {
                 retry_after_ms: 60_000
             })
         );
-        budget.admit(&pool("app", "app"), 2).await.unwrap();
+        budget.admit(&pool("app", "launcher"), 2).await.unwrap();
 
         clock.advance(5_000);
         assert_eq!(
@@ -1772,7 +1788,8 @@ mod tests {
         );
         let snapshot = budget.snapshot().await;
         assert_eq!(snapshot.source, CountSource::Redis);
-        assert_eq!(snapshot.used, 5);
+        let pools: Vec<u32> = snapshot.pools.iter().map(|pool| pool.used).collect();
+        assert_eq!((snapshot.used, pools), (5, vec![2, 3, 0]));
         redis.forget().await;
     }
 
