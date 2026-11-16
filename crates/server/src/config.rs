@@ -189,6 +189,10 @@ pub enum ConfigError {
         "{CONSUMERS_ENV}: the token of consumer {consumer:?} must be at least {MIN_TOKEN_LENGTH} characters"
     )]
     ShortConsumerToken { consumer: String },
+    #[error(
+        "{CONSUMERS_ENV}: the token of consumer {consumer:?} starts or ends with whitespace, which no request can send"
+    )]
+    PaddedToken { consumer: String },
     #[error("{CONSUMERS_ENV}: consumers {first:?} and {second:?} have the same token")]
     SharedToken { first: String, second: String },
 }
@@ -362,6 +366,11 @@ fn validate_consumers(consumers: &[Consumer]) -> Result<(), ConfigError> {
                     pool: pool.clone(),
                 });
             }
+        }
+        if consumer.token.0.trim() != consumer.token.0 {
+            return Err(ConfigError::PaddedToken {
+                consumer: consumer.name.clone(),
+            });
         }
         if consumer.token.0.chars().count() < MIN_TOKEN_LENGTH {
             return Err(ConfigError::ShortConsumerToken {
@@ -786,6 +795,16 @@ mod tests {
                 consumer: "app".to_owned(),
             })
         );
+        for padded in [format!(" {TOKEN}"), format!("{TOKEN}\\n")] {
+            assert_eq!(
+                consumers_from(&format!(
+                    r#"[{{"name":"app","token":"{padded}","pools":["app"]}}]"#
+                )),
+                Err(ConfigError::PaddedToken {
+                    consumer: "app".to_owned(),
+                })
+            );
+        }
         let json = format!(
             r#"[{{"name":"app","token":"{TOKEN}","pools":["app"]}},{{"name":"sandbox","token":"{TOKEN}","pools":["jobs"]}}]"#
         );
@@ -874,6 +893,12 @@ mod tests {
             (
                 CONSUMERS_ENV,
                 consumers(r#"[{"name":"app","token":"too-short","pools":["app"]}]"#),
+            ),
+            (
+                CONSUMERS_ENV,
+                consumers(&format!(
+                    r#"[{{"name":"app","token":" {TOKEN}","pools":["app"]}}]"#
+                )),
             ),
             (
                 CONSUMERS_ENV,
