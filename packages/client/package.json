@@ -20,12 +20,13 @@
   },
   "files": [
     "dist",
+    "src",
     "README.md"
   ],
   "scripts": {
     "generate": "node scripts/generate.mjs",
     "generate:check": "node scripts/generate.mjs --check",
-    "build": "tsc -p tsconfig.build.json",
+    "build": "pnpm run clean && tsc -p tsconfig.build.json",
     "clean": "node -e \"fs.rmSync('dist', { recursive: true, force: true })\"",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.zod3.json",
     "test": "vitest run"
