@@ -43,6 +43,7 @@ ErrorCode: TypeAlias = Literal[
     "BUDGET_SPENT",
     "UPSTREAM_HOLD",
     "REQUEST_TOO_LARGE",
+    "INTERNAL",
 ]
 
 

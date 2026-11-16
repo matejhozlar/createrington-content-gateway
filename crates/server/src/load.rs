@@ -58,6 +58,7 @@ impl<I> Won<I> {
 enum Slot<V> {
     Kept(V),
     Waiting {
+        key: String,
         waiting: Waiting,
         started: bool,
         kept: Option<(V, Arc<Entry>)>,
@@ -97,7 +98,7 @@ where
         if let Some(finisher) = finisher {
             won.push(Won {
                 id: id.clone(),
-                key,
+                key: key.clone(),
                 load_key,
                 finisher,
             });
@@ -105,6 +106,7 @@ where
         slots.push((
             id,
             Slot::Waiting {
+                key,
                 waiting,
                 started,
                 kept,
@@ -121,6 +123,7 @@ where
         let value = match slot {
             Slot::Kept(value) => value,
             Slot::Waiting {
+                key,
                 waiting,
                 started,
                 kept,
@@ -130,7 +133,10 @@ where
                         called |= started && outcome.called;
                         outcome.loaded
                     }
-                    None => Err(LoadFailure::Upstream(UpstreamFailure::Unreachable)),
+                    None => {
+                        tracing::warn!(%key, "a load ended without an answer");
+                        Err(LoadFailure::Lost)
+                    }
                 };
                 let value = loaded.and_then(|entry| {
                     read(&entry).ok_or(LoadFailure::Upstream(UpstreamFailure::Unreadable))
@@ -207,7 +213,7 @@ where
             load.finish(&finishing.cache, outcome);
         }
     };
-    let given = many(state, vec![key], String::clone, forced, read, fetch).await?;
+    let given = many(state, vec![key.clone()], String::clone, forced, read, fetch).await?;
     let Given {
         value,
         cache,
@@ -219,7 +225,10 @@ where
             cache,
             called,
         }),
-        None => Err(LoadFailure::Upstream(UpstreamFailure::Unreachable)),
+        None => {
+            tracing::warn!(%key, "a load ended without an answer for its own key");
+            Err(LoadFailure::Lost)
+        }
     }
 }
 
@@ -294,10 +303,18 @@ async fn fetch_chunk<R: PerId>(state: Arc<AppState>, pool: Pool, route: R, chunk
     .await;
     let now = state.clock.now_ms();
     let mut found: Result<HashMap<R::Id, Entry>, LoadFailure> = match sent {
-        Ok(answer) if answer.status == StatusCode::OK => route
-            .split(&answer, now)
-            .map(|entries| entries.into_iter().collect())
-            .ok_or(LoadFailure::Upstream(UpstreamFailure::Unreadable)),
+        Ok(answer) if answer.status == StatusCode::OK => match route.split(&answer, now) {
+            Some(entries) => Ok(entries.into_iter().collect()),
+            None => {
+                tracing::warn!(
+                    upstream = R::SOURCE.name(),
+                    %pool,
+                    path = route.path(),
+                    "the upstream's batch answer cannot be split per id"
+                );
+                Err(LoadFailure::Upstream(UpstreamFailure::Unreadable))
+            }
+        },
         Ok(answer) if answer.status == StatusCode::NOT_FOUND && R::KNOWS_NONE_AS_404 => {
             Ok(HashMap::new())
         }
@@ -359,5 +376,29 @@ mod tests {
         );
         assert_eq!(mock.calls(), 1);
         assert_eq!(gateway.state.curseforge_budget.snapshot().await.used, 1);
+    }
+
+    #[tokio::test]
+    async fn a_load_that_dies_is_lost_rather_than_blamed_on_the_upstream() {
+        let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "{}")).await;
+        let gateway = gateway(&mock);
+        let whole = |entry: &Arc<Entry>| Some(entry.clone());
+        let died = one(&gateway.state, "mod:1".to_owned(), false, whole, async {
+            panic!("the load dies")
+        })
+        .await;
+        assert!(matches!(died, Err(LoadFailure::Lost)));
+
+        let entry = Arc::new(Entry::new(
+            Answer::json(Bytes::from_static(b"{}")),
+            gateway.state.clock.now_ms(),
+            1_000,
+        ));
+        let next = one(&gateway.state, "mod:1".to_owned(), false, whole, {
+            let entry = entry.clone();
+            async move { Outcome::called(Ok(entry)) }
+        })
+        .await;
+        assert!(Arc::ptr_eq(&next.ok().unwrap().value, &entry));
     }
 }

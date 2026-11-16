@@ -80,7 +80,12 @@ impl Meta {
             .map_err(|error| upstream::failure(error, name))?;
         let sent = upstream::read(response, name).await?;
         if sent.answer.status != StatusCode::OK {
-            tracing::warn!("{name} answered {} for {url}", sent.answer.status);
+            tracing::warn!(
+                upstream = name,
+                %url,
+                status = %sent.answer.status,
+                "the upstream answered a version list with an unexpected status"
+            );
             return Err(UpstreamFailure::Unreadable);
         }
         Ok(sent.answer.body)
@@ -107,17 +112,21 @@ impl Origin {
     }
 }
 
-/// Why a version list could not be given: the source, and what went wrong with it.
+/// Why a version list could not be given: what went wrong with its source, or a load that ended without an answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("{} {failure}", origin.name())]
-pub struct ListFailure {
-    pub origin: Origin,
-    pub failure: UpstreamFailure,
+pub enum ListFailure {
+    #[error("{} {failure}", origin.name())]
+    Upstream {
+        origin: Origin,
+        failure: UpstreamFailure,
+    },
+    #[error("the load of a version list ended without an answer")]
+    Lost,
 }
 
 impl ListFailure {
     fn unreadable(origin: Origin) -> Self {
-        Self {
+        Self::Upstream {
             origin,
             failure: UpstreamFailure::Unreadable,
         }
@@ -126,7 +135,10 @@ impl ListFailure {
 
 impl From<ListFailure> for ApiError {
     fn from(failed: ListFailure) -> Self {
-        ApiError::upstream(failed.failure, failed.origin.name())
+        match failed {
+            ListFailure::Upstream { origin, failure } => ApiError::upstream(failure, origin.name()),
+            ListFailure::Lost => ApiError::internal(),
+        }
     }
 }
 
@@ -381,8 +393,10 @@ struct FabricGame {
 fn parsed<T: DeserializeOwned>(body: &[u8], origin: Origin, url: &str) -> Result<T, ListFailure> {
     serde_json::from_slice(body).map_err(|error| {
         tracing::warn!(
-            "{} answered {url} with something the gateway cannot read: {error}",
-            origin.name()
+            upstream = origin.name(),
+            %url,
+            %error,
+            "the upstream answered a version list with something the gateway cannot read"
         );
         ListFailure::unreadable(origin)
     })
@@ -409,8 +423,8 @@ async fn document<T: DeserializeOwned + 'static>(
                 Ok(body) => body,
                 Err(failure) => return Outcome::called(Err(LoadFailure::Upstream(failure))),
             };
-            if let Err(failed) = parsed::<T>(&body, origin, &url) {
-                return Outcome::called(Err(LoadFailure::Upstream(failed.failure)));
+            if parsed::<T>(&body, origin, &url).is_err() {
+                return Outcome::called(Err(LoadFailure::Upstream(UpstreamFailure::Unreadable)));
             }
             let answer = Answer {
                 status: StatusCode::OK,
@@ -424,11 +438,8 @@ async fn document<T: DeserializeOwned + 'static>(
     };
     match load::one(state, key.to_owned(), false, read::<T>, fetch).await {
         Ok(given) => Ok(given.value),
-        Err(LoadFailure::Upstream(failure)) => Err(ListFailure { origin, failure }),
-        Err(_) => Err(ListFailure {
-            origin,
-            failure: UpstreamFailure::Unreachable,
-        }),
+        Err(LoadFailure::Upstream(failure)) => Err(ListFailure::Upstream { origin, failure }),
+        Err(_) => Err(ListFailure::Lost),
     }
 }
 
@@ -582,6 +593,7 @@ async fn supported(state: &Arc<AppState>, loader: Loader) -> Result<BTreeSet<Str
         (status = 200, description = "The versions", body = MinecraftVersions),
         (status = 400, description = "`INVALID_QUERY`: an unknown `type` or `loader`", body = ApiError),
         (status = 401, description = "No valid consumer token", body = ApiError),
+        (status = 500, description = "The gateway failed to finish the request: `INTERNAL`", body = ApiError),
         (status = 502, description = "Mojang or the loader's source could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`", body = ApiError),
         (status = 504, description = "The source did not answer in time, `UPSTREAM_TIMEOUT`", body = ApiError),
     )
@@ -640,6 +652,7 @@ pub async fn minecraft_versions(
         (status = 200, description = "The version", body = MinecraftVersionDetails),
         (status = 401, description = "No valid consumer token", body = ApiError),
         (status = 404, description = "Mojang lists no such version, `UNKNOWN_VERSION`", body = ApiError),
+        (status = 500, description = "The gateway failed to finish the request: `INTERNAL`", body = ApiError),
         (status = 502, description = "Mojang could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`", body = ApiError),
         (status = 504, description = "Mojang did not answer in time, `UPSTREAM_TIMEOUT`", body = ApiError),
     )
@@ -658,8 +671,9 @@ pub async fn minecraft_version(
     };
     if !version.url.starts_with(&format!("{}/", state.meta.mojang)) {
         tracing::warn!(
-            "Mojang's manifest points version {id} outside its own host: {}",
-            version.url
+            version = %id,
+            url = %version.url,
+            "Mojang's manifest points a version outside its own host"
         );
         return Err(ListFailure::unreadable(Origin::Mojang).into());
     }
@@ -695,6 +709,7 @@ pub async fn minecraft_version(
         (status = 400, description = "`INVALID_QUERY`: `minecraft` given more than once", body = ApiError),
         (status = 401, description = "No valid consumer token", body = ApiError),
         (status = 404, description = "No such loader, `UNKNOWN_LOADER`", body = ApiError),
+        (status = 500, description = "The gateway failed to finish the request: `INTERNAL`", body = ApiError),
         (status = 502, description = "The loader's source could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`", body = ApiError),
         (status = 504, description = "The source did not answer in time, `UPSTREAM_TIMEOUT`", body = ApiError),
     )
@@ -802,6 +817,7 @@ fn pick(index: &RuntimeIndex, platform: &str, wanted: &Wanted) -> Option<JavaRun
         (status = 400, description = "`INVALID_QUERY`: no `platform`, or not exactly one of `major` and `component`", body = ApiError),
         (status = 401, description = "No valid consumer token", body = ApiError),
         (status = 404, description = "Mojang ships no such runtime for the platform, `UNKNOWN_RUNTIME`", body = ApiError),
+        (status = 500, description = "The gateway failed to finish the request: `INTERNAL`", body = ApiError),
         (status = 502, description = "Mojang could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`", body = ApiError),
         (status = 504, description = "Mojang did not answer in time, `UPSTREAM_TIMEOUT`", body = ApiError),
     )
@@ -849,9 +865,9 @@ pub async fn java_runtime(
         .starts_with(&format!("{}/", state.meta.mojang))
     {
         tracing::warn!(
-            "Mojang's list of runtimes points {} outside its own host: {}",
-            runtime.component,
-            runtime.manifest.url
+            runtime = %runtime.component,
+            url = %runtime.manifest.url,
+            "Mojang's list of runtimes points a runtime outside its own host"
         );
         return Err(ListFailure::unreadable(Origin::Mojang).into());
     }

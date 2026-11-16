@@ -221,6 +221,7 @@ struct Candidate {
         (status = 400, description = "`INVALID_BODY`, `POOL_REQUIRED` or `UNKNOWN_POOL`", body = ApiError),
         (status = 401, description = "No valid consumer token", body = ApiError),
         (status = 413, description = "The files need more CurseForge calls than a whole minute allows, `REQUEST_TOO_LARGE`; split them", body = ApiError),
+        (status = 500, description = "The gateway failed to finish the request: `INTERNAL`", body = ApiError),
         (status = 502, description = "CurseForge could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`", body = ApiError),
         (status = 503, description = "The CurseForge call was refused: `BUDGET_SPENT` this minute or `UPSTREAM_HOLD` after a 429", body = ApiError, headers(("Retry-After" = u64, description = "Seconds until the next call can go out"))),
         (status = 504, description = "CurseForge did not answer in time, `UPSTREAM_TIMEOUT`", body = ApiError),
@@ -264,9 +265,7 @@ pub async fn resolve(
         .filter_map(|(id, row)| {
             let row: FileRow = serde_json::from_slice(row)
                 .inspect_err(|error| {
-                    tracing::warn!(
-                        "CurseForge's row of file {id} does not read as a file: {error}"
-                    );
+                    tracing::warn!(file_id = id, %error, "CurseForge's row of a file does not read as a file");
                 })
                 .ok()?;
             Some((
@@ -309,8 +308,9 @@ pub async fn resolve(
             ),
             Err(failure) => {
                 tracing::warn!(
-                    "Modrinth could not be asked for {} files: {failure}",
-                    wanted.len()
+                    files = wanted.len(),
+                    %failure,
+                    "Modrinth could not be asked for the files"
                 );
                 (HashMap::new(), true)
             }
@@ -460,7 +460,10 @@ async fn check_cdn(
     };
     let wait = state.cdn.wait;
     if tokio::time::timeout(wait, collect).await.is_err() {
-        tracing::warn!("CurseForge's CDN could not be asked about every file within {wait:?}");
+        tracing::warn!(
+            wait_ms = wait.as_millis(),
+            "CurseForge's CDN could not be asked about every file in time"
+        );
     }
     verdicts
 }
@@ -476,18 +479,20 @@ async fn head(
         Ok((StatusCode::OK, Some(length))) if length == size => Some(url),
         Ok((StatusCode::OK, length)) => {
             tracing::warn!(
-                "CurseForge's CDN lists {} for file {file_id}, CurseForge's API lists {size} bytes",
-                length.map_or("no size".to_owned(), |length| length.to_string())
+                file_id,
+                cdn_bytes = ?length,
+                api_bytes = size,
+                "CurseForge's CDN and API list different sizes for a file"
             );
             None
         }
         Ok((StatusCode::FORBIDDEN | StatusCode::NOT_FOUND, _)) => None,
         Ok((status, _)) => {
-            tracing::warn!("CurseForge's CDN answered {status} for file {file_id}");
+            tracing::warn!(file_id, %status, "CurseForge's CDN answered a file with an unexpected status");
             return None;
         }
         Err(error) => {
-            tracing::warn!("CurseForge's CDN could not be asked about file {file_id}: {error}");
+            tracing::warn!(file_id, %error, "CurseForge's CDN could not be asked about a file");
             return None;
         }
     };

@@ -155,6 +155,16 @@
               }
             }
           },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "502": {
             "description": "CurseForge could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
             "content": {
@@ -296,6 +306,16 @@
           },
           "413": {
             "description": "The batch needs more calls than a whole minute allows, `REQUEST_TOO_LARGE`; split it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
             "content": {
               "application/json": {
                 "schema": {
@@ -456,6 +476,16 @@
               }
             }
           },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "502": {
             "description": "Mojang could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
             "content": {
@@ -554,6 +584,16 @@
               }
             }
           },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "502": {
             "description": "The loader's source could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
             "content": {
@@ -641,6 +681,16 @@
               }
             }
           },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "502": {
             "description": "Mojang or the loader's source could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
             "content": {
@@ -711,6 +761,16 @@
           },
           "404": {
             "description": "Mojang lists no such version, `UNKNOWN_VERSION`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
             "content": {
               "application/json": {
                 "schema": {
@@ -820,6 +880,16 @@
           },
           "401": {
             "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
             "content": {
               "application/json": {
                 "schema": {
@@ -979,6 +1049,16 @@
               }
             }
           },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "502": {
             "description": "Modrinth could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
             "content": {
@@ -1126,6 +1206,16 @@
           },
           "413": {
             "description": "The files need more CurseForge calls than a whole minute allows, `REQUEST_TOO_LARGE`; split them",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1359,7 +1449,8 @@
           "UPSTREAM_UNREADABLE",
           "BUDGET_SPENT",
           "UPSTREAM_HOLD",
-          "REQUEST_TOO_LARGE"
+          "REQUEST_TOO_LARGE",
+          "INTERNAL"
         ]
       },
       "FileSource": {

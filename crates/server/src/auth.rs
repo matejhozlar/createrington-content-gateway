@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use axum::{
     extract::{FromRequestParts, Request, State},
@@ -36,6 +36,12 @@ impl From<&Consumer> for Caller {
 pub struct Pool {
     pub consumer: Arc<str>,
     pub name: Arc<str>,
+}
+
+impl fmt::Display for Pool {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.consumer, self.name)
+    }
 }
 
 pub async fn authenticate(

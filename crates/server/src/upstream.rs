@@ -150,8 +150,8 @@ pub async fn read(
         .headers()
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok()?.parse::<usize>().ok());
-    if announced.is_some_and(|length| length > MAX_ANSWER_BYTES) {
-        return Err(UpstreamFailure::TooLarge);
+    if let Some(bytes) = announced.filter(|length| *length > MAX_ANSWER_BYTES) {
+        return Err(too_large(name, bytes));
     }
     let mut body = Vec::with_capacity(announced.unwrap_or(0));
     while let Some(chunk) = response
@@ -160,7 +160,7 @@ pub async fn read(
         .map_err(|error| failure(error, name))?
     {
         if body.len() + chunk.len() > MAX_ANSWER_BYTES {
-            return Err(UpstreamFailure::TooLarge);
+            return Err(too_large(name, body.len() + chunk.len()));
         }
         body.extend_from_slice(&chunk);
     }
@@ -174,13 +174,23 @@ pub async fn read(
     })
 }
 
+fn too_large(name: &'static str, bytes: usize) -> UpstreamFailure {
+    tracing::warn!(
+        upstream = name,
+        bytes,
+        limit = MAX_ANSWER_BYTES,
+        "the upstream's answer is larger than the gateway reads"
+    );
+    UpstreamFailure::TooLarge
+}
+
 /// Why `name` gave no answer, from the error reqwest reported.
 pub fn failure(error: reqwest::Error, name: &'static str) -> UpstreamFailure {
     if error.is_timeout() {
-        tracing::warn!("{name} did not answer in time: {error}");
+        tracing::warn!(upstream = name, %error, "the upstream did not answer in time");
         UpstreamFailure::Timeout
     } else {
-        tracing::warn!("{name} could not be reached: {error}");
+        tracing::warn!(upstream = name, %error, "the upstream could not be reached");
         UpstreamFailure::Unreachable
     }
 }

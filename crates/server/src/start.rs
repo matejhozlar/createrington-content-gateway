@@ -40,14 +40,14 @@ pub async fn run() -> ExitCode {
         .init();
 
     if let Some(error) = log_filter_error {
-        tracing::error!("invalid configuration: {error}");
+        tracing::error!(%error, "the configuration is invalid");
         return ExitCode::FAILURE;
     }
 
     let config = match Config::from_env() {
         Ok(config) => config,
         Err(error) => {
-            tracing::error!("invalid configuration: {error}");
+            tracing::error!(%error, "the configuration is invalid");
             return ExitCode::FAILURE;
         }
     };
@@ -55,7 +55,7 @@ pub async fn run() -> ExitCode {
     let listener = match TcpListener::bind(config.listen).await {
         Ok(listener) => listener,
         Err(error) => {
-            tracing::error!("cannot listen on {}: {error}", config.listen);
+            tracing::error!(address = %config.listen, %error, "cannot listen");
             return ExitCode::FAILURE;
         }
     };
@@ -70,7 +70,7 @@ pub async fn run() -> ExitCode {
                     Some(Arc::new(store))
                 }
                 Err(error) => {
-                    tracing::error!("cannot set up the connection to Redis: {error}");
+                    tracing::error!(%error, "cannot set up the connection to Redis");
                     return ExitCode::FAILURE;
                 }
             }
@@ -86,21 +86,21 @@ pub async fn run() -> ExitCode {
     ) {
         Ok(state) => Arc::new(state),
         Err(error) => {
-            tracing::error!("cannot set up the upstream clients: {error}");
+            tracing::error!(%error, "cannot set up the upstream clients");
             return ExitCode::FAILURE;
         }
     };
     tracing::info!(
-        "listening on {} for {} consumer(s), {} CurseForge and {} Modrinth calls a minute, budgets and cache kept in {}",
-        config.listen,
-        config.consumers.len(),
-        config.budget_per_minute,
-        config.modrinth_per_minute,
-        if config.redis_url.is_some() {
-            "Redis, in memory while it fails"
+        address = %config.listen,
+        consumers = config.consumers.len(),
+        curseforge_limit = config.budget_per_minute,
+        modrinth_limit = config.modrinth_per_minute,
+        kept_in = if config.redis_url.is_some() {
+            "redis"
         } else {
             "memory"
-        }
+        },
+        "listening"
     );
     let stopped = serve::serve(
         listener,
@@ -118,13 +118,13 @@ pub async fn run() -> ExitCode {
         }
         Ok(Stopped::GraceExpired) => {
             tracing::warn!(
-                "requests still open {} s after the shutdown signal, stopped anyway",
-                SHUTDOWN_GRACE.as_secs()
+                grace_ms = SHUTDOWN_GRACE.as_millis(),
+                "requests were still open when the shutdown grace ended, stopped anyway"
             );
             ExitCode::SUCCESS
         }
         Err(error) => {
-            tracing::error!("{error}");
+            tracing::error!(%error, "serving stopped on an error");
             ExitCode::FAILURE
         }
     }
@@ -133,7 +133,7 @@ pub async fn run() -> ExitCode {
 async fn shutdown_signal() {
     let interrupt = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
-            tracing::warn!("cannot listen for ctrl-c: {error}");
+            tracing::warn!(%error, "cannot listen for ctrl-c");
             std::future::pending::<()>().await;
         }
     };
@@ -145,7 +145,7 @@ async fn shutdown_signal() {
                 signal.recv().await;
             }
             Err(error) => {
-                tracing::warn!("cannot listen for SIGTERM: {error}");
+                tracing::warn!(%error, "cannot listen for SIGTERM");
                 std::future::pending::<()>().await;
             }
         }

@@ -18,7 +18,7 @@ use crate::{
     error::ApiError,
     load::{self, PerId},
     modrinth,
-    upstream::{Source, UpstreamFailure},
+    upstream::Source,
 };
 
 pub const SHA1_LENGTH: usize = 40;
@@ -182,11 +182,10 @@ async fn uncached(
     match call.await {
         Ok(Ok(answer)) => respond(&answer, CacheStatus::Miss),
         Ok(Err(failure)) => failed(failure, &pool, source),
-        Err(_) => failed(
-            LoadFailure::Upstream(UpstreamFailure::Unreachable),
-            &pool,
-            source,
-        ),
+        Err(error) => {
+            tracing::warn!(upstream = source.name(), %pool, %error, "an uncached call ended without an answer");
+            failed(LoadFailure::Lost, &pool, source)
+        }
     }
 }
 
@@ -338,5 +337,6 @@ pub fn failed(failure: LoadFailure, pool: &Pool, source: Source) -> Response {
         LoadFailure::Upstream(failure) => {
             ApiError::upstream(failure, source.name()).into_response()
         }
+        LoadFailure::Lost => ApiError::internal().into_response(),
     }
 }

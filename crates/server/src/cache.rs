@@ -160,14 +160,17 @@ pub enum LoadFailure {
     Refused(crate::budget::Refusal),
     #[error(transparent)]
     Upstream(crate::upstream::UpstreamFailure),
+    #[error("the load ended without an answer")]
+    Lost,
 }
 
 impl LoadFailure {
-    /// Whether a kept answer may stand in: the call was refused or failed, or the upstream answered a 5xx.
+    /// Whether a kept answer may stand in: the call was refused or failed, the load ended without an answer, or the
+    /// upstream answered a 5xx.
     pub fn allows_stale(&self) -> bool {
         match self {
             Self::Answered(answer) => answer.status.is_server_error(),
-            Self::Refused(_) | Self::Upstream(_) => true,
+            Self::Refused(_) | Self::Upstream(_) | Self::Lost => true,
         }
     }
 }
@@ -282,10 +285,17 @@ impl AnswerCache {
             return entries;
         };
         for (index, bytes) in missing.into_iter().zip(stored) {
-            if let Some(entry) = bytes
-                .and_then(decode)
-                .filter(|entry| entry.can_stand_in(now_ms))
-            {
+            let Some(bytes) = bytes else {
+                continue;
+            };
+            let Some(entry) = decode(bytes) else {
+                tracing::warn!(
+                    key = %keys[index],
+                    "Redis holds a cache entry the gateway cannot read, it counts as missing"
+                );
+                continue;
+            };
+            if entry.can_stand_in(now_ms) {
                 let entry = Arc::new(entry);
                 self.entries.insert(
                     keys[index].clone(),

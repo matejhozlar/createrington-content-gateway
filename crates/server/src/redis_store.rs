@@ -128,19 +128,16 @@ impl RedisStore {
     }
 
     fn mark_down(&self, reason: &str) {
-        if let Some(news) = self.went_down(reason) {
-            tracing::warn!("{news}");
+        if let Some(news) = self.went_down() {
+            tracing::warn!(%reason, "{news}");
         }
     }
 
-    fn went_down(&self, reason: &str) -> Option<String> {
+    fn went_down(&self) -> Option<&'static str> {
         let until_ms = self.clock.now_ms() + PAUSE_AFTER_FAILURE_MS;
         let was = std::mem::replace(&mut *self.link(), Link::Down { until_ms });
-        (!matches!(was, Link::Down { .. })).then(|| {
-            format!(
-                "Redis failed, the budget and the cache use memory until it answers again: {reason}"
-            )
-        })
+        (!matches!(was, Link::Down { .. }))
+            .then_some("Redis failed, the budget and the cache use memory until it answers again")
     }
 }
 
@@ -212,12 +209,10 @@ mod tests {
         assert_eq!(store.came_up(), Some("Redis connected"));
         assert_eq!(store.came_up(), None);
         assert_eq!(
-            store.went_down("refused").as_deref(),
-            Some(
-                "Redis failed, the budget and the cache use memory until it answers again: refused"
-            )
+            store.went_down(),
+            Some("Redis failed, the budget and the cache use memory until it answers again")
         );
-        assert_eq!(store.went_down("refused again"), None);
+        assert_eq!(store.went_down(), None);
         assert_eq!(
             store.came_up(),
             Some("Redis answers again, the budget and the cache use it again")

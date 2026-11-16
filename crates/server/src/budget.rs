@@ -165,6 +165,7 @@ struct Counts {
     withheld: u32,
     pools: HashMap<Pool, MinuteCounts>,
     held_until_ms: u64,
+    told_spent: bool,
     days: BTreeMap<String, HashMap<Pool, DayCounts>>,
 }
 
@@ -333,7 +334,7 @@ impl Budget {
             Some(redis) => self.admit_in_redis(redis, pool, calls, now).await,
             None => None,
         };
-        let (verdict, held_until_ms) = {
+        let (verdict, held_until_ms, first_spent) = {
             let mut state = self.lock(now);
             let verdict = match decided {
                 Some((verdict, held_until_ms)) => {
@@ -352,7 +353,9 @@ impl Budget {
             if verdict != Verdict::Admitted {
                 state.day(now, pool, self.history_days).withheld += u64::from(calls);
             }
-            (verdict, state.held_until_ms)
+            let first_spent =
+                verdict == Verdict::Spent && !std::mem::replace(&mut state.told_spent, true);
+            (verdict, state.held_until_ms, first_spent)
         };
         let refusal = match verdict {
             Verdict::Admitted => return Ok(()),
@@ -363,9 +366,21 @@ impl Budget {
             Verdict::Held => Refusal::Hold {
                 retry_after_ms: held_until_ms.saturating_sub(now),
             },
-            Verdict::Spent => Refusal::Spent {
-                retry_after_ms: (now / MINUTE_MS + 1) * MINUTE_MS - now,
-            },
+            Verdict::Spent => {
+                let wait_ms = (now / MINUTE_MS + 1) * MINUTE_MS - now;
+                if first_spent {
+                    tracing::warn!(
+                        upstream = self.upstream.name(),
+                        %pool,
+                        limit = self.limit_per_minute,
+                        wait_ms,
+                        "the budget of this minute is spent, calls wait for the next minute"
+                    );
+                }
+                Refusal::Spent {
+                    retry_after_ms: wait_ms,
+                }
+            }
         };
         self.write_days_soon();
         Err(refusal)
@@ -411,8 +426,15 @@ impl Budget {
                 held_until_ms = self.lock(now).keep_later_hold(stored);
             }
         }
+        let wait_ms = held_until_ms.saturating_sub(now);
+        tracing::warn!(
+            upstream = self.upstream.name(),
+            %pool,
+            wait_ms,
+            "the upstream answered 429, every call waits until the hold ends"
+        );
         Some(Refusal::Hold {
-            retry_after_ms: held_until_ms.saturating_sub(now),
+            retry_after_ms: wait_ms,
         })
     }
 
@@ -433,8 +455,9 @@ impl Budget {
             .await;
         if lost > 0 {
             tracing::warn!(
-                "Redis did not take the last daily counts of the {} budget, {lost} of them are lost",
-                self.upstream.name()
+                upstream = self.upstream.name(),
+                lost,
+                "Redis did not take the last daily counts, they are lost"
             );
         }
     }
@@ -476,7 +499,7 @@ impl Budget {
                     .pools
                     .iter()
                     .map(|pool| {
-                        let field = pool_field(pool);
+                        let field = pool.to_string();
                         pool_snapshot(
                             pool,
                             MinuteCounts {
@@ -512,9 +535,9 @@ impl Budget {
                         });
                         if !known {
                             tracing::warn!(
-                                "Redis holds the daily count {field} of the {} budget, which is not one the gateway \
-                                 keeps, so the readout leaves it out",
-                                self.upstream.name()
+                                upstream = self.upstream.name(),
+                                %field,
+                                "Redis holds a daily count the gateway does not keep, the readout leaves it out"
                             );
                         }
                     }
@@ -565,7 +588,7 @@ impl Budget {
                 .pools
                 .iter()
                 .filter(|(_, counts)| counts.used > 0)
-                .map(|(pool, counts)| (pool_field(pool), counts.used))
+                .map(|(pool, counts)| (pool.to_string(), counts.used))
                 .collect();
             (state.used, state.held_until_ms, pools_counted)
         };
@@ -577,7 +600,7 @@ impl Budget {
             .arg(now)
             .arg(held_until_ms)
             .arg(counted)
-            .arg(pool_field(pool))
+            .arg(pool.to_string())
             .arg(MINUTE_KEY_TTL_MS);
         for (field, used) in pools_counted {
             invocation.arg(field).arg(used);
@@ -590,8 +613,9 @@ impl Budget {
             .await?;
         let Some(verdict) = Verdict::of_code(code) else {
             tracing::warn!(
-                "the budget script of {} answered the unknown verdict {code}, memory decides instead",
-                self.upstream.name()
+                upstream = self.upstream.name(),
+                code,
+                "the budget script answered an unknown verdict, memory decides instead"
             );
             return None;
         };
@@ -616,9 +640,9 @@ impl Budget {
             Ok(stored) => Some(stored),
             Err(error) => {
                 tracing::warn!(
-                    "Redis answered the readout of the {} budget with replies it cannot read, the readout uses \
-                     memory: {error}",
-                    self.upstream.name()
+                    upstream = self.upstream.name(),
+                    %error,
+                    "Redis answered the budget readout with replies the gateway cannot read, the readout uses memory"
                 );
                 None
             }
@@ -652,6 +676,7 @@ impl Budget {
             state.minute = minute;
             state.used = 0;
             state.withheld = 0;
+            state.told_spent = false;
             state.pools.clear();
         }
         state
@@ -922,12 +947,8 @@ fn pool_snapshot(pool: &Pool, counts: MinuteCounts) -> PoolSnapshot {
     }
 }
 
-fn pool_field(pool: &Pool) -> String {
-    format!("{}/{}", pool.consumer, pool.name)
-}
-
 fn day_field(pool: &Pool, name: &str) -> String {
-    format!("{}/{name}", pool_field(pool))
+    format!("{pool}/{name}")
 }
 
 fn parse_day_field(field: &str) -> Option<(Pool, &str)> {
