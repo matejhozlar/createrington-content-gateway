@@ -6,8 +6,11 @@ use utoipa::{
 
 use crate::{
     budget::{
-        self, BudgetSnapshot, CountSource, DayCounts, DayPoolSnapshot, DaySnapshot, PoolSnapshot,
-        UpstreamBudget,
+        DayCounts,
+        readout::{
+            self, BudgetSnapshot, CountSource, DayPoolSnapshot, DaySnapshot, PoolSnapshot,
+            UpstreamBudget,
+        },
     },
     curseforge,
     error::{ApiError, ErrorCode},
@@ -15,8 +18,12 @@ use crate::{
     modrinth::{self, VersionFilesRequest},
     resolve::{self, FileSource, ResolveRequest, Resolved, ResolvedFile},
     versions::{
-        self, JavaRuntime, Latest, Loader, LoaderVersion, LoaderVersions, MinecraftVersion,
-        MinecraftVersionDetails, MinecraftVersions, RuntimeManifest, VersionFilter, VersionType,
+        java::{self, JavaRuntime, RuntimeManifest},
+        loaders::{self, Loader, LoaderVersion, LoaderVersions},
+        minecraft::{
+            self, Latest, MinecraftVersion, MinecraftVersionDetails, MinecraftVersions,
+            VersionFilter, VersionType,
+        },
     },
 };
 
@@ -42,16 +49,16 @@ pub const API_VERSION: &str = "1";
     paths(
         health::healthz,
         document,
-        budget::readout,
+        readout::readout,
         curseforge::passthrough_get,
         curseforge::passthrough_post,
         modrinth::passthrough_get,
         modrinth::passthrough_post,
         resolve::resolve,
-        versions::minecraft_versions,
-        versions::minecraft_version,
-        versions::loader_versions,
-        versions::java_runtime,
+        minecraft::minecraft_versions,
+        minecraft::minecraft_version,
+        loaders::loader_versions,
+        java::java_runtime,
     ),
     components(schemas(
         Health,

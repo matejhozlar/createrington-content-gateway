@@ -170,7 +170,7 @@ impl Default for Timeouts {
 
 pub fn router(state: Arc<AppState>) -> Router {
     let authenticated = Router::new()
-        .route("/v1/budget", get(budget::readout))
+        .route("/v1/budget", get(budget::readout::readout))
         .route(
             "/v1/curseforge/{*path}",
             get(curseforge::passthrough_get).post(curseforge::passthrough_post),
@@ -180,16 +180,19 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(modrinth::passthrough_get).post(modrinth::passthrough_post),
         )
         .route("/v1/resolve", post(resolve::resolve))
-        .route("/v1/minecraft/versions", get(versions::minecraft_versions))
+        .route(
+            "/v1/minecraft/versions",
+            get(versions::minecraft::minecraft_versions),
+        )
         .route(
             "/v1/minecraft/versions/{id}",
-            get(versions::minecraft_version),
+            get(versions::minecraft::minecraft_version),
         )
         .route(
             "/v1/minecraft/loaders/{loader}/versions",
-            get(versions::loader_versions),
+            get(versions::loaders::loader_versions),
         )
-        .route("/v1/minecraft/java", get(versions::java_runtime))
+        .route("/v1/minecraft/java", get(versions::java::java_runtime))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::authenticate,
