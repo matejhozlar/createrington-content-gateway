@@ -34,6 +34,7 @@ pub enum ErrorCode {
     BudgetSpent,
     UpstreamHold,
     RequestTooLarge,
+    Internal,
 }
 
 /// The JSON error every route answers with: `{ code, message }`, plus `pool` and `retryAfterMs` on a refused call.
@@ -163,6 +164,14 @@ impl ApiError {
             StatusCode::NOT_FOUND,
             ErrorCode::UnknownRuntime,
             format!("Mojang ships no {what} for platform {platform:?}"),
+        )
+    }
+
+    pub fn internal() -> Self {
+        Self::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Internal,
+            "the gateway failed to finish this request, its log says why",
         )
     }
 
@@ -317,6 +326,19 @@ mod tests {
         assert_eq!(body["code"], "REQUEST_TOO_LARGE");
         assert_eq!(body["pool"], "jobs");
         assert!(body.get("retryAfterMs").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_request_the_gateway_failed_to_finish_is_its_own_fault() {
+        let (status, _, body) = parts(ApiError::internal()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            body,
+            json!({
+                "code": "INTERNAL",
+                "message": "the gateway failed to finish this request, its log says why",
+            })
+        );
     }
 
     #[tokio::test]

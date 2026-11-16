@@ -315,7 +315,8 @@ export interface components {
       | "UPSTREAM_UNREADABLE"
       | "BUDGET_SPENT"
       | "UPSTREAM_HOLD"
-      | "REQUEST_TOO_LARGE";
+      | "REQUEST_TOO_LARGE"
+      | "INTERNAL";
     /**
      * @description Where a file's download address comes from.
      * @enum {string}
@@ -643,6 +644,15 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
       /** @description CurseForge could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE` */
       502: {
         headers: {
@@ -737,6 +747,15 @@ export interface operations {
       };
       /** @description The batch needs more calls than a whole minute allows, `REQUEST_TOO_LARGE`; split it */
       413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
         headers: {
           [name: string]: unknown;
         };
@@ -854,6 +873,15 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
       /** @description Mojang could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE` */
       502: {
         headers: {
@@ -928,6 +956,15 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
       /** @description The loader's source could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE` */
       502: {
         headers: {
@@ -982,6 +1019,15 @@ export interface operations {
       };
       /** @description No valid consumer token */
       401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
         headers: {
           [name: string]: unknown;
         };
@@ -1051,6 +1097,15 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
       /** @description Mojang could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE` */
       502: {
         headers: {
@@ -1113,6 +1168,15 @@ export interface operations {
       };
       /** @description No valid consumer token */
       401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
         headers: {
           [name: string]: unknown;
         };
@@ -1214,6 +1278,15 @@ export interface operations {
       };
       /** @description The hashes need more calls than a whole minute allows, `REQUEST_TOO_LARGE`; split them */
       413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
         headers: {
           [name: string]: unknown;
         };
@@ -1326,6 +1399,15 @@ export interface operations {
       };
       /** @description The files need more CurseForge calls than a whole minute allows, `REQUEST_TOO_LARGE`; split them */
       413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
         headers: {
           [name: string]: unknown;
         };
