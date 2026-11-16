@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.1.8 (2026-11-16)
+
+- [add] Answer a path none of the gateway's routes serves with its JSON error, `404 UNKNOWN_ROUTE`, instead of an empty 404
+- [add] Log the events the gateway exists for as warn lines with their values as fields (`upstream`, `pool`, `wait_ms`, `limit`, `bytes`, `status`, `url`, `key`, `error`): a 429 starting a hold, a budget spent for the minute (once per minute), an answer over the size limit, a batch answer that cannot be split per id, a load that ended without an answer and a Redis cache entry that does not decode. Every existing log line follows the same shape, and a pool is written as `consumer/pool`
+- [fix] Answer a request whose load task died `500 INTERNAL`, documented on every route that loads, instead of `502 UPSTREAM_UNREACHABLE`, which blamed the upstream; a kept answer still stands in for it and the cause is logged once
+- [fix] Keep a Minecraft or loader version list only once it reads: a `200` that did not read was cached and answered `502` for its whole fresh time and then stood in as the stale copy. A kept list that does not read, such as one an older gateway left in Redis, now counts as no copy
+- [fix] Read the loader in any case in `loader=` of `GET /v1/minecraft/versions` as in the path, and answer `400 INVALID_QUERY` on `GET /v1/minecraft/loaders/{loader}/versions` for a query it cannot read (such as `minecraft` given twice) instead of ignoring it
+- [fix] Count a stale answer as a cache hit only when no call was made for it: a single CurseForge route counted a hit as well after its own failed call, which was already counted as that call
+- [fix] Keep a Redis outage inside a minute from admitting up to twice the minute's ceiling: the gateway counts every call it let through or refused, and the Redis budget takes that count, in total and per pool, as the least the minute has used
+- [fix] Keep a count that arrives after its minute ended from resetting the budget's current minute
+- [fix] Tell the request that met a CurseForge 429 the same wait as the requests after it, and report the budget's `source` as `unavailable` when either upstream's budget could not read Redis
+- [fix] Name a non-ASCII `X-Budget-Pool` in the `UNKNOWN_POOL` refusal instead of an empty pool name
+- [fix] Keep a CDN check of `POST /v1/resolve` running after the request that started it stops waiting, so its verdict is kept for the next request, and let concurrent requests for the same file share one HEAD instead of each sending its own
+- [fix] Trim every environment variable of surrounding whitespace and start every configuration error with the variable it is about: `CONTENT_GATEWAY_TOKEN` with surrounding whitespace no longer passes startup and then fails every request, a short `CONTENT_GATEWAY_TOKEN` gets its own error, and a token in `CONTENT_GATEWAY_CONSUMERS` that starts or ends with whitespace stops the gateway at startup since no request can send it
+- [security] Take at most 1000 different ids in the CurseForge batch routes (`POST mods`, `POST mods/files`, `POST fingerprints/432`, `POST fingerprints`) like `version_files` and `resolve`, answering `400 INVALID_BODY` for more
+- [refactor] Load single answers, batches, Modrinth hashes and version lists through one loader, split the budget, version lists and resolve into named modules and steps, and make every server module private so the compiler reports dead code
+- [chore] Share one CI across Gitea and GitHub through composite actions, run it on pushes to `dev` and `main` and weekly, build the Dockerfile in it, pin every action by commit with Renovate moving the pins, install uv from its checksummed release archive, and check versions, em dashes, documented variables and commit subjects in scripts
+- [chore] Run the Redis-backed tests as ignored without `CONTENT_GATEWAY_TEST_REDIS_URL` instead of letting them pass unrun, and cover the Modrinth, resolve and version list paths with tests that no longer race sleeps
+
 ## v0.1.7 (2026-11-15)
 
 - [add] Add `CONTENT_GATEWAY_USER_AGENT`, the one User-Agent the gateway sends to every host it calls: CurseForge's API and CDN, Modrinth, Mojang, NeoForge's Maven, Forge and Fabric's meta. Before, CurseForge's API and CDN always saw `content-gateway/<version>` while the rest saw `MODRINTH_USER_AGENT`. `MODRINTH_USER_AGENT` is still read when the new variable is unset, and the default stays `content-gateway/<version>`
