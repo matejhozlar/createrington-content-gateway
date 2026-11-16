@@ -1,0 +1,22 @@
+name: Setup uv
+description: Install the pinned uv with its official installer, the same way on Gitea and GitHub runners
+
+inputs:
+  version:
+    description: The uv version to install
+    # renovate: datasource=github-releases depName=astral-sh/uv
+    default: "0.13.7"
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      shell: bash
+      env:
+        UV_VERSION: ${{ inputs.version }}
+      run: |
+        install_dir="$HOME/.local/bin"
+        curl -LsSf --retry 3 "https://astral.sh/uv/$UV_VERSION/install.sh" \
+          | env UV_INSTALL_DIR="$install_dir" UV_NO_MODIFY_PATH=1 sh
+        echo "$install_dir" >> "$GITHUB_PATH"
+        "$install_dir/uv" --version

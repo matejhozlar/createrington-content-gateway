@@ -1,0 +1,17 @@
+name: Rust checks
+description: Check, lint and test the workspace, the Redis tests included. Runs after the setup-rust action, with CONTENT_GATEWAY_TEST_REDIS_URL naming the job's Redis.
+
+runs:
+  using: composite
+  steps:
+    - name: Check
+      shell: bash
+      run: cargo check --workspace --locked
+
+    - name: Lint
+      shell: bash
+      run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+    - name: Test
+      shell: bash
+      run: cargo test --workspace --locked -- --include-ignored

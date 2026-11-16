@@ -1,0 +1,73 @@
+name: Repository checks
+description: Formatting, the written rules (scripts/check-repo.mjs), commit subjects and the Python client's version on a pull request, and actionlint with shellcheck over the workflows. Runs after the setup action, on a checkout with the full history.
+
+inputs:
+  actionlint-version:
+    description: The actionlint version to install
+    # renovate: datasource=github-releases depName=rhysd/actionlint extractVersion=^v(?<version>.+)$
+    default: "1.7.12"
+  shellcheck-version:
+    description: The shellcheck version to install when the runner has none
+    # renovate: datasource=github-releases depName=koalaman/shellcheck extractVersion=^v(?<version>.+)$
+    default: "0.11.0"
+
+runs:
+  using: composite
+  steps:
+    - name: Check formatting
+      shell: bash
+      run: pnpm format:check
+
+    - name: Check the versions, em dashes and documented variables
+      shell: bash
+      run: pnpm check:repo
+
+    - name: Test the repository scripts
+      shell: bash
+      run: pnpm test:scripts
+
+    - name: Check the commit subjects
+      if: github.event_name == 'pull_request'
+      shell: bash
+      env:
+        BASE_REF: ${{ github.base_ref }}
+      run: node scripts/check-commits.mjs "origin/$BASE_REF"
+
+    - name: Check the Python client's version and changelog
+      shell: bash
+      env:
+        BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
+      run: node scripts/check-python-version.mjs ${BASE:+"$BASE"}
+
+    - name: Install actionlint and shellcheck
+      shell: bash
+      env:
+        ACTIONLINT_VERSION: ${{ inputs.actionlint-version }}
+        SHELLCHECK_VERSION: ${{ inputs.shellcheck-version }}
+      run: |
+        case "$(uname -m)" in
+          x86_64) arch=amd64 shellcheck_arch=x86_64 ;;
+          aarch64 | arm64) arch=arm64 shellcheck_arch=aarch64 ;;
+          *) echo "::error::No actionlint build for $(uname -m)"; exit 1 ;;
+        esac
+        bin="$RUNNER_TEMP/lint-tools"
+        mkdir -p "$bin"
+        cd "$RUNNER_TEMP"
+        archive="actionlint_${ACTIONLINT_VERSION}_linux_${arch}.tar.gz"
+        base="https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}"
+        curl -fsSL --retry 3 -O "$base/$archive" -O "$base/actionlint_${ACTIONLINT_VERSION}_checksums.txt"
+        grep -F " $archive" "actionlint_${ACTIONLINT_VERSION}_checksums.txt" | sha256sum -c -
+        tar -xzf "$archive" -C "$bin" actionlint
+        if ! command -v shellcheck > /dev/null; then
+          curl -fsSL --retry 3 "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.${shellcheck_arch}.tar.xz" \
+            | tar -xJ --strip-components=1 -C "$bin" "shellcheck-v${SHELLCHECK_VERSION}/shellcheck"
+        fi
+        echo "$bin" >> "$GITHUB_PATH"
+
+    - name: Lint the workflows and shell scripts
+      shell: bash
+      run: |
+        shellcheck --version
+        actionlint -version
+        actionlint .gitea/workflows/*.yml .github/workflows/*.yml
+        shellcheck .gitea/scripts/*.sh scripts/*.sh
