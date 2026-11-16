@@ -144,6 +144,18 @@ const javaRuntime = {
   manifest: { url: "https://example.com/manifest.json", sha1: "d", size: 1 },
 } satisfies JavaRuntime;
 
+/** An abort signal from another realm or a polyfill: the shape of `AbortSignal` without its prototype. */
+class ForeignSignal extends EventTarget {
+  aborted = false;
+  reason: unknown = undefined;
+
+  abort(reason: unknown): void {
+    this.aborted = true;
+    this.reason = reason;
+    this.dispatchEvent(new Event("abort"));
+  }
+}
+
 const budgetSpent = apiError(
   "BUDGET_SPENT",
   "the gateway has asked CurseForge enough this minute",
@@ -225,6 +237,37 @@ describe("the gateway's own routes", () => {
     setTimeout(() => controller.abort(new Error("done")), 20);
     const error = await failed(client().health({ signal: controller.signal }));
     expect(error.message).toBe("done");
+  });
+
+  it("stops when the caller aborts, with the signal itself", async () => {
+    gateway.reply(
+      { ...json(200, health), delayMs: 300 },
+      { ...json(200, minecraftVersion), delayMs: 300 },
+    );
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(new Error("done")), 20);
+    const calls = [
+      client().health(controller.signal),
+      client().minecraftVersion("1.21.1", controller.signal),
+    ];
+    for (const call of calls) {
+      expect((await failed(call)).message).toBe("done");
+    }
+  });
+
+  it("follows a signal that is not this realm's AbortSignal", async () => {
+    gateway.reply(
+      { ...json(200, health), delayMs: 300 },
+      { ...json(200, health), delayMs: 300 },
+    );
+    const foreign = new ForeignSignal();
+    setTimeout(() => foreign.abort(new Error("done")), 20);
+    const signal = foreign as unknown as AbortSignal;
+    expect(signal).not.toBeInstanceOf(AbortSignal);
+    const calls = [client().health(signal), client().health({ signal })];
+    for (const call of calls) {
+      expect((await failed(call)).message).toBe("done");
+    }
   });
 });
 

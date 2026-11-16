@@ -439,39 +439,44 @@ export class ContentGateway {
       body = JSON.stringify(options.body);
     }
     const deadline = Date.now() + (options.waitUpToMs ?? 0);
+    const caller = followSignal(options.signal);
 
-    for (;;) {
-      const response = await this.fetch(url, {
-        method: options.method,
-        headers,
-        body,
-        signal: attemptSignal(
-          options.timeoutMs ?? this.timeoutMs,
-          options.signal,
-        ),
-      });
-      const answer = await readBody(response);
-      if (response.headers.has(CACHE_HEADER) || response.ok) {
-        return { response, body: answer };
-      }
+    try {
+      for (;;) {
+        const response = await this.fetch(url, {
+          method: options.method,
+          headers,
+          body,
+          signal: attemptSignal(
+            options.timeoutMs ?? this.timeoutMs,
+            caller.signal,
+          ),
+        });
+        const answer = await readBody(response);
+        if (response.headers.has(CACHE_HEADER) || response.ok) {
+          return { response, body: answer };
+        }
 
-      const error = asApiError(answer);
-      const wait = retryAfterMs(response, error);
-      if (
-        response.status === 503 &&
-        wait !== null &&
-        Date.now() + wait <= deadline
-      ) {
-        await sleep(wait, options.signal);
-        continue;
+        const error = asApiError(answer);
+        const wait = retryAfterMs(response, error);
+        if (
+          response.status === 503 &&
+          wait !== null &&
+          Date.now() + wait <= deadline
+        ) {
+          await sleep(wait, caller.signal);
+          continue;
+        }
+        throw new ContentGatewayError(
+          response.status,
+          error,
+          `the gateway answered ${response.status} to ${options.method} ${options.path}` +
+            (typeof answer === "string" && answer !== "" ? `: ${answer}` : ""),
+          wait,
+        );
       }
-      throw new ContentGatewayError(
-        response.status,
-        error,
-        `the gateway answered ${response.status} to ${options.method} ${options.path}` +
-          (typeof answer === "string" && answer !== "" ? `: ${answer}` : ""),
-        wait,
-      );
+    } finally {
+      caller.stop();
     }
   }
 }
@@ -479,7 +484,25 @@ export class ContentGateway {
 function signalOf(
   options: RequestOptions | AbortSignal,
 ): AbortSignal | undefined {
-  return options instanceof AbortSignal ? options : options.signal;
+  return "aborted" in options ? options : options.signal;
+}
+
+function followSignal(signal: AbortSignal | undefined): {
+  signal: AbortSignal | undefined;
+  stop: () => void;
+} {
+  if (signal === undefined || signal instanceof AbortSignal) {
+    return { signal, stop: () => {} };
+  }
+  const foreign: EventTarget & Pick<AbortSignal, "aborted" | "reason"> = signal;
+  const controller = new AbortController();
+  const abort = (): void => controller.abort(foreign.reason);
+  if (foreign.aborted) abort();
+  else foreign.addEventListener("abort", abort, { once: true });
+  return {
+    signal: controller.signal,
+    stop: () => foreign.removeEventListener("abort", abort),
+  };
 }
 
 function fillPath(
