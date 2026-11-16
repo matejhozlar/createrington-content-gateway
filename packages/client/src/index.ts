@@ -3,6 +3,8 @@ export {
   ContentGatewayError,
   DEFAULT_TIMEOUT_MS,
   RESOLVE_TIMEOUT_MS,
+  type BudgetOptions,
+  type BudgetedOptions,
   type CacheStatus,
   type ContentGatewayOptions,
   type CurseForgeAnswer,
@@ -13,7 +15,9 @@ export {
   type MinecraftVersionsOptions,
   type ModrinthRequest,
   type PassthroughAnswer,
+  type PassthroughOptions,
   type Query,
+  type RequestOptions,
   type ResolveOptions,
 } from "./client.js";
 export type {
@@ -27,6 +31,8 @@ export type {
   FileSource,
   Health,
   JavaRuntime,
+  KnownErrorCode,
+  Latest,
   Loader,
   LoaderVersion,
   LoaderVersions,

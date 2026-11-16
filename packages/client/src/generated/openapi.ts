@@ -460,7 +460,7 @@ export interface components {
        *     Modrinth has a link. On unless set to false.
        * @default true
        */
-      cdn: boolean;
+      cdn?: boolean;
       /**
        * @description CurseForge file ids, up to 1000.
        * @example [
