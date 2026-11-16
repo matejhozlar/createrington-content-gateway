@@ -60,25 +60,25 @@ if counted > used then
   redis.call('HSET', KEYS[1], 'used', counted)
   used = counted
 end
-local verdict = {admitted}
+local verdict = {code_admitted}
 if calls > limit then
-  verdict = {too_large}
+  verdict = {code_too_large}
 elseif held > now then
-  verdict = {held}
+  verdict = {code_held}
 elseif used + calls > limit then
-  verdict = {spent}
+  verdict = {code_spent}
 end
 local count = 'used'
-if verdict ~= {admitted} then count = 'withheld' end
+if verdict ~= {code_admitted} then count = 'withheld' end
 redis.call('HINCRBY', KEYS[1], count, calls)
 redis.call('HINCRBY', KEYS[1], count .. ':' .. ARGV[6], calls)
 redis.call('PEXPIRE', KEYS[1], ARGV[7])
 return {{verdict, held}}
 ",
-        admitted = Verdict::Admitted.code(),
-        too_large = Verdict::TooLarge.code(),
-        held = Verdict::Held.code(),
-        spent = Verdict::Spent.code(),
+        code_admitted = Verdict::Admitted.code(),
+        code_too_large = Verdict::TooLarge.code(),
+        code_held = Verdict::Held.code(),
+        code_spent = Verdict::Spent.code(),
     )
 }
 
