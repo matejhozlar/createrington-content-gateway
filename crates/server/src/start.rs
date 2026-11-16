@@ -64,13 +64,13 @@ pub async fn run() -> ExitCode {
     let redis = match &config.redis_url {
         None => None,
         Some(url) => {
-            match RedisStore::open(url.as_str(), redis_store::DEFAULT_PREFIX, clock.clone()) {
+            match RedisStore::open(url.connection(), redis_store::DEFAULT_PREFIX, clock.clone()) {
                 Ok(store) => {
                     store.ping().await;
                     Some(Arc::new(store))
                 }
                 Err(error) => {
-                    tracing::error!("cannot use REDIS_URL: {error}");
+                    tracing::error!("cannot set up the connection to Redis: {error}");
                     return ExitCode::FAILURE;
                 }
             }

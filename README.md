@@ -53,7 +53,7 @@ Every process that calls the gateway is a consumer with its own bearer token (at
 
 Names and pools are 1 to 64 lowercase letters, digits and `-`, starting with a letter or digit. A request sends `Authorization: Bearer <token>`, and `X-Budget-Pool: <pool>` when its token has more than one pool. One ceiling per minute covers all pools; every pool is counted on its own.
 
-An empty value counts as unset. An invalid value stops the gateway at startup with a message saying what is wrong. `.env.example` lists every variable. The gateway does not read a `.env` file by itself: export the variables, or let `docker compose` or `docker run --env-file .env` pass the file.
+Values are trimmed of surrounding whitespace, and an empty value counts as unset. An invalid value stops the gateway at startup with a message that names the variable and says what is wrong. `.env.example` lists every variable. The gateway does not read a `.env` file by itself: export the variables, or let `docker compose` or `docker run --env-file .env` pass the file.
 
 Two more variables are read at build time, not at runtime. `/v1/healthz` reports them, and they are `null` when unset:
 
