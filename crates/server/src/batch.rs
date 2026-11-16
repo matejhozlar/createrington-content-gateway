@@ -561,6 +561,21 @@ mod tests {
         let got = post_json(&gateway.router, "/v1/curseforge/mods", &repeated).await;
         assert_eq!(got.status, StatusCode::OK);
         assert_eq!(mock.calls(), 1);
+
+        let fingerprints = many(1001).replace("modIds", "fingerprints");
+        for route in [
+            "/v1/curseforge/fingerprints",
+            "/v1/curseforge/fingerprints/432",
+        ] {
+            let got = post_json(&gateway.router, route, &fingerprints).await;
+            assert_eq!(got.status, StatusCode::BAD_REQUEST, "{route}");
+            assert_eq!(
+                got.json()["message"],
+                "the body must be a list of at most 1000 ids under `fingerprints`",
+                "{route}"
+            );
+        }
+        assert_eq!(mock.calls(), 1);
     }
 
     #[tokio::test]
