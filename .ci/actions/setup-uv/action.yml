@@ -1,0 +1,32 @@
+name: Setup uv
+description: Install the pinned uv from its release archive, checked against the release's SHA-256, the same way on Gitea and GitHub runners
+
+inputs:
+  version:
+    description: The uv version to install
+    # renovate: datasource=github-releases depName=astral-sh/uv
+    default: "0.13.7"
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      shell: bash
+      env:
+        UV_VERSION: ${{ inputs.version }}
+      run: |
+        case "$(uname -m)" in
+          x86_64) target=x86_64-unknown-linux-gnu ;;
+          aarch64 | arm64) target=aarch64-unknown-linux-gnu ;;
+          *) echo "::error::No uv build for $(uname -m)"; exit 1 ;;
+        esac
+        install_dir="$RUNNER_TEMP/uv"
+        mkdir -p "$install_dir"
+        cd "$RUNNER_TEMP"
+        archive="uv-$target.tar.gz"
+        base="https://github.com/astral-sh/uv/releases/download/$UV_VERSION"
+        curl -fsSL --retry 3 -O "$base/$archive" -O "$base/$archive.sha256"
+        sha256sum -c "$archive.sha256"
+        tar -xzf "$archive" --strip-components=1 -C "$install_dir" "uv-$target/uv" "uv-$target/uvx"
+        echo "$install_dir" >> "$GITHUB_PATH"
+        "$install_dir/uv" --version

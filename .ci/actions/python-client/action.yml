@@ -1,0 +1,29 @@
+name: Python client checks
+description: Lint, type check and test the Python client, then build it and import the built wheel in a fresh environment. Runs after the setup-uv action.
+
+inputs:
+  python-version:
+    description: The Python version to check on
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Check the Python client
+      shell: bash
+      working-directory: packages/python-client
+      env:
+        UV_PYTHON: ${{ inputs.python-version }}
+      run: |
+        uv sync --locked
+        uv run python scripts/generate.py --check
+        uv run ruff format --check .
+        uv run ruff check .
+        uv run mypy
+        uv run pytest
+
+    - name: Build the Python client and import the built wheel
+      shell: bash
+      env:
+        UV_PYTHON: ${{ inputs.python-version }}
+      run: bash scripts/check-python-wheel.sh

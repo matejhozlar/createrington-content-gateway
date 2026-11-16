@@ -233,7 +233,12 @@ A server release is the `vX.Y.Z` tag on the release merge into `main`. On GitHub
 
 ### Releasing the client
 
-The client package is versioned with [changesets](https://github.com/changesets/changesets), apart from the server. A change to `packages/client` comes with a changeset written on its branch (`pnpm changeset`); CI refuses a changed client without one. The release PR runs `pnpm version-packages`, which turns the changesets into the version bump and the package's `CHANGELOG.md` entry, and the merge into `main` publishes that version to the npm registry named by the `NPM_PUBLISH_REGISTRY` repository variable (`.gitea/workflows/publish-client.yml`, with the registry token in the `NPM_PUBLISH_TOKEN` secret). A version the registry already has is not published again, and a merge that still carries unconsumed changesets fails instead of publishing.
+The client package is versioned with [changesets](https://github.com/changesets/changesets), apart from the server. A change to `packages/client` comes with a changeset written on its branch (`pnpm changeset`); CI refuses a changed client without one. The release PR runs `pnpm version-packages`, which turns the changesets into the version bump and the package's `CHANGELOG.md` entry. The version that lands on `main` is published twice:
+
+- to [npmjs](https://www.npmjs.com/), by the `npm` job of `.github/workflows/release.yml` when the release tag reaches GitHub. It publishes with npm's [trusted publishing](https://docs.npmjs.com/trusted-publishers) and provenance, so no token is stored anywhere: the package's settings on npmjs name this repository and `release.yml` as its trusted publisher.
+- to the npm registry named by the `NPM_PUBLISH_REGISTRY` repository variable, by `.gitea/workflows/publish-client.yml` on the merge into `main`, with the registry token in the `NPM_PUBLISH_TOKEN` secret. A fork without a registry of its own deletes this workflow.
+
+Both check, build and test the client first, skip a version their registry already has, and fail instead of publishing while unconsumed changesets are left.
 
 ## Contributing
 

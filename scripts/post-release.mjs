@@ -2,29 +2,30 @@ import {
   checkout,
   fail,
   fetch,
-  git,
+  gitOrFail,
   requireCleanTree,
+  unpushed,
   update,
 } from "./git.mjs";
-
-function run(args, message) {
-  try {
-    const output = git(args);
-    if (output) console.log(output);
-  } catch {
-    fail(`${message}, see git's message above.`);
-  }
-}
 
 requireCleanTree();
 
 fetch();
 for (const branch of ["main", "dev"]) {
   checkout(branch);
+  const ahead = unpushed(branch);
+  if (ahead) {
+    fail(
+      `${branch} has ${ahead} commit(s) that are not on origin. Push them or drop them, then run this again.`,
+    );
+  }
   update(branch);
 }
-run(
+gitOrFail(
   ["merge", "--no-edit", "main"],
   "Could not merge main into dev. Resolve the conflicts, commit, then run: git push origin dev",
 );
-run(["push", "origin", "dev"], "Could not push dev");
+gitOrFail(
+  ["push", "origin", "dev"],
+  "Could not push dev, see git's message above.",
+);
