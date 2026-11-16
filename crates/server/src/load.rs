@@ -321,7 +321,8 @@ pub fn distinct<T: Eq + Hash + Clone>(
     Some(kept)
 }
 
-fn spawn_load(load: impl Future<Output = ()> + Send + 'static, key: String, keys: usize) {
+/// Runs `load` detached, so a load others joined finishes whoever stops waiting, and logs it once when it dies.
+pub fn spawn_load(load: impl Future<Output = ()> + Send + 'static, key: String, keys: usize) {
     let running = tokio::spawn(load);
     tokio::spawn(async move {
         if let Err(error) = running.await {

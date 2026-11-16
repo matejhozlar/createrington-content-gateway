@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::sync::Semaphore;
 use utoipa::ToSchema;
 
 use crate::{
@@ -21,7 +21,7 @@ use crate::{
     load,
     modrinth::VersionFiles,
     passthrough,
-    upstream::{Source, UpstreamFailure},
+    upstream::Source,
 };
 
 pub const CURSEFORGE_CDN: &str = "https://mediafilez.forgecdn.net";
@@ -513,7 +513,6 @@ async fn cdn_links(
     let now = state.clock.now_ms();
     let kept = state.cache.lookup_many(&keys, now).await;
     let at_once = Arc::new(Semaphore::new(CDN_AT_ONCE));
-    let mut checks = JoinSet::new();
     let mut waits = Vec::new();
     for ((file, key), kept) in candidates.into_iter().zip(keys).zip(kept) {
         if let Some(entry) = kept.filter(|entry| !forced && entry.is_fresh(now)) {
@@ -524,22 +523,31 @@ async fn cdn_links(
         let load_key = load_key(key.clone(), forced);
         let (waiting, finisher) = state.cache.join(&load_key);
         if let Some(finisher) = finisher {
-            let (state, at_once) = (state.clone(), at_once.clone());
-            checks.spawn(async move {
-                let _slot = at_once.acquire().await;
-                let verdict = head(&state, &file).await;
-                let loaded = match verdict.entry(state.clock.now_ms()) {
-                    Some(entry) => {
-                        let entry = Arc::new(entry);
-                        state.cache.insert(&key, entry.clone());
-                        Ok(entry)
-                    }
-                    None => Err(LoadFailure::Upstream(UpstreamFailure::Unreachable)),
-                };
-                state
+            let (state, at_once, checked) = (state.clone(), at_once.clone(), key.clone());
+            let check = async move {
+                let now = state.clock.now_ms();
+                let kept = state
                     .cache
-                    .finish(&load_key, finisher, Outcome::called(loaded));
-            });
+                    .get(&key)
+                    .filter(|entry| !forced && entry.is_fresh(now));
+                let outcome = match kept {
+                    Some(entry) => Outcome::not_called(Ok(entry)),
+                    None => {
+                        let _slot = at_once.acquire().await;
+                        let verdict = head(&state, &file).await;
+                        Outcome::called(match verdict.entry(state.clock.now_ms()) {
+                            Some(entry) => {
+                                let entry = Arc::new(entry);
+                                state.cache.insert(&key, entry.clone());
+                                Ok(entry)
+                            }
+                            None => Err(LoadFailure::Lost),
+                        })
+                    }
+                };
+                state.cache.finish(&load_key, finisher, outcome);
+            };
+            load::spawn_load(check, checked, 1);
         }
         waits.push((file_id, waiting));
     }
@@ -997,6 +1005,38 @@ mod tests {
             assert_eq!(CdnVerdict::kept(&entry), verdict);
         }
         assert!(CdnVerdict::Unknown.entry(NOV_3_2026_20H).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_check_outlives_the_request_that_started_it_and_is_kept_for_the_retry() {
+        let (mock, gate) = Mock::held_when(
+            |seen| seen.method == "HEAD",
+            only_on_the_cdn(cdn_reply(200, "30")),
+        )
+        .await;
+        let gateway = gateway_with(
+            &mock,
+            GatewayWith {
+                timeouts: Timeouts {
+                    cdn_wait: Duration::from_millis(50),
+                    ..Timeouts::default()
+                },
+                ..GatewayWith::default()
+            },
+        );
+        let gave_up = resolve(&gateway, r#"{"fileIds":[1003]}"#).await;
+        assert_eq!(gave_up.json()["files"][0]["retry"], true);
+
+        gate.open();
+        until("the check to finish", || {
+            gateway.state.cache.loads_running() == 0
+        })
+        .await;
+        let retried = resolve(&gateway, r#"{"fileIds":[1003]}"#).await;
+        let file = &retried.json()["files"][0];
+        assert_eq!(file["source"], "curseforge-cdn");
+        assert_eq!(file["retry"], false);
+        assert_eq!(heads(&mock), 1);
     }
 
     #[tokio::test]
