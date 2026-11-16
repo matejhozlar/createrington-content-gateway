@@ -61,9 +61,7 @@ impl RedisStore {
         F: FnOnce(ConnectionManager) -> Fut,
         Fut: Future<Output = RedisResult<T>>,
     {
-        if let Link::Down { until_ms } = *self.link()
-            && self.clock.now_ms() < until_ms
-        {
+        if self.paused() {
             return None;
         }
         self.run_even_if_paused(operation).await
@@ -97,6 +95,14 @@ impl RedisStore {
             redis::cmd("PING").query_async::<()>(&mut connection).await
         })
         .await;
+    }
+
+    fn paused(&self) -> bool {
+        let Link::Down { until_ms } = *self.link() else {
+            return false;
+        };
+        let now = self.clock.now_ms();
+        now < until_ms && until_ms <= now.saturating_add(PAUSE_AFTER_FAILURE_MS)
     }
 
     fn link(&self) -> MutexGuard<'_, Link> {
@@ -182,6 +188,16 @@ mod tests {
         assert_eq!(answer(&store).await, (None, false));
 
         clock.advance(1);
+        assert_eq!(answer(&store).await, (Some(7), true));
+        assert_eq!(*store.link(), Link::Up);
+    }
+
+    #[tokio::test]
+    async fn a_clock_stepped_back_does_not_stretch_the_pause() {
+        let store = store(&TestClock::at(NOV_3_2026_20H));
+        *store.link() = Link::Down {
+            until_ms: NOV_3_2026_20H + 5_001,
+        };
         assert_eq!(answer(&store).await, (Some(7), true));
         assert_eq!(*store.link(), Link::Up);
     }
