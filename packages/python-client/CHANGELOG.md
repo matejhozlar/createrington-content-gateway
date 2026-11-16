@@ -1,5 +1,19 @@
 # content-gateway-client
 
+## 0.3.0
+
+`ContentGatewayError.retry_after` gives `retry_after_ms` in seconds, the unit of `timeout` and `wait_up_to`.
+
+`java_runtime` has two overloads, so a type checker refuses a call with neither or both of `major` and `component`; the run-time check stays.
+
+New exports: `ResolveRequest` and `VersionFilesRequest`, the bodies `resolve` and `modrinth_version_files` send, and `BudgetSource`, the TypeScript client's name for the budget's `Source`, which stays exported too.
+
+The package ships its licence file, the README links the repository instead of a relative path that is dead on PyPI, and the classifiers name every supported Python minor, 3.11 to 3.14.
+
+New error code `UNKNOWN_ROUTE`: the gateway now answers a path none of its routes serves with its JSON error, `404 UNKNOWN_ROUTE`, instead of an empty 404.
+
+New error code `INTERNAL`: a request the gateway failed to finish, such as one whose load task died, answers `500 INTERNAL` instead of `502 UPSTREAM_UNREACHABLE`, which blamed the upstream.
+
 ## 0.2.1
 
 The gateway's own routes (`health`, `budget`, `resolve` and the version lists) raise `ContentGatewayError` on any answer that is not the gateway's JSON object instead of returning it typed as their result: a page from something else at the base URL, an empty success, or CurseForge's own failure that `resolve` passes on with its status. A raised error's `retry_after_ms` falls back to `Retry-After` when the body carries none, and an `X-Cache` value the gateway does not send is named as such instead of reported as a missing header.

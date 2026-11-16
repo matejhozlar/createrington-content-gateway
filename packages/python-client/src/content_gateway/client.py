@@ -6,7 +6,7 @@ import re
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, cast
+from typing import Any, Literal, cast, overload
 from urllib.parse import quote, urlencode, urlsplit
 
 import httpx
@@ -22,6 +22,8 @@ from .generated import (
     MinecraftVersionDetails,
     MinecraftVersions,
     Resolved,
+    ResolveRequest,
+    VersionFilesRequest,
     VersionFilter,
 )
 
@@ -83,6 +85,11 @@ class ContentGatewayError(Exception):
         self.pool = error.get("pool") if error is not None else None
         from_body = error.get("retryAfterMs") if error is not None else None
         self.retry_after_ms = from_body if from_body is not None else retry_after_ms
+
+    @property
+    def retry_after(self) -> float | None:
+        """`retry_after_ms` in seconds, the unit of `timeout` and `wait_up_to`."""
+        return None if self.retry_after_ms is None else self.retry_after_ms / 1000
 
     def __str__(self) -> str:
         return self.message
@@ -208,6 +215,41 @@ class _Gateway:
         )
 
     @staticmethod
+    def _health_request() -> _Request:
+        return _Request("GET", "/v1/healthz", authenticated=False)
+
+    @classmethod
+    def _modrinth_version_file_request(
+        cls, sha1: str, *, pool: str | None, fresh: bool, wait_up_to: float | None
+    ) -> _Request:
+        return cls._passthrough_request(
+            "modrinth",
+            f"version_file/{quote(sha1, safe='')}",
+            query=None,
+            body=None,
+            method=None,
+            pool=pool,
+            fresh=fresh,
+            wait_up_to=wait_up_to,
+        )
+
+    @classmethod
+    def _modrinth_version_files_request(
+        cls, hashes: Sequence[str], *, pool: str | None, fresh: bool, wait_up_to: float | None
+    ) -> _Request:
+        body: VersionFilesRequest = {"hashes": list(hashes), "algorithm": "sha1"}
+        return cls._passthrough_request(
+            "modrinth",
+            "version_files",
+            query=None,
+            body=body,
+            method=None,
+            pool=pool,
+            fresh=fresh,
+            wait_up_to=wait_up_to,
+        )
+
+    @staticmethod
     def _budget_request(days: int | None) -> _Request:
         return _Request("GET", "/v1/budget", query=None if days is None else {"days": days})
 
@@ -221,7 +263,7 @@ class _Gateway:
         wait_up_to: float | None,
         timeout: float,
     ) -> _Request:
-        body: dict[str, Any] = {"fileIds": list(file_ids)}
+        body: ResolveRequest = {"fileIds": list(file_ids)}
         if cdn is not None:
             body["cdn"] = cdn
         return _Request(
@@ -288,7 +330,7 @@ class ContentGateway(_Gateway):
 
     def health(self) -> Health:
         """`GET /v1/healthz`, which needs no token."""
-        return cast(Health, self._own(_Request("GET", "/v1/healthz", authenticated=False)))
+        return cast(Health, self._own(self._health_request()))
 
     def budget(self, *, days: int | None = None) -> BudgetSnapshot:
         """`GET /v1/budget`: this minute's calls, the 429 hold and the daily counts of the last `days` UTC days."""
@@ -353,9 +395,10 @@ class ContentGateway(_Gateway):
         wait_up_to: float | None = None,
     ) -> PassthroughAnswer:
         """`GET /v1/modrinth/version_file/<sha1>`: the version Modrinth lists the file under, or a 404."""
-        return self.modrinth(
-            f"version_file/{quote(sha1, safe='')}", pool=pool, fresh=fresh, wait_up_to=wait_up_to
+        request = self._modrinth_version_file_request(
+            sha1, pool=pool, fresh=fresh, wait_up_to=wait_up_to
         )
+        return self._passthrough(request)
 
     def modrinth_version_files(
         self,
@@ -366,13 +409,10 @@ class ContentGateway(_Gateway):
         wait_up_to: float | None = None,
     ) -> PassthroughAnswer:
         """`POST /v1/modrinth/version_files`: the versions Modrinth lists these SHA-1s under, keyed by lowercase hash."""
-        return self.modrinth(
-            "version_files",
-            body={"hashes": list(hashes), "algorithm": "sha1"},
-            pool=pool,
-            fresh=fresh,
-            wait_up_to=wait_up_to,
+        request = self._modrinth_version_files_request(
+            hashes, pool=pool, fresh=fresh, wait_up_to=wait_up_to
         )
+        return self._passthrough(request)
 
     def resolve(
         self,
@@ -403,6 +443,12 @@ class ContentGateway(_Gateway):
     def loader_versions(self, loader: Loader, *, minecraft: str | None = None) -> LoaderVersions:
         """`GET /v1/minecraft/loaders/<loader>/versions`: a loader's builds, newest first."""
         return cast(LoaderVersions, self._own(self._loader_versions_request(loader, minecraft)))
+
+    @overload
+    def java_runtime(self, platform: str, *, major: int, component: None = None) -> JavaRuntime: ...
+
+    @overload
+    def java_runtime(self, platform: str, *, major: None = None, component: str) -> JavaRuntime: ...
 
     def java_runtime(
         self, platform: str, *, major: int | None = None, component: str | None = None
@@ -462,7 +508,7 @@ class AsyncContentGateway(_Gateway):
 
     async def health(self) -> Health:
         """`GET /v1/healthz`, which needs no token."""
-        return cast(Health, await self._own(_Request("GET", "/v1/healthz", authenticated=False)))
+        return cast(Health, await self._own(self._health_request()))
 
     async def budget(self, *, days: int | None = None) -> BudgetSnapshot:
         """`GET /v1/budget`: this minute's calls, the 429 hold and the daily counts of the last `days` UTC days."""
@@ -527,9 +573,10 @@ class AsyncContentGateway(_Gateway):
         wait_up_to: float | None = None,
     ) -> PassthroughAnswer:
         """`GET /v1/modrinth/version_file/<sha1>`: the version Modrinth lists the file under, or a 404."""
-        return await self.modrinth(
-            f"version_file/{quote(sha1, safe='')}", pool=pool, fresh=fresh, wait_up_to=wait_up_to
+        request = self._modrinth_version_file_request(
+            sha1, pool=pool, fresh=fresh, wait_up_to=wait_up_to
         )
+        return await self._passthrough(request)
 
     async def modrinth_version_files(
         self,
@@ -540,13 +587,10 @@ class AsyncContentGateway(_Gateway):
         wait_up_to: float | None = None,
     ) -> PassthroughAnswer:
         """`POST /v1/modrinth/version_files`: the versions Modrinth lists these SHA-1s under, keyed by lowercase hash."""
-        return await self.modrinth(
-            "version_files",
-            body={"hashes": list(hashes), "algorithm": "sha1"},
-            pool=pool,
-            fresh=fresh,
-            wait_up_to=wait_up_to,
+        request = self._modrinth_version_files_request(
+            hashes, pool=pool, fresh=fresh, wait_up_to=wait_up_to
         )
+        return await self._passthrough(request)
 
     async def resolve(
         self,
@@ -582,6 +626,16 @@ class AsyncContentGateway(_Gateway):
         """`GET /v1/minecraft/loaders/<loader>/versions`: a loader's builds, newest first."""
         request = self._loader_versions_request(loader, minecraft)
         return cast(LoaderVersions, await self._own(request))
+
+    @overload
+    async def java_runtime(
+        self, platform: str, *, major: int, component: None = None
+    ) -> JavaRuntime: ...
+
+    @overload
+    async def java_runtime(
+        self, platform: str, *, major: None = None, component: str
+    ) -> JavaRuntime: ...
 
     async def java_runtime(
         self, platform: str, *, major: int | None = None, component: str | None = None

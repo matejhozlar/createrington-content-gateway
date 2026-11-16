@@ -1,9 +1,10 @@
 [project]
 name = "content-gateway-client"
-version = "0.2.1"
+version = "0.3.0"
 description = "Typed client for content-gateway: the gateway's own routes from its OpenAPI document and the CurseForge and Modrinth passthroughs with the budget's refusals handled."
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = ["httpx>=0.28,<1"]
 keywords = ["curseforge", "modrinth", "minecraft", "api-client"]
@@ -13,6 +14,10 @@ classifiers = [
   "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Games/Entertainment",
   "Topic :: Software Development :: Libraries",
   "Typing :: Typed",
@@ -30,11 +35,10 @@ build-backend = "hatchling.build"
 packages = ["src/content_gateway"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/content_gateway", "README.md", "CHANGELOG.md"]
+include = ["src/content_gateway", "README.md", "CHANGELOG.md", "LICENSE"]
 
 [dependency-groups]
 dev = [
-  "anyio>=4.12",
   "datamodel-code-generator>=0.89",
   "mypy>=2.4",
   "pytest>=9.2",

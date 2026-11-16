@@ -1,0 +1,48 @@
+name: Client checks
+description: Check, build and test the TypeScript client, then load the built package. Runs after the setup action.
+
+inputs:
+  node-version:
+    description: The Node major version the tests and the built package run on. The tooling before them runs on the setup action's Node.
+    default: "24"
+
+runs:
+  using: composite
+  steps:
+    - name: Require a changeset for a changed client
+      if: github.event_name == 'pull_request'
+      shell: bash
+      env:
+        BASE_REF: ${{ github.base_ref }}
+      run: pnpm changeset:check "origin/$BASE_REF"
+
+    - name: Check the generated types against openapi.json
+      shell: bash
+      run: pnpm --filter @createrington/content-gateway-client generate:check
+
+    - name: Type check
+      shell: bash
+      run: pnpm --filter @createrington/content-gateway-client typecheck
+
+    - name: Build
+      shell: bash
+      run: pnpm --filter @createrington/content-gateway-client build
+
+    - name: Setup the Node the client runs on
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Test
+      shell: bash
+      working-directory: packages/client
+      env:
+        NODE_MAJOR: ${{ inputs.node-version }}
+      run: |
+        node -e 'if (process.versions.node.split(".")[0] !== process.env.NODE_MAJOR) { console.error(`Expected Node ${process.env.NODE_MAJOR}, found ${process.version}`); process.exit(1); }'
+        ./node_modules/.bin/vitest run
+
+    - name: Load the package in Node
+      shell: bash
+      working-directory: packages/client
+      run: node --input-type=module -e "const { ContentGateway } = await import('@createrington/content-gateway-client'); if (typeof ContentGateway !== 'function') process.exit(1)"

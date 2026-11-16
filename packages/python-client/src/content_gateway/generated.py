@@ -35,6 +35,7 @@ ErrorCode: TypeAlias = Literal[
     "UNKNOWN_VERSION",
     "UNKNOWN_LOADER",
     "UNKNOWN_RUNTIME",
+    "UNKNOWN_ROUTE",
     "UPSTREAM_TIMEOUT",
     "UPSTREAM_UNREACHABLE",
     "UPSTREAM_TOO_LARGE",
@@ -42,6 +43,7 @@ ErrorCode: TypeAlias = Literal[
     "BUDGET_SPENT",
     "UPSTREAM_HOLD",
     "REQUEST_TOO_LARGE",
+    "INTERNAL",
 ]
 
 

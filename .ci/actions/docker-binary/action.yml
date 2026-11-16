@@ -1,0 +1,21 @@
+name: Build the static binary with Docker
+description: Build the Dockerfile's binary stage into build/content-gateway, installing the docker CLI with BuildKit when the job has none
+
+runs:
+  using: composite
+  steps:
+    - name: Ensure the docker CLI with BuildKit
+      shell: bash
+      run: |
+        if ! command -v docker >/dev/null 2>&1; then
+          if command -v sudo >/dev/null 2>&1; then SUDO=sudo; else SUDO=; fi
+          $SUDO apt-get update
+          $SUDO apt-get install -y --no-install-recommends docker.io docker-buildx
+        fi
+        docker buildx version
+
+    - name: Build the binary stage
+      shell: bash
+      run: |
+        docker build --target binary --output type=local,dest=build .
+        test -x build/content-gateway

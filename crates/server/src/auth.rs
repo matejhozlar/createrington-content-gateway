@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 
 use axum::{
     extract::{FromRequestParts, Request, State},
@@ -10,13 +10,12 @@ use subtle::ConstantTimeEq;
 
 use crate::{app::AppState, config::Consumer, error::ApiError};
 
-pub const POOL_HEADER: &str = "x-budget-pool";
+const POOL_HEADER: &str = "x-budget-pool";
 
-/// The consumer a request authenticated as, put into the request's extensions by `authenticate`.
 #[derive(Debug, Clone)]
-pub struct Caller {
-    pub consumer: Arc<str>,
-    pub pools: Arc<[Arc<str>]>,
+struct Caller {
+    consumer: Arc<str>,
+    pools: Arc<[Arc<str>]>,
 }
 
 impl From<&Consumer> for Caller {
@@ -33,10 +32,16 @@ impl From<&Consumer> for Caller {
 }
 
 /// The budget pool a request draws from: the `X-Budget-Pool` header, or the token's only pool when it has one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Pool {
     pub consumer: Arc<str>,
     pub name: Arc<str>,
+}
+
+impl fmt::Display for Pool {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}/{}", self.consumer, self.name)
+    }
 }
 
 pub async fn authenticate(
@@ -70,13 +75,13 @@ impl<S: Send + Sync> FromRequestParts<S> for Pool {
                 pools => return Err(ApiError::pool_required(pools)),
             },
             Some(value) => {
-                let requested = value.to_str().unwrap_or_default();
+                let requested = String::from_utf8_lossy(value.as_bytes());
                 caller
                     .pools
                     .iter()
                     .find(|pool| pool.as_ref() == requested)
                     .cloned()
-                    .ok_or_else(|| ApiError::unknown_pool(requested, &caller.pools))?
+                    .ok_or_else(|| ApiError::unknown_pool(&requested, &caller.pools))?
             }
         };
         Ok(Self {
@@ -107,32 +112,21 @@ mod tests {
     use axum::{
         Router,
         body::Body,
-        http::{Request, StatusCode},
+        http::{HeaderValue, Request, StatusCode},
         middleware,
         routing::get,
     };
-    use http_body_util::BodyExt;
     use serde_json::Value;
-    use tower::ServiceExt;
 
     use super::*;
-    use crate::{app::test_state, config::Token};
+    use crate::test_support::{TOKEN as APP_TOKEN, call as call_router, consumer, test_state};
 
-    const APP_TOKEN: &str = "app-token-0123456789abcdef0123456789";
     const SANDBOX_TOKEN: &str = "sandbox-token-0123456789abcdef012345";
 
     fn router() -> Router {
         let state = test_state(vec![
-            Consumer {
-                name: "app".to_owned(),
-                token: Token::new(APP_TOKEN),
-                pools: vec!["launcher".to_owned(), "app".to_owned()],
-            },
-            Consumer {
-                name: "sandbox".to_owned(),
-                token: Token::new(SANDBOX_TOKEN),
-                pools: vec!["jobs".to_owned()],
-            },
+            consumer("app", APP_TOKEN, &["launcher", "app"]),
+            consumer("sandbox", SANDBOX_TOKEN, &["jobs"]),
         ]);
         Router::new()
             .route(
@@ -148,13 +142,8 @@ mod tests {
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
-        let response = router()
-            .oneshot(request.body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        let status = response.status();
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        (status, String::from_utf8(body.to_vec()).unwrap())
+        let got = call_router(&router(), request.body(Body::empty()).unwrap()).await;
+        (got.status, got.text())
     }
 
     fn code(body: &str) -> String {
@@ -203,6 +192,24 @@ mod tests {
             call(&[("authorization", &bearer), ("x-budget-pool", "launcher")]).await,
             (StatusCode::OK, "app/launcher".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn a_pool_name_that_is_not_ascii_is_named_in_the_refusal() {
+        let bearer = format!("Bearer {APP_TOKEN}");
+        let request = Request::get("/pool")
+            .header("authorization", &bearer)
+            .header(
+                "x-budget-pool",
+                HeaderValue::from_bytes("launcher\u{e9}".as_bytes()).unwrap(),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let got = call_router(&router(), request).await;
+        assert_eq!(got.status, StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_str(&got.text()).unwrap();
+        assert_eq!(body["code"], "UNKNOWN_POOL");
+        assert_eq!(body["pool"], "launcher\u{e9}");
     }
 
     #[tokio::test]

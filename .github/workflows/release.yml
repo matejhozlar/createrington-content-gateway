@@ -22,6 +22,7 @@ jobs:
   check:
     if: github.server_url == 'https://github.com'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       released: ${{ steps.released.outputs.released }}
       tag: ${{ steps.release.outputs.tag }}
@@ -124,6 +125,7 @@ jobs:
             platform: linux/arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -203,6 +205,7 @@ jobs:
       contents: read
       packages: write
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -235,9 +238,12 @@ jobs:
           IMAGE: ${{ needs.check.outputs.image }}
           VERSION: ${{ needs.check.outputs.version }}
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf "$IMAGE@sha256:%s " *)
+          mapfile -t tags < <(jq -r '.tags[] | "-t", .' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          sources=()
+          for digest in *; do
+            sources+=("$IMAGE@sha256:$digest")
+          done
+          docker buildx imagetools create "${tags[@]}" "${sources[@]}"
           docker buildx imagetools inspect "$IMAGE:$VERSION"
 
   release:
@@ -246,6 +252,7 @@ jobs:
     permissions:
       contents: write
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -269,7 +276,7 @@ jobs:
           sha256sum content-gateway-* openapi.json > SHA256SUMS
           cat SHA256SUMS
 
-      - uses: softprops/action-gh-release@28ab305d0ffa26d60ec4bd614126329e26c7a0ec # v3.0.4
+      - uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           tag_name: ${{ needs.check.outputs.tag }}
           target_commitish: ${{ needs.check.outputs.commit }}
@@ -285,21 +292,70 @@ jobs:
       contents: read
       id-token: write
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.check.outputs.commit }}
 
-      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
-        with:
-          version: "0.13.7"
+      - name: Setup uv
+        uses: ./.ci/actions/setup-uv
 
-      - name: Build the Python client
-        working-directory: packages/python-client
-        run: uv build
+      - name: Build the Python client and import the built wheel
+        run: bash scripts/check-python-wheel.sh
 
+      # A Docker action that runs the image tagged with the ref it is called by, so it stays on its release tag.
       - name: Publish the version PyPI does not have yet
         uses: pypa/gh-action-pypi-publish@v1.14.3
         with:
           packages-dir: packages/python-client/dist
           skip-existing: true
+
+  npm:
+    if: github.server_url == 'https://github.com' && needs.check.outputs.released != 'true'
+    needs: [check, release]
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      HUSKY: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.check.outputs.commit }}
+
+      - name: Setup
+        uses: ./.ci/actions/setup
+
+      - name: Refuse to publish with changesets left unconsumed
+        run: node scripts/check-pending-changesets.mjs
+
+      - name: Client checks
+        uses: ./.ci/actions/client
+
+      - name: Publish the version npmjs does not have yet
+        working-directory: packages/client
+        env:
+          NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          if published=$(npm view "$name@$version" version 2>&1); then
+            if [ "$published" = "$version" ]; then
+              echo "$name@$version is already on npmjs"
+              exit 0
+            fi
+          elif ! grep -q E404 <<< "$published"; then
+            echo "::error::Could not ask npmjs for $name@$version: $published"
+            exit 1
+          fi
+          npm_version=$(npm --version)
+          case "$npm_version" in
+            [0-9].* | 10.* | 11.[0-4].* | 11.5.0)
+              echo "::error::npm $npm_version cannot publish by trusted publishing, it needs 11.5.1 or newer"
+              exit 1
+              ;;
+          esac
+          npm publish --provenance --access public

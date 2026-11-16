@@ -1,0 +1,30 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigestsToSemver"],
+  "baseBranchPatterns": ["dev"],
+  "enabledManagers": ["github-actions", "docker-compose", "custom.regex"],
+  "packageRules": [
+    {
+      "description": "A Docker action that runs the image tagged with the ref it is called by, so it stays on its release tag",
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["pypa/gh-action-pypi-publish"],
+      "pinDigests": false
+    },
+    {
+      "description": "One Redis for the CI jobs and compose.yaml",
+      "matchDatasources": ["docker"],
+      "matchPackageNames": ["redis"],
+      "groupName": "redis image"
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Tool versions in the composite actions, marked with a renovate comment above them",
+      "managerFilePatterns": ["/^\\.ci/actions/.+/action\\.ya?ml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s+default: \"(?<currentValue>[^\"]+)\""
+      ]
+    }
+  ]
+}

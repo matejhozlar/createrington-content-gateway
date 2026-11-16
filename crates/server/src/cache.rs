@@ -13,7 +13,7 @@ use tokio::sync::watch;
 
 use crate::redis_store::RedisStore;
 
-pub const STALE_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+const STALE_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_BYTES: u64 = 256 * 1024 * 1024;
 const FORMAT: u8 = 1;
 
@@ -23,6 +23,55 @@ pub struct Answer {
     pub status: StatusCode,
     pub content_type: Option<HeaderValue>,
     pub body: Bytes,
+}
+
+impl Answer {
+    /// A 404 without a body, as CurseForge and Modrinth answer for something they do not know.
+    pub fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            content_type: None,
+            body: Bytes::new(),
+        }
+    }
+
+    /// A 200 with a JSON body.
+    pub fn json(body: impl Into<Bytes>) -> Self {
+        Self {
+            status: StatusCode::OK,
+            content_type: Some(HeaderValue::from_static("application/json; charset=utf-8")),
+            body: body.into(),
+        }
+    }
+}
+
+/// Where an answer came from, sent as `X-Cache`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheStatus {
+    Hit,
+    Miss,
+    Stale,
+}
+
+impl CacheStatus {
+    /// `stale` when a kept answer stood in for a failure, else `miss` when the upstream was called, else `hit`.
+    pub fn of(stale: bool, called: bool) -> Self {
+        if stale {
+            Self::Stale
+        } else if called {
+            Self::Miss
+        } else {
+            Self::Hit
+        }
+    }
+
+    pub fn header(self) -> HeaderValue {
+        HeaderValue::from_static(match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Stale => "stale",
+        })
+    }
 }
 
 /// A cached answer with its fresh and stale times in milliseconds since the Unix epoch; a fingerprint entry is
@@ -54,8 +103,14 @@ impl Entry {
         self.fresh_until_ms > now_ms
     }
 
-    pub fn is_stale(&self, now_ms: u64) -> bool {
+    /// Whether the entry may still be given in place of an answer the upstream could not give.
+    pub fn can_stand_in(&self, now_ms: u64) -> bool {
         self.stale_until_ms > now_ms
+    }
+
+    /// Whether a per-id entry can go into a joined answer: it has its row, or it is a kept 404.
+    pub fn fits_a_batch(&self) -> bool {
+        self.answer.status == StatusCode::NOT_FOUND || self.row.is_some()
     }
 }
 
@@ -64,10 +119,11 @@ pub struct AnswerCache {
     entries: Cache<String, Kept>,
     loading: Mutex<HashMap<String, Waiting>>,
     redis: Option<Arc<RedisStore>>,
+    #[cfg(test)]
+    joined: std::sync::atomic::AtomicUsize,
 }
 
-/// What a load ended with, handed to every request that waited on it.
-pub type Loaded = Result<Arc<Entry>, LoadFailure>;
+type Loaded = Result<Arc<Entry>, LoadFailure>;
 
 /// A load's outcome, and whether it called the upstream or found the answer kept meanwhile.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,15 +132,56 @@ pub struct Outcome {
     pub called: bool,
 }
 
+impl Outcome {
+    pub fn called(loaded: Loaded) -> Self {
+        Self {
+            loaded,
+            called: true,
+        }
+    }
+
+    pub fn not_called(loaded: Loaded) -> Self {
+        Self {
+            loaded,
+            called: false,
+        }
+    }
+}
+
 pub type Waiting = watch::Receiver<Option<Outcome>>;
 pub type Finisher = watch::Sender<Option<Outcome>>;
 
 /// Why a load gave no answer to keep. `Answered` is an answer that is not kept, such as a 5xx, passed on as it came.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LoadFailure {
+    #[error("answered {}", .0.status)]
     Answered(Answer),
+    #[error("refused: {0}")]
     Refused(crate::budget::Refusal),
+    #[error(transparent)]
     Upstream(crate::upstream::UpstreamFailure),
+    #[error("the load ended without an answer")]
+    Lost,
+}
+
+impl LoadFailure {
+    /// Whether a kept answer may stand in: the call was refused or failed, the load ended without an answer, or the
+    /// upstream answered a 5xx.
+    pub fn allows_stale(&self) -> bool {
+        match self {
+            Self::Answered(answer) => answer.status.is_server_error(),
+            Self::Refused(_) | Self::Upstream(_) | Self::Lost => true,
+        }
+    }
+}
+
+/// The key a load runs under: a `no-cache` load runs apart, so it never joins one that may answer from the cache.
+pub fn load_key(key: String, forced: bool) -> String {
+    if forced {
+        format!("{key} no-cache")
+    } else {
+        key
+    }
 }
 
 #[derive(Clone)]
@@ -123,6 +220,7 @@ impl Expiry<String, Kept> for KeepUntilStale {
     }
 }
 
+#[cfg(test)]
 impl Default for AnswerCache {
     fn default() -> Self {
         Self::new(None)
@@ -141,6 +239,8 @@ impl AnswerCache {
                 .build(),
             loading: Mutex::default(),
             redis,
+            #[cfg(test)]
+            joined: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -185,10 +285,17 @@ impl AnswerCache {
             return entries;
         };
         for (index, bytes) in missing.into_iter().zip(stored) {
-            if let Some(entry) = bytes
-                .and_then(decode)
-                .filter(|entry| entry.is_stale(now_ms))
-            {
+            let Some(bytes) = bytes else {
+                continue;
+            };
+            let Some(entry) = decode(bytes) else {
+                tracing::warn!(
+                    key = %keys[index],
+                    "Redis holds a cache entry the gateway cannot read, it counts as missing"
+                );
+                continue;
+            };
+            if entry.can_stand_in(now_ms) {
                 let entry = Arc::new(entry);
                 self.entries.insert(
                     keys[index].clone(),
@@ -237,6 +344,9 @@ impl AnswerCache {
             .get(key)
             .filter(|waiting| waiting.has_changed().is_ok())
         {
+            #[cfg(test)]
+            self.joined
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             return (waiting.clone(), None);
         }
         let (finisher, waiting) = watch::channel(None);
@@ -269,6 +379,11 @@ impl AnswerCache {
     #[cfg(test)]
     pub(crate) fn loads_running(&self) -> usize {
         self.loading().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn joined(&self) -> usize {
+        self.joined.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn loading(&self) -> std::sync::MutexGuard<'_, HashMap<String, Waiting>> {
@@ -381,6 +496,7 @@ fn decode(bytes: Vec<u8>) -> Option<Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestRedis;
 
     fn entry(body: &'static str) -> Arc<Entry> {
         Arc::new(Entry::new(
@@ -395,10 +511,7 @@ mod tests {
     }
 
     fn outcome(body: &'static str) -> Outcome {
-        Outcome {
-            loaded: Ok(entry(body)),
-            called: true,
-        }
+        Outcome::called(Ok(entry(body)))
     }
 
     #[tokio::test]
@@ -470,6 +583,28 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_says_what_went_wrong_without_the_upstream_s_body() {
+        let answered = LoadFailure::Answered(Answer {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            content_type: None,
+            body: Bytes::from_static(b"a whole page of upstream html"),
+        });
+        assert_eq!(answered.to_string(), "answered 503 Service Unavailable");
+        assert_eq!(
+            LoadFailure::Refused(crate::budget::Refusal::TooLarge {
+                calls: 4,
+                limit_per_minute: 3
+            })
+            .to_string(),
+            "refused: 4 calls are more than the 3 a minute allows"
+        );
+        assert_eq!(
+            LoadFailure::Upstream(crate::upstream::UpstreamFailure::Timeout).to_string(),
+            "did not answer in time"
+        );
+    }
+
+    #[test]
     fn a_stored_form_that_does_not_read_is_no_entry() {
         assert_eq!(decode(Vec::new()), None);
         assert_eq!(decode(vec![FORMAT + 1, 0, 200]), None);
@@ -478,19 +613,45 @@ mod tests {
         assert_eq!(decode(cut), None);
     }
 
-    #[tokio::test]
-    async fn entries_survive_in_redis_for_a_new_cache() {
-        let Ok(url) = std::env::var("CONTENT_GATEWAY_TEST_REDIS_URL") else {
-            eprintln!("CONTENT_GATEWAY_TEST_REDIS_URL is not set, skipped");
-            return;
+    #[test]
+    fn a_stored_row_outside_its_body_is_no_entry() {
+        let body = Bytes::from_static(b"{\"data\":[1]}");
+        let kept = Entry {
+            row: Some(body.slice(9..10)),
+            ..Entry::new(
+                Answer {
+                    status: StatusCode::OK,
+                    content_type: None,
+                    body: body.clone(),
+                },
+                1_000,
+                60_000,
+            )
         };
-        let prefix = format!("content-gateway-test:cache:{}", std::process::id());
-        let open = || Arc::new(RedisStore::open(&url, prefix.clone()).unwrap());
-        let kept = AnswerCache::new(Some(open()));
+        let stored = encode(&kept);
+        assert_eq!(decode(stored.clone()).unwrap(), kept);
+        let row_at = 1 + 2 + 3 * 8 + 1 + 1;
+        let with_row = |start: u32, end: u32| {
+            let mut stored = stored.clone();
+            stored[row_at..row_at + 4].copy_from_slice(&start.to_be_bytes());
+            stored[row_at + 4..row_at + 8].copy_from_slice(&end.to_be_bytes());
+            decode(stored)
+        };
+        let length = u32::try_from(body.len()).unwrap();
+        assert!(with_row(0, length).is_some());
+        assert_eq!(with_row(0, length + 1), None);
+        assert_eq!(with_row(5, 4), None);
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CONTENT_GATEWAY_TEST_REDIS_URL"]
+    async fn entries_survive_in_redis_for_a_new_cache() {
+        let redis = TestRedis::required();
+        let kept = AnswerCache::new(Some(redis.open()));
         kept.insert("mod:1", entry("one"));
         kept.insert("mod:2", entry("two"));
 
-        let store = open();
+        let store = redis.open();
         let stored = vec![store.key("cache:mod:1"), store.key("cache:mod:2")];
         for _ in 0..100 {
             let keys = stored.clone();
@@ -531,15 +692,7 @@ mod tests {
             [Some(Bytes::from("two")), None, Some(Bytes::from("one"))]
         );
         assert!(after_restart.get("mod:1").is_some());
-
-        store
-            .run(|mut connection| async move {
-                redis::cmd("DEL")
-                    .arg(stored)
-                    .query_async::<()>(&mut connection)
-                    .await
-            })
-            .await;
+        redis.forget().await;
     }
 
     #[tokio::test]

@@ -36,7 +36,8 @@ export interface paths {
      * What `POST api.curseforge.com/v1/{path}` answers to this body.
      * @description `POST mods` with only `{"modIds": [...]}`, `POST mods/files` with only `{"fileIds": [...]}`, and
      *     `POST fingerprints/432` or `POST fingerprints` with only `{"fingerprints": [...]}` are answered per id from the
-     *     cache, and only the ids not kept are asked for, 100 per call. Every other body goes to CurseForge each time.
+     *     cache, and only the ids not kept are asked for, 100 per call, at most 1000 different ids. Every other body goes to
+     *     CurseForge each time.
      */
     post: operations["curseforge_post"];
     delete?: never;
@@ -307,13 +308,15 @@ export interface components {
       | "UNKNOWN_VERSION"
       | "UNKNOWN_LOADER"
       | "UNKNOWN_RUNTIME"
+      | "UNKNOWN_ROUTE"
       | "UPSTREAM_TIMEOUT"
       | "UPSTREAM_UNREACHABLE"
       | "UPSTREAM_TOO_LARGE"
       | "UPSTREAM_UNREADABLE"
       | "BUDGET_SPENT"
       | "UPSTREAM_HOLD"
-      | "REQUEST_TOO_LARGE";
+      | "REQUEST_TOO_LARGE"
+      | "INTERNAL";
     /**
      * @description Where a file's download address comes from.
      * @enum {string}
@@ -358,7 +361,7 @@ export interface components {
       snapshot: string;
     };
     /**
-     * @description The mod loaders whose versions the gateway lists.
+     * @description The mod loaders whose versions the gateway lists, named in any case in a path or a query.
      * @enum {string}
      */
     Loader: "neoforge" | "forge" | "fabric";
@@ -457,7 +460,7 @@ export interface components {
        *     Modrinth has a link. On unless set to false.
        * @default true
        */
-      cdn: boolean;
+      cdn?: boolean;
       /**
        * @description CurseForge file ids, up to 1000.
        * @example [
@@ -480,8 +483,8 @@ export interface components {
     };
     /**
      * @description Where a readout's counts come from: `redis` when they are the stored ones, `memory` when no Redis is configured,
-     *     `unavailable` when Redis did not answer, so the minute is this process's own count and the days hold only what
-     *     is not written to Redis yet.
+     *     `unavailable` when Redis did not answer, so the minute is the calls this process let through or refused itself
+     *     and the days hold only what is not written to Redis yet.
      * @enum {string}
      */
     Source: "redis" | "memory" | "unavailable";
@@ -641,6 +644,15 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
       /** @description CurseForge could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE` */
       502: {
         headers: {
@@ -715,7 +727,7 @@ export interface operations {
           "application/json": unknown;
         };
       };
-      /** @description `INVALID_PATH`, `POOL_REQUIRED` or `UNKNOWN_POOL` */
+      /** @description `INVALID_PATH`, `INVALID_BODY` (a batch of more than 1000 different ids), `POOL_REQUIRED` or `UNKNOWN_POOL` */
       400: {
         headers: {
           [name: string]: unknown;
@@ -735,6 +747,15 @@ export interface operations {
       };
       /** @description The batch needs more calls than a whole minute allows, `REQUEST_TOO_LARGE`; split it */
       413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
         headers: {
           [name: string]: unknown;
         };
@@ -852,6 +873,15 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
       /** @description Mojang could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE` */
       502: {
         headers: {
@@ -899,6 +929,15 @@ export interface operations {
           "application/json": components["schemas"]["LoaderVersions"];
         };
       };
+      /** @description `INVALID_QUERY`: `minecraft` given more than once */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
       /** @description No valid consumer token */
       401: {
         headers: {
@@ -910,6 +949,15 @@ export interface operations {
       };
       /** @description No such loader, `UNKNOWN_LOADER` */
       404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
         headers: {
           [name: string]: unknown;
         };
@@ -971,6 +1019,15 @@ export interface operations {
       };
       /** @description No valid consumer token */
       401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
         headers: {
           [name: string]: unknown;
         };
@@ -1040,6 +1097,15 @@ export interface operations {
           "application/json": components["schemas"]["ApiError"];
         };
       };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
       /** @description Mojang could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE` */
       502: {
         headers: {
@@ -1102,6 +1168,15 @@ export interface operations {
       };
       /** @description No valid consumer token */
       401: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
         headers: {
           [name: string]: unknown;
         };
@@ -1203,6 +1278,15 @@ export interface operations {
       };
       /** @description The hashes need more calls than a whole minute allows, `REQUEST_TOO_LARGE`; split them */
       413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
         headers: {
           [name: string]: unknown;
         };
@@ -1315,6 +1399,15 @@ export interface operations {
       };
       /** @description The files need more CurseForge calls than a whole minute allows, `REQUEST_TOO_LARGE`; split them */
       413: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          "application/json": components["schemas"]["ApiError"];
+        };
+      };
+      /** @description The gateway failed to finish the request: `INTERNAL` */
+      500: {
         headers: {
           [name: string]: unknown;
         };

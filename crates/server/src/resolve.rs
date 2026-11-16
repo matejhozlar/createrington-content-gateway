@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
     Json,
@@ -12,24 +8,25 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::{Deserialize, Serialize};
-use tokio::{sync::Semaphore, task::JoinSet};
+use tokio::sync::Semaphore;
 use utoipa::ToSchema;
 
 use crate::{
     app::AppState,
     auth::Pool,
-    batch::{self, Batch},
-    cache::{Answer, Entry},
+    batch::Batch,
+    cache::{Answer, AnswerCache, Entry, LoadFailure, Outcome, load_key},
+    clock::{HOUR_MS, MINUTE_MS},
     error::ApiError,
-    modrinth,
-    passthrough::{self, HOUR_MS, MINUTE_MS},
+    load,
+    modrinth::VersionFiles,
+    passthrough,
+    upstream::Source,
 };
 
 pub const CURSEFORGE_CDN: &str = "https://mediafilez.forgecdn.net";
 pub const CDN_TIMEOUT: Duration = Duration::from_secs(10);
-const CDN_WAIT: Duration = Duration::from_secs(20);
-/// The longest a `POST /v1/resolve` can take: CurseForge's timeout, then Modrinth's, then the CDN wait.
-pub const LONGEST: Duration = Duration::from_secs(40);
+pub const CDN_WAIT: Duration = Duration::from_secs(20);
 const CDN_AT_ONCE: usize = 8;
 const CDN_FOUND_MS: u64 = HOUR_MS;
 const CDN_NOT_FOUND_MS: u64 = 10 * MINUTE_MS;
@@ -41,6 +38,7 @@ const MOST_FILES: usize = 1000;
 pub struct Cdn {
     client: reqwest::Client,
     base: String,
+    wait: Duration,
 }
 
 impl Cdn {
@@ -48,6 +46,7 @@ impl Cdn {
         base: impl Into<String>,
         user_agent: &str,
         timeout: Duration,
+        wait: Duration,
     ) -> reqwest::Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
@@ -55,11 +54,11 @@ impl Cdn {
                 .user_agent(user_agent)
                 .build()?,
             base: base.into(),
+            wait,
         })
     }
 
-    /// The address of a file on the CDN, built from its id and name the way CurseForge's own links are.
-    pub fn url(&self, file_id: u64, file_name: &str) -> String {
+    fn url(&self, file_id: u64, file_name: &str) -> String {
         format!(
             "{}/files/{}/{}/{}",
             self.base,
@@ -148,7 +147,6 @@ pub struct Resolved {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FileRow {
-    id: u64,
     file_name: Option<String>,
     file_length: Option<u64>,
     download_url: Option<String>,
@@ -179,8 +177,7 @@ struct VersionHashes {
     sha1: Option<String>,
 }
 
-struct Known {
-    file_id: u64,
+struct ListedFile {
     file_name: Option<String>,
     size: Option<u64>,
     sha1: Option<String>,
@@ -191,6 +188,58 @@ struct Candidate {
     file_id: u64,
     file_name: String,
     size: u64,
+}
+
+/// Modrinth's links by SHA-1, or that Modrinth could not be asked.
+enum ModrinthLinks {
+    Asked(HashMap<String, String>),
+    Unasked,
+}
+
+impl ModrinthLinks {
+    fn of(&self, file: &ListedFile) -> Option<&String> {
+        match self {
+            Self::Asked(links) => links.get(file.sha1.as_ref()?),
+            Self::Unasked => None,
+        }
+    }
+
+    fn could_have(&self, file: &ListedFile) -> bool {
+        matches!(self, Self::Unasked) && file.sha1.is_some()
+    }
+}
+
+/// What CurseForge's CDN said about a file's built address: there, not there, or not asked in time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CdnVerdict {
+    Found(String),
+    Missing,
+    Unknown,
+}
+
+impl CdnVerdict {
+    fn kept(entry: &Entry) -> Self {
+        if entry.answer.status != StatusCode::OK {
+            return Self::Missing;
+        }
+        String::from_utf8(entry.answer.body.to_vec()).map_or(Self::Missing, Self::Found)
+    }
+
+    fn entry(&self, now_ms: u64) -> Option<Entry> {
+        let (answer, fresh_ms) = match self {
+            Self::Found(url) => (
+                Answer {
+                    status: StatusCode::OK,
+                    content_type: Some(HeaderValue::from_static("text/plain")),
+                    body: Bytes::from(url.clone()),
+                },
+                CDN_FOUND_MS,
+            ),
+            Self::Missing => (Answer::not_found(), CDN_NOT_FOUND_MS),
+            Self::Unknown => return None,
+        };
+        Some(Entry::new(answer, now_ms, fresh_ms))
+    }
 }
 
 /// A download address for each CurseForge file.
@@ -218,6 +267,7 @@ struct Candidate {
         (status = 400, description = "`INVALID_BODY`, `POOL_REQUIRED` or `UNKNOWN_POOL`", body = ApiError),
         (status = 401, description = "No valid consumer token", body = ApiError),
         (status = 413, description = "The files need more CurseForge calls than a whole minute allows, `REQUEST_TOO_LARGE`; split them", body = ApiError),
+        (status = 500, description = "The gateway failed to finish the request: `INTERNAL`", body = ApiError),
         (status = 502, description = "CurseForge could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`", body = ApiError),
         (status = 503, description = "The CurseForge call was refused: `BUDGET_SPENT` this minute or `UPSTREAM_HOLD` after a 429", body = ApiError, headers(("Retry-After" = u64, description = "Seconds until the next call can go out"))),
         (status = 504, description = "CurseForge did not answer in time, `UPSTREAM_TIMEOUT`", body = ApiError),
@@ -230,111 +280,152 @@ pub async fn resolve(
     headers: HeaderMap,
     body: Result<Json<ResolveRequest>, JsonRejection>,
 ) -> Response {
+    let asked = match requested_ids(body) {
+        Ok(asked) => asked,
+        Err(error) => return error.into_response(),
+    };
+    let forced = passthrough::wants_fresh(&headers);
+    let ids = asked.file_ids;
+    let known = match known_files(&state, &pool, &ids, forced).await {
+        Ok(known) => known,
+        Err(failure) => return passthrough::failed(failure, &pool, Source::CurseForge),
+    };
+    let unlinked: Vec<(u64, &ListedFile)> = ids
+        .iter()
+        .filter_map(|id| Some((*id, known.get(id)?)))
+        .filter(|(_, file)| file.download_url.is_none())
+        .collect();
+    let modrinth = modrinth_links(&state, &pool, &unlinked, forced).await;
+    let on_cdn = if asked.cdn {
+        let candidates: Vec<Candidate> = unlinked
+            .iter()
+            .filter_map(|(id, file)| cdn_candidate(*id, file, &modrinth))
+            .collect();
+        Some(cdn_links(&state, candidates, forced).await)
+    } else {
+        None
+    };
+    Json(assemble(&ids, &known, &modrinth, on_cdn.as_ref())).into_response()
+}
+
+struct Asked {
+    file_ids: Vec<u64>,
+    cdn: bool,
+}
+
+fn requested_ids(body: Result<Json<ResolveRequest>, JsonRejection>) -> Result<Asked, ApiError> {
     let Ok(Json(request)) = body else {
-        return ApiError::invalid_body(
+        return Err(ApiError::invalid_body(
             "a JSON object with `fileIds`, a list of CurseForge file ids",
-        )
-        .into_response();
+        ));
     };
     if request.file_ids.is_empty() {
-        return ApiError::invalid_body("`fileIds` must list at least one file id").into_response();
+        return Err(ApiError::invalid_body(
+            "`fileIds` must list at least one file id",
+        ));
     }
-    let mut seen = HashSet::new();
-    let mut ids: Vec<u64> = Vec::new();
-    for id in &request.file_ids {
-        if seen.insert(*id) {
-            ids.push(*id);
-        }
-        if ids.len() > MOST_FILES {
-            return ApiError::invalid_body("`fileIds` may list at most 1000 file ids")
-                .into_response();
-        }
-    }
-    let forced = passthrough::wants_fresh(&headers);
+    let file_ids = load::distinct(request.file_ids, MOST_FILES).ok_or_else(|| {
+        ApiError::invalid_body(&format!("`fileIds` may list at most {MOST_FILES} file ids"))
+    })?;
+    Ok(Asked {
+        file_ids,
+        cdn: request.cdn,
+    })
+}
 
-    let rows = match batch::rows(
-        state.clone(),
-        pool.clone(),
-        Batch::Files,
-        ids.clone(),
-        forced,
-    )
-    .await
-    {
-        Ok(rows) => rows,
-        Err(response) => return *response,
-    };
-    let known: HashMap<u64, Known> = rows
-        .rows
+async fn known_files(
+    state: &Arc<AppState>,
+    pool: &Pool,
+    ids: &[u64],
+    forced: bool,
+) -> Result<HashMap<u64, ListedFile>, LoadFailure> {
+    let rows = load::rows(state, pool, Batch::Files, ids.to_vec(), forced)
+        .await?
+        .value;
+    Ok(rows
         .iter()
         .filter_map(|(id, row)| {
-            let row: FileRow = serde_json::from_slice(row).ok()?;
+            let row: FileRow = serde_json::from_slice(row)
+                .inspect_err(|error| {
+                    tracing::warn!(file_id = id, %error, "CurseForge's row of a file does not read as a file");
+                })
+                .ok()?;
             Some((
                 *id,
-                Known {
-                    file_id: row.id,
+                ListedFile {
                     file_name: row.file_name,
                     size: row.file_length,
                     sha1: row
                         .hashes
                         .iter()
                         .find(|hash| hash.algo == SHA1_ALGO)
-                        .and_then(|hash| modrinth::sha1_of(&hash.value)),
+                        .and_then(|hash| passthrough::sha1_of(&hash.value)),
                     download_url: row.download_url,
                 },
             ))
         })
-        .collect();
+        .collect())
+}
 
-    let wanted: Vec<&Known> = ids
+async fn modrinth_links(
+    state: &Arc<AppState>,
+    pool: &Pool,
+    unlinked: &[(u64, &ListedFile)],
+    forced: bool,
+) -> ModrinthLinks {
+    let hashes: Vec<String> = unlinked
         .iter()
-        .filter_map(|id| known.get(id))
-        .filter(|file| file.download_url.is_none())
+        .filter_map(|(_, file)| file.sha1.clone())
         .collect();
-    let hashes: Vec<String> = wanted.iter().filter_map(|file| file.sha1.clone()).collect();
-    let (on_modrinth, modrinth_failed) = if hashes.is_empty() {
-        (HashMap::new(), false)
-    } else {
-        match modrinth::lookup(&state, &pool, hashes, forced).await {
-            Ok(looked) => (
-                looked
-                    .known
-                    .into_iter()
-                    .filter_map(|known| Some((known.hash.clone(), modrinth_url(&known)?)))
-                    .collect::<HashMap<String, String>>(),
-                false,
-            ),
-            Err(failure) => {
-                tracing::warn!(
-                    "Modrinth could not be asked for {} files: {failure:?}",
-                    wanted.len()
-                );
-                (HashMap::new(), true)
-            }
-        }
-    };
-
-    let on_cdn = if request.cdn {
-        let candidates: Vec<Candidate> = wanted
-            .iter()
-            .filter(|file| {
-                file.sha1
-                    .as_ref()
-                    .is_none_or(|sha1| !on_modrinth.contains_key(sha1))
-            })
-            .filter_map(|file| {
-                Some(Candidate {
-                    file_id: file.file_id,
-                    file_name: file.file_name.clone()?,
-                    size: file.size?,
+    if hashes.is_empty() {
+        return ModrinthLinks::Asked(HashMap::new());
+    }
+    match load::rows(state, pool, VersionFiles, hashes, forced).await {
+        Ok(given) => ModrinthLinks::Asked(
+            given
+                .value
+                .into_iter()
+                .filter_map(|(hash, version)| {
+                    let url = modrinth_url(&hash, &version)?;
+                    Some((hash, url))
                 })
-            })
-            .collect();
-        check_cdn(&state, &candidates, forced).await
-    } else {
-        HashMap::new()
-    };
+                .collect(),
+        ),
+        Err(failure) => {
+            tracing::warn!(
+                files = unlinked.len(),
+                %failure,
+                "Modrinth could not be asked for the files"
+            );
+            ModrinthLinks::Unasked
+        }
+    }
+}
 
+fn is_cdn_candidate(file: &ListedFile, modrinth: &ModrinthLinks) -> bool {
+    file.download_url.is_none()
+        && modrinth.of(file).is_none()
+        && file.file_name.is_some()
+        && file.size.is_some()
+}
+
+fn cdn_candidate(file_id: u64, file: &ListedFile, modrinth: &ModrinthLinks) -> Option<Candidate> {
+    if !is_cdn_candidate(file, modrinth) {
+        return None;
+    }
+    Some(Candidate {
+        file_id,
+        file_name: file.file_name.clone()?,
+        size: file.size?,
+    })
+}
+
+fn assemble(
+    ids: &[u64],
+    known: &HashMap<u64, ListedFile>,
+    modrinth: &ModrinthLinks,
+    on_cdn: Option<&HashMap<u64, CdnVerdict>>,
+) -> Resolved {
     let files = ids
         .iter()
         .map(|id| {
@@ -351,18 +442,19 @@ pub async fn resolve(
             };
             let (found, retry) = if let Some(url) = &file.download_url {
                 (Some((FileSource::Curseforge, url.clone())), false)
-            } else if let Some(url) = file.sha1.as_ref().and_then(|sha1| on_modrinth.get(sha1)) {
+            } else if let Some(url) = modrinth.of(file) {
                 (Some((FileSource::Modrinth, url.clone())), false)
             } else {
-                let cdn = if request.cdn && file.file_name.is_some() && file.size.is_some() {
-                    on_cdn.get(id)
-                } else {
-                    Some(&None)
+                let verdict = match on_cdn {
+                    Some(on_cdn) if is_cdn_candidate(file, modrinth) => {
+                        on_cdn.get(id).cloned().unwrap_or(CdnVerdict::Unknown)
+                    }
+                    _ => CdnVerdict::Missing,
                 };
-                match cdn {
-                    Some(Some(url)) => (Some((FileSource::CurseforgeCdn, url.clone())), false),
-                    Some(None) => (None, modrinth_failed && file.sha1.is_some()),
-                    None => (None, true),
+                match verdict {
+                    CdnVerdict::Found(url) => (Some((FileSource::CurseforgeCdn, url)), false),
+                    CdnVerdict::Missing => (None, modrinth.could_have(file)),
+                    CdnVerdict::Unknown => (None, true),
                 }
             };
             let (source, url) =
@@ -378,11 +470,11 @@ pub async fn resolve(
             }
         })
         .collect();
-    Json(Resolved { files }).into_response()
+    Resolved { files }
 }
 
-fn modrinth_url(known: &modrinth::Known) -> Option<String> {
-    let version: Version = serde_json::from_slice(known.version.as_ref()?).ok()?;
+fn modrinth_url(hash: &str, version: &[u8]) -> Option<String> {
+    let version: Version = serde_json::from_slice(version).ok()?;
     version
         .files
         .into_iter()
@@ -390,7 +482,7 @@ fn modrinth_url(known: &modrinth::Known) -> Option<String> {
             file.hashes
                 .sha1
                 .as_ref()
-                .is_some_and(|sha1| sha1.eq_ignore_ascii_case(&known.hash))
+                .is_some_and(|sha1| sha1.eq_ignore_ascii_case(hash))
                 && is_modrinth_cdn(&file.url)
         })
         .map(|file| file.url)
@@ -405,11 +497,11 @@ fn cdn_key(file_id: u64, size: u64) -> String {
     format!("cdn:{file_id}:{size}")
 }
 
-async fn check_cdn(
+async fn cdn_links(
     state: &Arc<AppState>,
-    candidates: &[Candidate],
+    candidates: Vec<Candidate>,
     forced: bool,
-) -> HashMap<u64, Option<String>> {
+) -> HashMap<u64, CdnVerdict> {
     let mut verdicts = HashMap::with_capacity(candidates.len());
     if candidates.is_empty() {
         return verdicts;
@@ -420,376 +512,91 @@ async fn check_cdn(
         .collect();
     let now = state.clock.now_ms();
     let kept = state.cache.lookup_many(&keys, now).await;
-    let mut to_check = Vec::new();
-    for (file, kept) in candidates.iter().zip(kept) {
-        match kept.filter(|entry| !forced && entry.is_fresh(now)) {
-            Some(entry) if entry.answer.status == StatusCode::OK => {
-                verdicts.insert(
-                    file.file_id,
-                    String::from_utf8(entry.answer.body.to_vec()).ok(),
-                );
-            }
-            Some(_) => {
-                verdicts.insert(file.file_id, None);
-            }
-            None => to_check.push((file.file_id, file.file_name.clone(), file.size)),
-        }
-    }
-    if to_check.is_empty() {
-        return verdicts;
-    }
-
     let at_once = Arc::new(Semaphore::new(CDN_AT_ONCE));
-    let mut checks = JoinSet::new();
-    for (file_id, file_name, size) in to_check {
-        let (state, at_once) = (state.clone(), at_once.clone());
-        checks.spawn(async move {
-            let _slot = at_once.acquire().await;
-            (file_id, head(&state, file_id, &file_name, size).await)
-        });
+    let mut waits = Vec::new();
+    for ((file, key), kept) in candidates.into_iter().zip(keys).zip(kept) {
+        if let Some(entry) = kept.filter(|entry| !forced && entry.is_fresh(now)) {
+            verdicts.insert(file.file_id, CdnVerdict::kept(&entry));
+            continue;
+        }
+        let file_id = file.file_id;
+        let load_key = load_key(key.clone(), forced);
+        let (waiting, finisher) = state.cache.join(&load_key);
+        if let Some(finisher) = finisher {
+            let (state, at_once, checked) = (state.clone(), at_once.clone(), key.clone());
+            let check = async move {
+                let now = state.clock.now_ms();
+                let kept = state
+                    .cache
+                    .get(&key)
+                    .filter(|entry| !forced && entry.is_fresh(now));
+                let outcome = match kept {
+                    Some(entry) => Outcome::not_called(Ok(entry)),
+                    None => {
+                        let _slot = at_once.acquire().await;
+                        let verdict = head(&state, &file).await;
+                        Outcome::called(match verdict.entry(state.clock.now_ms()) {
+                            Some(entry) => {
+                                let entry = Arc::new(entry);
+                                state.cache.insert(&key, entry.clone());
+                                Ok(entry)
+                            }
+                            None => Err(LoadFailure::Lost),
+                        })
+                    }
+                };
+                state.cache.finish(&load_key, finisher, outcome);
+            };
+            load::spawn_load(check, checked, 1);
+        }
+        waits.push((file_id, waiting));
     }
     let collect = async {
-        while let Some(joined) = checks.join_next().await {
-            if let Ok((file_id, Some(verdict))) = joined {
-                verdicts.insert(file_id, verdict);
-            }
+        for (file_id, waiting) in waits {
+            let verdict = match AnswerCache::wait(waiting).await {
+                Some(Outcome {
+                    loaded: Ok(entry), ..
+                }) => CdnVerdict::kept(&entry),
+                _ => CdnVerdict::Unknown,
+            };
+            verdicts.insert(file_id, verdict);
         }
     };
-    if tokio::time::timeout(CDN_WAIT, collect).await.is_err() {
-        tracing::warn!("CurseForge's CDN could not be asked about every file within {CDN_WAIT:?}");
+    let wait = state.cdn.wait;
+    if tokio::time::timeout(wait, collect).await.is_err() {
+        tracing::warn!(
+            wait_ms = wait.as_millis(),
+            "CurseForge's CDN could not be asked about every file in time"
+        );
     }
     verdicts
 }
 
-async fn head(
-    state: &AppState,
-    file_id: u64,
-    file_name: &str,
-    size: u64,
-) -> Option<Option<String>> {
-    let url = state.cdn.url(file_id, file_name);
-    let verdict = match state.cdn.head(&url).await {
-        Ok((StatusCode::OK, Some(length))) if length == size => Some(url),
+async fn head(state: &AppState, file: &Candidate) -> CdnVerdict {
+    let file_id = file.file_id;
+    let url = state.cdn.url(file_id, &file.file_name);
+    match state.cdn.head(&url).await {
+        Ok((StatusCode::OK, Some(length))) if length == file.size => CdnVerdict::Found(url),
         Ok((StatusCode::OK, length)) => {
             tracing::warn!(
-                "CurseForge's CDN lists {} for file {file_id}, CurseForge's API lists {size} bytes",
-                length.map_or("no size".to_owned(), |length| length.to_string())
+                file_id,
+                cdn_bytes = ?length,
+                api_bytes = file.size,
+                "CurseForge's CDN and API list different sizes for a file"
             );
-            None
+            CdnVerdict::Missing
         }
-        Ok((StatusCode::FORBIDDEN | StatusCode::NOT_FOUND, _)) => None,
+        Ok((StatusCode::FORBIDDEN | StatusCode::NOT_FOUND, _)) => CdnVerdict::Missing,
         Ok((status, _)) => {
-            tracing::warn!("CurseForge's CDN answered {status} for file {file_id}");
-            return None;
+            tracing::warn!(file_id, %status, "CurseForge's CDN answered a file with an unexpected status");
+            CdnVerdict::Unknown
         }
         Err(error) => {
-            tracing::warn!("CurseForge's CDN could not be asked about file {file_id}: {error}");
-            return None;
+            tracing::warn!(file_id, %error, "CurseForge's CDN could not be asked about a file");
+            CdnVerdict::Unknown
         }
-    };
-    let (answer, fresh_ms) = match &verdict {
-        Some(url) => (
-            Answer {
-                status: StatusCode::OK,
-                content_type: Some(HeaderValue::from_static("text/plain")),
-                body: Bytes::from(url.clone()),
-            },
-            CDN_FOUND_MS,
-        ),
-        None => (
-            Answer {
-                status: StatusCode::NOT_FOUND,
-                content_type: None,
-                body: Bytes::new(),
-            },
-            CDN_NOT_FOUND_MS,
-        ),
-    };
-    state.cache.insert(
-        &cdn_key(file_id, size),
-        Arc::new(Entry::new(answer, state.clock.now_ms(), fresh_ms)),
-    );
-    Some(verdict)
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use axum::http::Request;
-    use serde_json::{Value, json};
-
-    use super::*;
-    use crate::{config::DEFAULT_USER_AGENT, curseforge::TIMEOUT, test_support::*};
-
-    const JEI_SHA1: &str = "3e1dd9fb5ea2f0dd4ffcc2b1a7d0bb1a1a9d6a8e";
-    const SODIUM_SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
-    const CREATE_SHA1: &str = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
-
-    fn file(id: u64, name: &str, size: u64, sha1: &str, url: Option<&str>) -> Value {
-        json!({
-            "id": id, "modId": id / 10, "fileName": name, "fileLength": size,
-            "downloadUrl": url,
-            "hashes": [{ "value": sha1.to_ascii_uppercase(), "algo": 1 }, { "value": "md5md5", "algo": 2 }]
-        })
-    }
-
-    fn files_answer(files: &[Value]) -> String {
-        json!({ "data": files }).to_string()
-    }
-
-    fn modrinth_answer(found: &[(&str, &str)]) -> String {
-        let mut body = serde_json::Map::new();
-        for (sha1, name) in found {
-            body.insert(
-                (*sha1).to_owned(),
-                json!({ "id": "v", "files": [
-                    { "hashes": { "sha1": sha1 }, "url": format!("https://cdn.modrinth.com/data/p/versions/v/{name}"), "filename": name, "size": 1 },
-                    { "hashes": { "sha1": "ffffffffffffffffffffffffffffffffffffffff" }, "url": "https://cdn.modrinth.com/data/p/versions/v/other.jar", "filename": "other.jar", "size": 1 }
-                ] }),
-            );
-        }
-        Value::Object(body).to_string()
-    }
-
-    fn cdn_reply(status: u16, length: &'static str) -> Reply {
-        Reply {
-            status,
-            headers: vec![("content-length", length)],
-            body: String::new(),
-        }
-    }
-
-    async fn resolve(gateway: &Gateway, body: &str) -> Got {
-        send(
-            &gateway.router,
-            Request::post("/v1/resolve").header("content-type", "application/json"),
-            body,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn takes_curseforge_then_modrinth_then_the_cdn_and_says_when_nothing_has_a_file() {
-        let mock = Mock::start(Duration::ZERO, |_, seen| match seen.uri.as_str() {
-            "/v1/mods/files" => reply(
-                200,
-                files_answer(&[
-                    file(
-                        1001,
-                        "jei.jar",
-                        10,
-                        JEI_SHA1,
-                        Some("https://edge.forgecdn.net/jei.jar"),
-                    ),
-                    file(1002, "sodium.jar", 20, SODIUM_SHA1, None),
-                    file(1003, "create 1.0(a).jar", 30, CREATE_SHA1, None),
-                    file(
-                        1004,
-                        "gone.jar",
-                        40,
-                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                        None,
-                    ),
-                ]),
-            ),
-            "/v2/version_files" => reply(200, modrinth_answer(&[(SODIUM_SHA1, "sodium.jar")])),
-            "/files/1/3/create%201.0%28a%29.jar" => cdn_reply(200, "30"),
-            "/files/1/4/gone.jar" => cdn_reply(403, "0"),
-            uri => panic!("unexpected {uri}"),
-        })
-        .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-
-        let got = resolve(&gateway, r#"{"fileIds":[1001,1002,1003,1004,9999,1001]}"#).await;
-        assert_eq!(got.status, StatusCode::OK);
-        assert_eq!(got.header("x-cache"), None);
-        let files = got.json()["files"].clone();
-        assert_eq!(files.as_array().unwrap().len(), 5);
-        assert_eq!(files[0]["source"], "curseforge");
-        assert_eq!(files[0]["url"], "https://edge.forgecdn.net/jei.jar");
-        assert_eq!(files[0]["sha1"], JEI_SHA1);
-        assert_eq!(files[0]["fileName"], "jei.jar");
-        assert_eq!(files[0]["size"], 10);
-        assert_eq!(files[1]["source"], "modrinth");
-        assert_eq!(
-            files[1]["url"],
-            "https://cdn.modrinth.com/data/p/versions/v/sodium.jar"
-        );
-        assert_eq!(files[2]["source"], "curseforge-cdn");
-        assert_eq!(
-            files[2]["url"],
-            format!("{}/files/1/3/create%201.0%28a%29.jar", mock.base)
-        );
-        assert_eq!(files[3]["source"], Value::Null);
-        assert_eq!(files[3]["url"], Value::Null);
-        assert_eq!(files[3]["retry"], false);
-        assert_eq!(files[4]["fileId"], 9999);
-        assert_eq!(files[4]["source"], Value::Null);
-        assert_eq!(files[4]["sha1"], Value::Null);
-        assert_eq!(files[4]["retry"], false);
-
-        let seen = mock.seen();
-        let modrinth = seen
-            .iter()
-            .find(|seen| seen.uri == "/v2/version_files")
-            .unwrap();
-        let asked: Value = serde_json::from_str(&modrinth.body).unwrap();
-        assert_eq!(
-            asked["hashes"],
-            json!([
-                SODIUM_SHA1,
-                CREATE_SHA1,
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            ])
-        );
-        let heads: Vec<&Seen> = seen.iter().filter(|seen| seen.method == "HEAD").collect();
-        assert_eq!(heads.len(), 2);
-        assert!(
-            heads
-                .iter()
-                .all(|head| head.user_agent.as_deref() == Some(USER_AGENT))
-        );
-        assert_eq!(gateway.state.budget.snapshot().await.used, 1);
-
-        let again = resolve(&gateway, r#"{"fileIds":[1003,1004]}"#).await;
-        assert_eq!(again.json()["files"][0]["source"], "curseforge-cdn");
-        assert_eq!(mock.calls(), seen.len());
-    }
-
-    #[tokio::test]
-    async fn the_cdn_is_skipped_when_asked_and_a_wrong_size_is_no_answer() {
-        let mock = Mock::start(Duration::ZERO, |_, seen| match seen.uri.as_str() {
-            "/v1/mods/files" => reply(
-                200,
-                files_answer(&[
-                    file(1003, "create.jar", 30, CREATE_SHA1, None),
-                    file(1005, "short.jar", 50, SODIUM_SHA1, None),
-                ]),
-            ),
-            "/v2/version_files" => reply(200, "{}"),
-            "/files/1/5/short.jar" => cdn_reply(200, "49"),
-            uri => panic!("unexpected {uri}"),
-        })
-        .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-
-        let off = resolve(&gateway, r#"{"fileIds":[1003],"cdn":false}"#).await;
-        assert_eq!(off.json()["files"][0]["source"], Value::Null);
-        assert_eq!(off.json()["files"][0]["retry"], false);
-        assert!(mock.seen().iter().all(|seen| seen.method != "HEAD"));
-
-        let wrong = resolve(&gateway, r#"{"fileIds":[1005]}"#).await;
-        assert_eq!(wrong.json()["files"][0]["source"], Value::Null);
-        assert_eq!(wrong.json()["files"][0]["retry"], false);
-        resolve(&gateway, r#"{"fileIds":[1005]}"#).await;
-        assert_eq!(
-            mock.seen()
-                .iter()
-                .filter(|seen| seen.method == "HEAD")
-                .count(),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn a_modrinth_failure_asks_the_cdn_and_marks_the_rest_for_a_retry() {
-        let mock = Mock::start(Duration::ZERO, |_, seen| match seen.uri.as_str() {
-            "/v1/mods/files" => reply(
-                200,
-                files_answer(&[
-                    file(1003, "create.jar", 30, CREATE_SHA1, None),
-                    file(1006, "lost.jar", 60, SODIUM_SHA1, None),
-                ]),
-            ),
-            "/v2/version_files" => reply(500, "{}"),
-            "/files/1/3/create.jar" => cdn_reply(200, "30"),
-            "/files/1/6/lost.jar" => cdn_reply(404, "0"),
-            uri => panic!("unexpected {uri}"),
-        })
-        .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-
-        let got = resolve(&gateway, r#"{"fileIds":[1003,1006]}"#).await;
-        assert_eq!(got.status, StatusCode::OK);
-        assert_eq!(got.json()["files"][0]["source"], "curseforge-cdn");
-        assert_eq!(got.json()["files"][0]["retry"], false);
-        assert_eq!(got.json()["files"][1]["source"], Value::Null);
-        assert_eq!(got.json()["files"][1]["retry"], true);
-    }
-
-    #[tokio::test]
-    async fn a_curseforge_failure_is_the_passthrough_s_answer() {
-        let mock = Mock::start(Duration::ZERO, |_, _| reply(500, "{}")).await;
-        let failing = gateway(&mock, 300, TIMEOUT);
-        let got = resolve(&failing, r#"{"fileIds":[1003]}"#).await;
-        assert_eq!(got.status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(got.header("x-cache"), Some("miss"));
-
-        let refused = gateway(&mock, 1, TIMEOUT);
-        resolve(&refused, r#"{"fileIds":[1003]}"#).await;
-        let got = resolve(&refused, r#"{"fileIds":[1004]}"#).await;
-        assert_eq!(got.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(got.json()["code"], "BUDGET_SPENT");
-    }
-
-    #[tokio::test]
-    async fn refuses_a_bad_body() {
-        let mock = Mock::start(Duration::ZERO, |_, _| reply(200, "{}")).await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-        for body in ["{}", r#"{"fileIds":[]}"#, r#"{"fileIds":["x"]}"#, "nope"] {
-            let got = resolve(&gateway, body).await;
-            assert_eq!(got.status, StatusCode::BAD_REQUEST, "{body}");
-            assert_eq!(got.json()["code"], "INVALID_BODY", "{body}");
-        }
-        let many: Vec<String> = (0..1001).map(|id| id.to_string()).collect();
-        let got = resolve(&gateway, &format!(r#"{{"fileIds":[{}]}}"#, many.join(","))).await;
-        assert_eq!(got.status, StatusCode::BAD_REQUEST);
-        assert_eq!(mock.calls(), 0);
-    }
-
-    #[test]
-    fn the_longest_call_is_the_three_sources_in_a_row() {
-        assert_eq!(TIMEOUT + modrinth::TIMEOUT + CDN_WAIT, LONGEST);
-    }
-
-    #[tokio::test]
-    async fn a_file_without_a_name_or_size_keeps_its_link_and_skips_the_cdn() {
-        let mock = Mock::start(Duration::ZERO, |_, seen| match seen.uri.as_str() {
-            "/v1/mods/files" => reply(
-                200,
-                json!({ "data": [
-                    { "id": 1007, "modId": 100, "downloadUrl": "https://edge.forgecdn.net/bare.jar", "hashes": [] },
-                    { "id": 1008, "modId": 100, "fileLength": 80, "hashes": [{ "value": CREATE_SHA1, "algo": 1 }] },
-                ] })
-                .to_string(),
-            ),
-            "/v2/version_files" => reply(200, "{}"),
-            uri => panic!("unexpected {uri}"),
-        })
-        .await;
-        let gateway = gateway(&mock, 300, TIMEOUT);
-
-        let got = resolve(&gateway, r#"{"fileIds":[1007,1008]}"#).await;
-        let files = got.json()["files"].clone();
-        assert_eq!(files[0]["source"], "curseforge");
-        assert_eq!(files[0]["fileName"], Value::Null);
-        assert_eq!(files[0]["size"], Value::Null);
-        assert_eq!(files[1]["source"], Value::Null);
-        assert_eq!(files[1]["sha1"], CREATE_SHA1);
-        assert_eq!(files[1]["size"], 80);
-        assert_eq!(files[1]["retry"], false);
-        assert!(mock.seen().iter().all(|seen| seen.method != "HEAD"));
-    }
-
-    #[test]
-    fn builds_the_cdn_address_like_curseforge_does() {
-        let cdn = Cdn::new(CURSEFORGE_CDN, DEFAULT_USER_AGENT, CDN_TIMEOUT).unwrap();
-        assert_eq!(
-            cdn.url(4567890, "Create-1.20.1 (v0.5.1f)!'*.jar"),
-            "https://mediafilez.forgecdn.net/files/4567/890/Create-1.20.1%20%28v0.5.1f%29%21%27%2A.jar"
-        );
-        assert_eq!(
-            cdn.url(999, "ü.jar"),
-            "https://mediafilez.forgecdn.net/files/0/999/%C3%BC.jar"
-        );
-    }
-}
+mod tests;

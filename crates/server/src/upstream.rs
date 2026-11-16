@@ -54,12 +54,16 @@ impl Source {
     }
 }
 
-/// Why an upstream gave no answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Why an upstream gave no answer, worded to follow the upstream's name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum UpstreamFailure {
+    #[error("did not answer in time")]
     Timeout,
+    #[error("could not be reached")]
     Unreachable,
+    #[error("answered with more than the gateway keeps")]
     TooLarge,
+    #[error("answered with something the gateway cannot read")]
     Unreadable,
 }
 
@@ -146,7 +150,13 @@ pub async fn read(
         .headers()
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok()?.parse::<usize>().ok());
-    if announced.is_some_and(|length| length > MAX_ANSWER_BYTES) {
+    if let Some(bytes) = announced.filter(|length| *length > MAX_ANSWER_BYTES) {
+        tracing::warn!(
+            upstream = name,
+            bytes,
+            limit = MAX_ANSWER_BYTES,
+            "the upstream announced an answer larger than the gateway reads"
+        );
         return Err(UpstreamFailure::TooLarge);
     }
     let mut body = Vec::with_capacity(announced.unwrap_or(0));
@@ -156,6 +166,11 @@ pub async fn read(
         .map_err(|error| failure(error, name))?
     {
         if body.len() + chunk.len() > MAX_ANSWER_BYTES {
+            tracing::warn!(
+                upstream = name,
+                limit = MAX_ANSWER_BYTES,
+                "the upstream's answer grew past the size the gateway reads while being read"
+            );
             return Err(UpstreamFailure::TooLarge);
         }
         body.extend_from_slice(&chunk);
@@ -173,10 +188,39 @@ pub async fn read(
 /// Why `name` gave no answer, from the error reqwest reported.
 pub fn failure(error: reqwest::Error, name: &'static str) -> UpstreamFailure {
     if error.is_timeout() {
-        tracing::warn!("{name} did not answer in time: {error}");
+        tracing::warn!(upstream = name, %error, "the upstream did not answer in time");
         UpstreamFailure::Timeout
     } else {
-        tracing::warn!("{name} could not be reached: {error}");
+        tracing::warn!(upstream = name, %error, "the upstream could not be reached");
         UpstreamFailure::Unreachable
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn response(length: Option<&str>, body: Vec<u8>) -> reqwest::Response {
+        let mut response = axum::http::Response::builder().status(200);
+        if let Some(length) = length {
+            response = response.header(CONTENT_LENGTH, length);
+        }
+        reqwest::Response::from(response.body(body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn an_answer_announced_larger_than_the_gateway_keeps_is_not_read() {
+        let announced = (MAX_ANSWER_BYTES + 1).to_string();
+        let got = read(response(Some(&announced), Vec::new()), "CurseForge").await;
+        assert_eq!(got.err(), Some(UpstreamFailure::TooLarge));
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_grows_past_what_the_gateway_keeps_is_dropped() {
+        let got = read(response(None, vec![b'x'; MAX_ANSWER_BYTES + 1]), "Modrinth").await;
+        assert_eq!(got.err(), Some(UpstreamFailure::TooLarge));
+
+        let kept = read(response(None, vec![b'x'; MAX_ANSWER_BYTES]), "Modrinth").await;
+        assert_eq!(kept.unwrap().answer.body.len(), MAX_ANSWER_BYTES);
     }
 }

@@ -28,11 +28,11 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-utoipa = { version = "6.0.0", default-features = false, features = ["macros"] }
+utoipa.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
-tokio = { workspace = true, features = ["io-util"] }
+tokio = { workspace = true, features = ["io-util", "test-util"] }
 tower.workspace = true
 
 [lints]

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use axum::{
     body::Bytes,
     http::{
-        HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
+        HeaderMap, HeaderName, Method, StatusCode, Uri,
         header::{CACHE_CONTROL, CONTENT_TYPE},
     },
     response::{IntoResponse, Response},
@@ -13,17 +13,15 @@ use crate::{
     app::AppState,
     auth::Pool,
     batch::{self, Batch},
-    budget::{self, Refusal},
-    cache::{Answer, AnswerCache, Entry, Finisher, LoadFailure, Outcome},
+    cache::{Answer, CacheStatus, Entry, LoadFailure, Outcome},
     curseforge::{self, Share},
     error::ApiError,
+    load::{self, PerId},
     modrinth,
-    upstream::{Source, UpstreamFailure},
+    upstream::Source,
 };
 
-pub const MINUTE_MS: u64 = 60_000;
-pub const HOUR_MS: u64 = 60 * MINUTE_MS;
-pub const DAY_MS: u64 = 24 * HOUR_MS;
+pub const SHA1_LENGTH: usize = 40;
 const X_CACHE: HeaderName = HeaderName::from_static("x-cache");
 
 /// How long an answer of a route stays fresh, found and (when a 404 is kept) not found.
@@ -40,8 +38,7 @@ pub const fn fresh(found_ms: u64, not_found_ms: Option<u64>) -> Option<Freshness
     })
 }
 
-/// Whether `segment` may be sent to `source`: letters, digits, `-`, `_` and the source's slug characters.
-pub fn valid_segment(source: Source, segment: &str) -> bool {
+fn valid_segment(source: Source, segment: &str) -> bool {
     let slug_byte = |byte: u8| source.slug_characters().as_bytes().contains(&byte);
     !segment.is_empty()
         && segment != "."
@@ -49,6 +46,12 @@ pub fn valid_segment(source: Source, segment: &str) -> bool {
         && segment.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || slug_byte(byte)
         })
+}
+
+/// A lowercase SHA-1, or none when the text is not one.
+pub fn sha1_of(text: &str) -> Option<String> {
+    (text.len() == SHA1_LENGTH && text.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| text.to_ascii_lowercase())
 }
 
 pub fn is_id(segment: &str) -> bool {
@@ -133,142 +136,105 @@ pub async fn passthrough(state: Arc<AppState>, source: Source, request: Request)
         (false, _) => None,
     };
     let Some(freshness) = freshness else {
-        let call = {
-            let (state, pool) = (state.clone(), pool.clone());
-            tokio::spawn(async move {
-                call(&state, source, &pool, method, &path, query.as_deref(), body).await
-            })
-        };
-        return match call.await {
-            Ok(Ok(answer)) => respond(&answer, "miss"),
-            Ok(Err(failure)) => failed(failure, &pool, source),
-            Err(_) => failed(
-                LoadFailure::Upstream(UpstreamFailure::Unreachable),
-                &pool,
-                source,
-            ),
-        };
+        return uncached(state, source, pool, method, path, query, body).await;
     };
-
     let share = match source {
         Source::CurseForge => curseforge::share_of(&segments, query.as_deref()),
         Source::Modrinth => None,
     };
     let key = match share {
-        Some(Share::Mod(project)) => Batch::Mods.key(project),
+        Some(Share::Mod(project)) => Batch::Mods.key(&project),
         _ => source.key(&cache_key(&path, query.as_deref())),
     };
-    let (shared_file, cached) = match share {
-        Some(Share::File { file, .. }) => {
-            let mut found = state
-                .cache
-                .lookup_many(&[Batch::Files.key(file), key.clone()], state.clock.now_ms())
-                .await;
-            let cached = found.pop().flatten();
-            (found.pop().flatten(), cached)
-        }
-        _ => (None, state.cache.lookup(&key, state.clock.now_ms()).await),
+    let get = Get {
+        state,
+        source,
+        pool,
+        key,
+        path,
+        query,
+        freshness,
+        share,
     };
-    let now = state.clock.now_ms();
-    let budget = state.budget_of(source);
-    if !forced
-        && let Some(Share::File { project, .. }) = share
-        && let Some(entry) = shared_file.filter(|entry| {
-            entry.is_fresh(now)
-                && entry.answer.status == StatusCode::OK
-                && entry.owner == Some(project)
+    get.answer(forced).await
+}
+
+async fn uncached(
+    state: Arc<AppState>,
+    source: Source,
+    pool: Pool,
+    method: Method,
+    path: String,
+    query: Option<String>,
+    body: Bytes,
+) -> Response {
+    let call = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            state
+                .budget_of(source)
+                .admit(&pool, 1)
+                .await
+                .map_err(LoadFailure::Refused)?;
+            send_recorded(&state, source, &pool, method, &path, query.as_deref(), body).await
         })
-    {
-        budget.record_hit(&pool.consumer, &pool.name);
-        return respond(&entry.answer, "hit");
-    }
-    if !forced && let Some(entry) = cached.as_ref().filter(|entry| entry.is_fresh(now)) {
-        budget.record_hit(&pool.consumer, &pool.name);
-        return respond(&entry.answer, "hit");
-    }
-
-    let load_key = if forced {
-        format!("{key} no-cache")
-    } else {
-        key.clone()
     };
-    let (waiting, finisher) = state.cache.join(&load_key);
-    let started = finisher.is_some();
-    if let Some(finisher) = finisher {
-        let load = Load {
-            state: state.clone(),
-            source,
-            pool: pool.clone(),
-            key,
-            load_key,
-            path,
-            query,
-            freshness,
-            share,
-            forced,
-        };
-        tokio::spawn(load.run(finisher));
-    }
-    let outcome = AnswerCache::wait(waiting).await.unwrap_or(Outcome {
-        loaded: Err(LoadFailure::Upstream(UpstreamFailure::Unreachable)),
-        called: false,
-    });
-
-    match outcome.loaded {
-        Ok(entry) => {
-            if started && outcome.called {
-                respond(&entry.answer, "miss")
-            } else {
-                budget.record_hit(&pool.consumer, &pool.name);
-                respond(&entry.answer, "hit")
-            }
-        }
-        Err(failure) => {
-            let stale = cached.filter(|entry| entry.is_stale(state.clock.now_ms()));
-            match stale {
-                Some(entry) if batch::failed_upstream(&failure) => {
-                    budget.record_hit(&pool.consumer, &pool.name);
-                    respond(&entry.answer, "stale")
-                }
-                _ => failed(failure, &pool, source),
-            }
+    match call.await {
+        Ok(Ok(answer)) => respond(&answer, CacheStatus::Miss),
+        Ok(Err(failure)) => failed(failure, &pool, source),
+        Err(error) => {
+            tracing::warn!(upstream = source.name(), %pool, %error, "an uncached call ended without an answer");
+            failed(LoadFailure::Lost, &pool, source)
         }
     }
 }
 
-struct Load {
+struct Get {
     state: Arc<AppState>,
     source: Source,
     pool: Pool,
     key: String,
-    load_key: String,
     path: String,
     query: Option<String>,
     freshness: Freshness,
     share: Option<Share>,
-    forced: bool,
 }
 
-impl Load {
-    async fn run(self, finisher: Finisher) {
-        let outcome = self.outcome().await;
-        self.state.cache.finish(&self.load_key, finisher, outcome);
+fn whole(entry: &Arc<Entry>) -> Option<Arc<Entry>> {
+    Some(entry.clone())
+}
+
+impl Get {
+    async fn answer(self, forced: bool) -> Response {
+        let (state, source, pool) = (self.state.clone(), self.source, self.pool.clone());
+        let budget = state.budget_of(source);
+        if !forced && let Some(Share::File { project, file }) = self.share {
+            let now = state.clock.now_ms();
+            let shared = state.cache.lookup(&Batch::Files.key(&file), now).await;
+            if let Some(entry) = shared.filter(|entry| {
+                entry.is_fresh(now)
+                    && entry.answer.status == StatusCode::OK
+                    && entry.owner == Some(project)
+            }) {
+                budget.record_hit(&pool);
+                return respond(&entry.answer, CacheStatus::Hit);
+            }
+        }
+        match load::one(&state, self.key.clone(), forced, whole, self.fetch()).await {
+            Ok(given) => {
+                let given = given.counted(budget, &pool);
+                respond(&given.value.answer, given.cache)
+            }
+            Err(failure) => failed(failure, &pool, source),
+        }
     }
 
-    async fn outcome(&self) -> Outcome {
+    async fn fetch(self) -> Outcome {
         let state = &self.state;
-        if !self.forced
-            && let Some(entry) = state
-                .cache
-                .get(&self.key)
-                .filter(|entry| entry.is_fresh(state.clock.now_ms()))
-        {
-            return Outcome {
-                loaded: Ok(entry),
-                called: false,
-            };
+        if let Err(refusal) = state.budget_of(self.source).admit(&self.pool, 1).await {
+            return Outcome::not_called(Err(LoadFailure::Refused(refusal)));
         }
-        let answer = match call(
+        let sent = send_recorded(
             state,
             self.source,
             &self.pool,
@@ -277,15 +243,10 @@ impl Load {
             self.query.as_deref(),
             Bytes::new(),
         )
-        .await
-        {
+        .await;
+        let answer = match sent {
             Ok(answer) => answer,
-            Err(failure) => {
-                return Outcome {
-                    loaded: Err(failure),
-                    called: true,
-                };
-            }
+            Err(failure) => return Outcome::called(Err(failure)),
         };
         let fresh_ms = match answer.status {
             StatusCode::OK => Some(self.freshness.found_ms),
@@ -293,10 +254,7 @@ impl Load {
             _ => None,
         };
         let Some(fresh_ms) = fresh_ms else {
-            return Outcome {
-                loaded: Err(LoadFailure::Answered(answer)),
-                called: true,
-            };
+            return Outcome::called(Err(LoadFailure::Answered(answer)));
         };
         let found = answer.status == StatusCode::OK;
         let mut entry = Entry::new(answer, state.clock.now_ms(), fresh_ms);
@@ -313,30 +271,10 @@ impl Load {
             && entry.row.is_some()
             && entry.owner == Some(project)
         {
-            state.cache.insert(&Batch::Files.key(file), entry.clone());
+            state.cache.insert(&Batch::Files.key(&file), entry.clone());
         }
-        Outcome {
-            loaded: Ok(entry),
-            called: true,
-        }
+        Outcome::called(Ok(entry))
     }
-}
-
-async fn call(
-    state: &AppState,
-    source: Source,
-    pool: &Pool,
-    method: Method,
-    path: &str,
-    query: Option<&str>,
-    body: Bytes,
-) -> Result<Answer, LoadFailure> {
-    state
-        .budget_of(source)
-        .admit(&pool.consumer, &pool.name, 1)
-        .await
-        .map_err(LoadFailure::Refused)?;
-    send_recorded(state, source, pool, method, path, query, body).await
 }
 
 /// Sends one call the budget of `source` already admitted and records it. A 429 comes back as the hold it starts.
@@ -356,32 +294,26 @@ pub async fn send_recorded(
         .await
     {
         Ok(sent) => {
-            budget
+            let hold = budget
                 .record(
-                    &pool.consumer,
-                    &pool.name,
+                    pool,
                     Some(sent.answer.status.as_u16()),
                     sent.retry_after.as_deref(),
                 )
                 .await;
-            if sent.answer.status == StatusCode::TOO_MANY_REQUESTS {
-                return Err(LoadFailure::Refused(Refusal::Hold {
-                    retry_after_ms: budget::hold_ms(
-                        sent.retry_after.as_deref(),
-                        state.clock.now_ms(),
-                    ),
-                }));
+            match hold {
+                Some(hold) => Err(LoadFailure::Refused(hold)),
+                None => Ok(sent.answer),
             }
-            Ok(sent.answer)
         }
         Err(failure) => {
-            budget.record(&pool.consumer, &pool.name, None, None).await;
+            budget.record(pool, None, None).await;
             Err(LoadFailure::Upstream(failure))
         }
     }
 }
 
-pub fn respond(answer: &Answer, cache: &'static str) -> Response {
+pub fn respond(answer: &Answer, cache: CacheStatus) -> Response {
     let mut response = (answer.status, answer.body.clone()).into_response();
     let headers = response.headers_mut();
     match &answer.content_type {
@@ -392,18 +324,22 @@ pub fn respond(answer: &Answer, cache: &'static str) -> Response {
             headers.remove(CONTENT_TYPE);
         }
     }
-    headers.insert(X_CACHE, HeaderValue::from_static(cache));
+    headers.insert(X_CACHE, cache.header());
     response
 }
 
 pub fn failed(failure: LoadFailure, pool: &Pool, source: Source) -> Response {
     match failure {
-        LoadFailure::Answered(answer) => respond(&answer, "miss"),
+        LoadFailure::Answered(answer) => respond(&answer, CacheStatus::Miss),
         LoadFailure::Refused(refusal) => {
             ApiError::refused(refusal, &pool.name, source.name()).into_response()
         }
         LoadFailure::Upstream(failure) => {
             ApiError::upstream(failure, source.name()).into_response()
         }
+        LoadFailure::Lost => ApiError::internal().into_response(),
     }
 }
+
+#[cfg(test)]
+mod tests;

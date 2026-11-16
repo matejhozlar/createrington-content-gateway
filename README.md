@@ -53,7 +53,7 @@ Every process that calls the gateway is a consumer with its own bearer token (at
 
 Names and pools are 1 to 64 lowercase letters, digits and `-`, starting with a letter or digit. A request sends `Authorization: Bearer <token>`, and `X-Budget-Pool: <pool>` when its token has more than one pool. One ceiling per minute covers all pools; every pool is counted on its own.
 
-An empty value counts as unset. An invalid value stops the gateway at startup with a message saying what is wrong. `.env.example` lists every variable. The gateway does not read a `.env` file by itself: export the variables, or let `docker compose` or `docker run --env-file .env` pass the file.
+Values are trimmed of surrounding whitespace, and an empty value counts as unset. An invalid value stops the gateway at startup with a message that names the variable and says what is wrong. `.env.example` lists every variable. The gateway does not read a `.env` file by itself: export the variables, or let `docker compose` or `docker run --env-file .env` pass the file.
 
 Two more variables are read at build time, not at runtime. `/v1/healthz` reports them, and they are `null` when unset:
 
@@ -123,7 +123,7 @@ User=content-gateway
 
 `source` in the budget says where its counts come from: `redis` for the stored ones, `memory` when no Redis is configured, and `unavailable` when Redis did not answer, in which case the minute is the gateway's own count and the days show only what is not written to Redis yet.
 
-The gateway's own answers are described by [`openapi.json`](openapi.json), which the server derives from its types (`content-gateway --openapi` prints it). Its `info.version` is the version of the API, the `1` of `/v1`; the gateway's own version is in `/v1/healthz`. The CurseForge answers are CurseForge's and are not described there. TypeScript consumers install [`@createrington/content-gateway-client`](packages/client/README.md) and Python consumers [`content-gateway-client`](packages/python-client/README.md), whose types come from the document; anyone else can generate a client from it.
+The gateway's own answers are described by [`openapi.json`](openapi.json), which the server derives from its types (`content-gateway --openapi` prints it). Its `info.version` is the version of the API, the `1` of `/v1`; the gateway's own version is in `/v1/healthz`. The CurseForge answers are CurseForge's and are not described there. TypeScript consumers install [`@createrington/content-gateway-client`](packages/client/README.md) from npm (`pnpm add @createrington/content-gateway-client zod`) and Python consumers [`content-gateway-client`](packages/python-client/README.md), whose types come from the document; anyone else can generate a client from it.
 
 ### CurseForge
 
@@ -142,15 +142,15 @@ These answers are kept and given again while they are fresh, marked `X-Cache: hi
 | `GET /mods/{id}/files/{fileId}/changelog`, `GET /mods/{id}/description` | 24 h   |                 |
 | `POST /fingerprints/432`, `POST /fingerprints` (per fingerprint)        | 1 h    | 10 min          |
 
-`POST /mods` with a body of only `{"modIds": [...]}` and `POST /mods/files` with only `{"fileIds": [...]}` are kept per id, and each id is shared with `GET /mods/{id}` or `GET /mods/{id}/files/{fileId}` (a file only under its own project, since CurseForge answers 404 for a file under another one). Only the ids that are not kept are asked for, 100 per call, and the budget admits all of those calls or none. The answer is `{"data": [...]}` with one row per known id in the order asked, without repeats, or a 404 without a body when CurseForge knows none of them, as it answers itself.
+`POST /mods` with a body of only `{"modIds": [...]}` and `POST /mods/files` with only `{"fileIds": [...]}` are kept per id, and each id is shared with `GET /mods/{id}` or `GET /mods/{id}/files/{fileId}` (a file only under its own project, since CurseForge answers 404 for a file under another one). Only the ids that are not kept are asked for, 100 per call, and the budget admits all of those calls or none. A batch may list up to 1000 different ids; more answer `400 INVALID_BODY`. The answer is `{"data": [...]}` with one row per known id in the order asked, without repeats, or a 404 without a body when CurseForge knows none of them, as it answers itself.
 
-`POST /fingerprints/432` and `POST /fingerprints` with a body of only `{"fingerprints": [...]}` are kept per fingerprint, each route on its own: the files that matched it, as CurseForge sent them. Only fingerprints that are not kept are asked for, 100 per call. The answer is rebuilt in CurseForge's shape: `exactMatches` in the order asked, `exactFingerprints` for the ones that matched, `installedFingerprints` as asked (repeats included), empty `partialMatches` and `partialMatchFingerprints`, and `unmatchedFingerprints: null`, which is what CurseForge answers for a list of mod files. An answer from CurseForge with partial matches is not split and answers `502 UPSTREAM_UNREADABLE`.
+`POST /fingerprints/432` and `POST /fingerprints` with a body of only `{"fingerprints": [...]}` are kept per fingerprint, each route on its own: the files that matched it, as CurseForge sent them. Only fingerprints that are not kept are asked for, 100 per call, up to 1000 different fingerprints in a batch. The answer is rebuilt in CurseForge's shape: `exactMatches` in the order asked, `exactFingerprints` for the ones that matched, `installedFingerprints` as asked (repeats included), empty `partialMatches` and `partialMatchFingerprints`, and `unmatchedFingerprints: null`, which is what CurseForge answers for a list of mod files. An answer from CurseForge with partial matches is not split and answers `502 UPSTREAM_UNREADABLE`.
 
-Every other route, and every other `POST`, goes to CurseForge each time. Other statuses are never kept. `Cache-Control: no-cache` asks CurseForge again and keeps the new answer. A kept answer stays for 24 h after its fresh time and is given, marked `X-Cache: stale`, when the budget refuses the call, CurseForge holds the key off, answers 5xx or does not answer.
+Every other route, and every other `POST`, goes to CurseForge each time. Other statuses are never kept. `Cache-Control: no-cache` asks CurseForge again and keeps the new answer. A kept answer stays for 24 h after its fresh time and is given, marked `X-Cache: stale`, when the budget refuses the call, CurseForge holds the key off, answers 5xx or does not answer. A stale answer counts as a hit only when no call was made for it: one given after a call that failed is counted as that call.
 
 Without a kept answer, a 429 from CurseForge answers `503 UPSTREAM_HOLD` like any held call, a CurseForge that does not answer within 10 s `504 UPSTREAM_TIMEOUT`, and one that cannot be reached `502 UPSTREAM_UNREACHABLE`.
 
-Errors answer `{ "code", "message" }`. A call the budget refuses answers `503` with `Retry-After`, plus `pool` and `retryAfterMs` in the body; `code` is `BUDGET_SPENT` when the minute's ceiling is reached and `UPSTREAM_HOLD` while CurseForge's 429 hold lasts. A request that needs more calls than a whole minute allows answers `413 REQUEST_TOO_LARGE` without `Retry-After`, since waiting would not help.
+Errors answer `{ "code", "message" }`. A call the budget refuses answers `503` with `Retry-After`, plus `pool` and `retryAfterMs` in the body; `code` is `BUDGET_SPENT` when the minute's ceiling is reached and `UPSTREAM_HOLD` while CurseForge's 429 hold lasts. A request that needs more calls than a whole minute allows answers `413 REQUEST_TOO_LARGE` without `Retry-After`, since waiting would not help. A path no route serves answers `404 UNKNOWN_ROUTE`. A request the gateway itself failed to finish, such as one whose load task died, answers `500 INTERNAL` and leaves the cause in the gateway's log; a kept answer still stands in for it.
 
 ### Modrinth
 
@@ -185,7 +185,7 @@ These routes serve the version lists so that no consumer fetches and caches them
 
 - `GET /v1/minecraft/versions?type=release&loader=neoforge`: the versions Mojang lists, newest first, with `latest.release` and `latest.snapshot`. `type` is `release` (the default), `snapshot` or `all`. `loader` keeps only the versions that loader has at least one build for, which is what a server or pack picker should offer.
 - `GET /v1/minecraft/versions/{id}`: one version with `javaMajor`, the Java it runs on, and `javaComponent`, Mojang's runtime for it, from Mojang's document of the version; `404 UNKNOWN_VERSION` for an id Mojang does not list.
-- `GET /v1/minecraft/loaders/{loader}/versions?minecraft=1.21.1`: a loader's builds, newest first, each with the `minecraft` version it is for and `stable` and `recommended` flags. `neoforge` lists every build from Maven (betas marked unstable), `forge` the promoted builds (the recommended and the latest per Minecraft version, which is what pickers show), `fabric` every loader from its meta. `minecraft` keeps only the builds for that version; Fabric's loader is not tied to one, so that answers all of them when Fabric supports the version and none otherwise. `404 UNKNOWN_LOADER` for anything else.
+- `GET /v1/minecraft/loaders/{loader}/versions?minecraft=1.21.1`: a loader's builds, newest first, each with the `minecraft` version it is for and `stable` and `recommended` flags. `neoforge` lists every build from Maven (betas marked unstable), `forge` the promoted builds (the recommended and the latest per Minecraft version, which is what pickers show), `fabric` every loader from its meta. `minecraft` keeps only the builds for that version; Fabric's loader is not tied to one, so that answers all of them when Fabric supports the version and none otherwise. The loader is read in any case, in the path and in `loader=` of the route above. `404 UNKNOWN_LOADER` for anything else, `400 INVALID_QUERY` for `minecraft` given twice.
 - `GET /v1/minecraft/java?platform=linux&major=21` (or `&component=java-runtime-delta`): a Java runtime Mojang ships with its launcher, with its `component`, `major`, `version` and the `url`, `sha1` and `size` of Mojang's manifest, which lists every file of the runtime with its own address, SHA-1 and size. `platform` is Mojang's name: `linux`, `linux-i386`, `mac-os`, `mac-os-arm64`, `windows-x64`, `windows-x86` or `windows-arm64`. `major` picks the newest runtime of that Java major; `component` names one exactly, as `javaComponent` of a version does. `404 UNKNOWN_RUNTIME` when Mojang ships no such runtime for the platform. The runtime's files never pass through the gateway.
 
 ## Keep it private
@@ -209,6 +209,8 @@ pnpm format:check
 pnpm audit --audit-level=high
 ```
 
+`cargo test` skips the tests that need Redis and lists them as ignored. To run them as well, point `CONTENT_GATEWAY_TEST_REDIS_URL` at a Redis (each test keeps its keys under a prefix of its own and deletes them when it passes, so use a Redis you can empty) and run `cargo test --workspace --locked -- --include-ignored`, as CI does.
+
 The Python client's checks (ruff, mypy, pytest and its generate check) run with uv in `packages/python-client`, see [its README](packages/python-client/README.md).
 
 `openapi.json`, `packages/client/src/generated/openapi.ts` and `packages/python-client/src/content_gateway/generated.py` are generated and checked in: `cargo test` fails when the document no longer matches the server, and each client's generate check fails when its types no longer match the document. `pnpm openapi` rewrites all three; the Python step needs [uv](https://docs.astral.sh/uv/), which also runs the Python client's own checks (see its README).
@@ -231,7 +233,12 @@ A server release is the `vX.Y.Z` tag on the release merge into `main`. On GitHub
 
 ### Releasing the client
 
-The client package is versioned with [changesets](https://github.com/changesets/changesets), apart from the server. A change to `packages/client` comes with a changeset written on its branch (`pnpm changeset`); CI refuses a changed client without one. The release PR runs `pnpm version-packages`, which turns the changesets into the version bump and the package's `CHANGELOG.md` entry, and the merge into `main` publishes that version to the npm registry named by the `NPM_PUBLISH_REGISTRY` repository variable (`.gitea/workflows/publish-client.yml`, with the registry token in the `NPM_PUBLISH_TOKEN` secret). A version the registry already has is not published again, and a merge that still carries unconsumed changesets fails instead of publishing.
+The client package is versioned with [changesets](https://github.com/changesets/changesets), apart from the server. A change to `packages/client` comes with a changeset written on its branch (`pnpm changeset`); CI refuses a changed client without one. The release PR runs `pnpm version-packages`, which turns the changesets into the version bump and the package's `CHANGELOG.md` entry. The version that lands on `main` is published twice:
+
+- to [npmjs](https://www.npmjs.com/), by the `npm` job of `.github/workflows/release.yml` when the release tag reaches GitHub. It publishes with npm's [trusted publishing](https://docs.npmjs.com/trusted-publishers) and provenance, so no token is stored anywhere: the package's settings on npmjs name this repository and `release.yml` as its trusted publisher.
+- to the npm registry named by the `NPM_PUBLISH_REGISTRY` repository variable, by `.gitea/workflows/publish-client.yml` on the merge into `main`, with the registry token in the `NPM_PUBLISH_TOKEN` secret. A fork without a registry of its own deletes this workflow.
+
+Both check, build and test the client first, skip a version their registry already has, and fail instead of publishing while unconsumed changesets are left.
 
 ## Contributing
 

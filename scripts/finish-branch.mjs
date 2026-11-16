@@ -1,8 +1,8 @@
 import {
   checkout,
-  fail,
   fetch,
   git,
+  gitOrFail,
   requireCleanTree,
   update,
 } from "./git.mjs";
@@ -28,10 +28,7 @@ if (branch === base || branch === "HEAD") {
   );
   process.exit(0);
 }
-try {
-  console.log(git(["branch", force ? "-D" : "-d", branch]));
-} catch {
-  fail(
-    `Kept ${branch}: git does not see it as merged into ${base}. If it was squash merged, run: pnpm branch:done --force`,
-  );
-}
+gitOrFail(
+  ["branch", force ? "-D" : "-d", branch],
+  `Kept ${branch}: git does not see it as merged into ${base}. If it was squash merged, run: pnpm branch:done --force`,
+);

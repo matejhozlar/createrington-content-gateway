@@ -17,10 +17,11 @@ jobs:
   publish:
     if: github.ref == 'refs/heads/main'
     runs-on: oracle
+    timeout-minutes: 15
     env:
       NPM_PUBLISH_REGISTRY: ${{ vars.NPM_PUBLISH_REGISTRY }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Validate the publish variables
         run: |
@@ -30,25 +31,10 @@ jobs:
         uses: ./.ci/actions/setup
 
       - name: Refuse to publish with changesets left unconsumed
-        run: |
-          pending=$(find .changeset -name '*.md' ! -name README.md)
-          if [ -n "$pending" ]; then
-            echo "::error::These changesets were not turned into a version, run pnpm version-packages in the release PR:"
-            echo "$pending"
-            exit 1
-          fi
+        run: node scripts/check-pending-changesets.mjs
 
-      - name: Check the generated types
-        run: pnpm --filter @createrington/content-gateway-client generate:check
-
-      - name: Typecheck
-        run: pnpm --filter @createrington/content-gateway-client typecheck
-
-      - name: Test
-        run: pnpm --filter @createrington/content-gateway-client test
-
-      - name: Build
-        run: pnpm --filter @createrington/content-gateway-client build
+      - name: Client checks
+        uses: ./.ci/actions/client
 
       - name: Publish the version the registry does not have yet
         env:

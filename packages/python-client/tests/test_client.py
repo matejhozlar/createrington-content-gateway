@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import pickle
 import time
-from collections.abc import Callable
-from typing import Any
+from collections.abc import Callable, Coroutine, Iterator
+from typing import Any, cast, get_overloads
 
 import httpx
 import pytest
@@ -28,7 +29,7 @@ class FakeGateway:
 
     def __init__(self) -> None:
         self.requests: list[httpx.Request] = []
-        self.replies: list[httpx.Response] = []
+        self.replies: list[httpx.Response | httpx.TransportError] = []
 
     def reply(
         self,
@@ -46,11 +47,17 @@ class FakeGateway:
         else:
             self.replies.append(httpx.Response(status, json=body, headers=sent))
 
+    def fail(self, error: httpx.TransportError) -> None:
+        self.replies.append(error)
+
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         if not self.replies:
             raise AssertionError(f"no reply queued for {request.method} {request.url}")
-        return self.replies.pop(0)
+        reply = self.replies.pop(0)
+        if isinstance(reply, httpx.TransportError):
+            raise reply
+        return reply
 
     def client(self) -> httpx.Client:
         return httpx.Client(transport=httpx.MockTransport(self.handle))
@@ -63,21 +70,119 @@ class FakeGateway:
         return self.requests[-1]
 
 
+class Blocking:
+    """Drives an `AsyncContentGateway` through the sync class's interface, awaiting each call on one event loop, so every test runs against both classes."""
+
+    def __init__(self, gateway: AsyncContentGateway, runner: asyncio.Runner) -> None:
+        self._gateway = gateway
+        self._runner = runner
+
+    def __getattr__(self, name: str) -> Any:
+        found = getattr(self._gateway, "aclose" if name == "close" else name)
+        if not callable(found):
+            return found
+
+        def call(*args: Any, **kwargs: Any) -> Any:
+            return self._wait(found(*args, **kwargs))
+
+        return call
+
+    def __enter__(self) -> Blocking:
+        self._wait(self._gateway.__aenter__())
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._wait(self._gateway.__aexit__(*exc))
+
+    def _wait(self, result: Any) -> Any:
+        if inspect.iscoroutine(result):
+            return self._runner.run(cast(Coroutine[Any, Any, Any], result))
+        return result
+
+
+Connect = Callable[..., ContentGateway]
+
+
 @pytest.fixture
 def fake() -> FakeGateway:
     return FakeGateway()
 
 
+@pytest.fixture(params=["sync", "async"])
+def connect(request: pytest.FixtureRequest, fake: FakeGateway) -> Iterator[Connect]:
+    """Makes a `ContentGateway`, or an `AsyncContentGateway` behind `Blocking`, on the fake unless `own_client` is set."""
+    with asyncio.Runner() as runner:
+
+        def connect(*, own_client: bool = False, **options: Any) -> ContentGateway:
+            if request.param == "sync":
+                client = None if own_client else fake.client()
+                return ContentGateway(BASE_URL + "/", token=TOKEN, client=client, **options)
+            async_client = None if own_client else fake.async_client()
+            gateway = AsyncContentGateway(
+                BASE_URL + "/", token=TOKEN, client=async_client, **options
+            )
+            return cast(ContentGateway, Blocking(gateway, runner))
+
+        yield connect
+
+
 @pytest.fixture
-def gateway(fake: FakeGateway) -> ContentGateway:
-    return ContentGateway(BASE_URL + "/", token=TOKEN, pool="app", client=fake.client())
+def gateway(connect: Connect) -> ContentGateway:
+    return connect(pool="app")
 
 
 @pytest.fixture
 def no_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     slept: list[float] = []
+
+    async def sleep(seconds: float) -> None:
+        slept.append(seconds)
+
     monkeypatch.setattr(time, "sleep", slept.append)
+    monkeypatch.setattr(asyncio, "sleep", sleep)
     return slept
+
+
+def public(cls: type) -> set[str]:
+    return {name for name in dir(cls) if not name.startswith("_")}
+
+
+def test_the_async_class_mirrors_the_sync_one() -> None:
+    assert public(AsyncContentGateway) == public(ContentGateway) - {"close"} | {"aclose"}
+    for name in public(ContentGateway):
+        sync = getattr(ContentGateway, name)
+        twin = getattr(AsyncContentGateway, "aclose" if name == "close" else name)
+        assert inspect.iscoroutinefunction(twin), name
+        assert inspect.signature(twin) == inspect.signature(sync), name
+        overloads = [inspect.signature(o) for o in get_overloads(sync)]
+        assert [inspect.signature(o) for o in get_overloads(twin)] == overloads, name
+        if name != "close":
+            assert twin.__doc__ == sync.__doc__, name
+
+
+def shape(function: Callable[..., Any]) -> list[tuple[Any, ...]]:
+    """A function's parameters by name, kind and default, which hold across a sync and an async twin whose annotations name different classes."""
+    parameters = inspect.signature(function).parameters.values()
+    return [(p.name, p.kind, p.default) for p in parameters]
+
+
+def test_the_async_class_is_made_and_entered_like_the_sync_one() -> None:
+    sync_init = inspect.signature(ContentGateway.__init__)
+    async_init = inspect.signature(AsyncContentGateway.__init__)
+    assert async_init.replace(
+        parameters=[p for p in async_init.parameters.values() if p.name != "client"]
+    ) == sync_init.replace(
+        parameters=[p for p in sync_init.parameters.values() if p.name != "client"]
+    )
+    sync_client = sync_init.parameters["client"]
+    async_client = async_init.parameters["client"]
+    assert (async_client.kind, async_client.default) == (sync_client.kind, sync_client.default)
+    for sync, twin in (
+        (ContentGateway.__enter__, AsyncContentGateway.__aenter__),
+        (ContentGateway.__exit__, AsyncContentGateway.__aexit__),
+    ):
+        assert inspect.iscoroutinefunction(twin), twin.__name__
+        assert shape(twin) == shape(sync), twin.__name__
 
 
 def test_health_needs_no_token(fake: FakeGateway, gateway: ContentGateway) -> None:
@@ -171,6 +276,7 @@ def test_the_gateways_own_refusal_raises(fake: FakeGateway, gateway: ContentGate
     assert raised.value.code == "BUDGET_SPENT"
     assert raised.value.pool == "app"
     assert raised.value.retry_after_ms == 4000
+    assert raised.value.retry_after == 4.0
     assert str(raised.value) == "spent"
 
 
@@ -253,6 +359,7 @@ def test_retry_after_fills_the_error_when_the_body_says_nothing(
         gateway.curseforge("mods/1")
     assert raised.value.code is None
     assert raised.value.retry_after_ms == 7000
+    assert ContentGatewayError(502, None, "fallback").retry_after is None
 
 
 def test_a_bad_gateway_page_raises_with_its_text(
@@ -344,9 +451,9 @@ def test_java_runtime_by_major_or_component(fake: FakeGateway, gateway: ContentG
         == f"{BASE_URL}/v1/minecraft/java?platform=mac-os-arm64&component=jre-legacy"
     )
     with pytest.raises(ValueError, match="either major or component"):
-        gateway.java_runtime("linux")
+        gateway.java_runtime("linux")  # type: ignore[call-overload]
     with pytest.raises(ValueError, match="either major or component"):
-        gateway.java_runtime("linux", major=21, component="java-runtime-delta")
+        gateway.java_runtime("linux", major=21, component="java-runtime-delta")  # type: ignore[call-overload]
 
 
 def test_unknown_version_raises(fake: FakeGateway, gateway: ContentGateway) -> None:
@@ -380,79 +487,18 @@ def test_modrinth_file_url_picks_the_matching_file_on_the_cdn() -> None:
     assert modrinth_file_url({}, "aaa") is None
 
 
-def test_the_client_closes_only_what_it_made(fake: FakeGateway) -> None:
-    own = fake.client()
-    with ContentGateway(BASE_URL, token=TOKEN, client=own):
+def test_a_failure_that_never_reached_the_gateway_raises_httpxs_own(
+    fake: FakeGateway, gateway: ContentGateway
+) -> None:
+    fake.fail(httpx.ConnectError("connection refused"))
+    with pytest.raises(httpx.ConnectError, match="connection refused"):
+        gateway.curseforge("mods/1")
+
+
+def test_the_client_closes_only_what_it_made(connect: Connect) -> None:
+    with connect() as passed:
         pass
-    assert own.is_closed is False
-    made = ContentGateway(BASE_URL, token=TOKEN)
+    assert passed._client.is_closed is False
+    made = connect(own_client=True)
     made.close()
     assert made._client.is_closed is True
-
-
-def run(coroutine: Callable[[], Any]) -> Any:
-    return asyncio.run(coroutine())
-
-
-def test_async_client_sends_the_same_requests(fake: FakeGateway) -> None:
-    async def scenario() -> None:
-        async with AsyncContentGateway(
-            BASE_URL, token=TOKEN, pool="app", client=fake.async_client()
-        ) as gateway:
-            fake.reply(200, {"status": "ok", "version": "1"})
-            assert (await gateway.health())["status"] == "ok"
-            fake.reply(200, {"data": []}, headers={"x-cache": "stale"})
-            answer = await gateway.curseforge("mods", body={"modIds": [1]}, fresh=True)
-            assert answer.cache == "stale"
-            assert fake.last.headers["authorization"] == f"Bearer {TOKEN}"
-            assert fake.last.headers["cache-control"] == "no-cache"
-            fake.reply(200, {"id": "v"}, headers={"x-cache": "hit"})
-            assert (await gateway.modrinth_version_file("abc")).body == {"id": "v"}
-            fake.reply(200, {"files": []})
-            assert (await gateway.resolve([1]))["files"] == []
-            fake.reply(200, {"latest": {}, "versions": []})
-            await gateway.minecraft_versions()
-            fake.reply(200, {"id": "1"})
-            await gateway.minecraft_version("1")
-            fake.reply(200, {"loader": "fabric", "versions": []})
-            await gateway.loader_versions("fabric")
-            fake.reply(200, {"historyDays": 1})
-            await gateway.budget()
-            fake.reply(200, {}, headers={"x-cache": "miss"})
-            await gateway.modrinth_version_files(["a"])
-            fake.reply(502, {"error": "boom"}, headers={"x-cache": "miss"})
-            with pytest.raises(ContentGatewayError, match="passed on by the gateway"):
-                await gateway.resolve([1])
-            fake.reply(200, text="", headers={"content-type": "text/plain"})
-            with pytest.raises(ContentGatewayError, match="is not the gateway's JSON"):
-                await gateway.health()
-
-    run(scenario)
-    assert len(fake.requests) == 11
-
-
-def test_async_wait_up_to_sleeps_out_a_refusal(
-    fake: FakeGateway, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    slept: list[float] = []
-
-    async def fake_sleep(seconds: float) -> None:
-        slept.append(seconds)
-
-    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-
-    async def scenario() -> None:
-        async with AsyncContentGateway(
-            BASE_URL, token=TOKEN, client=fake.async_client()
-        ) as gateway:
-            fake.reply(503, {"code": "UPSTREAM_HOLD", "message": "held", "retryAfterMs": 500})
-            fake.reply(200, {"data": []}, headers={"x-cache": "miss"})
-            answer = await gateway.curseforge("mods/1", wait_up_to=3)
-            assert answer.ok is True
-            fake.reply(503, {"code": "UPSTREAM_HOLD", "message": "held", "retryAfterMs": 9000})
-            with pytest.raises(ContentGatewayError):
-                await gateway.curseforge("mods/1", wait_up_to=3)
-
-    run(scenario)
-    assert slept == [0.5]
-    assert len(fake.requests) == 3

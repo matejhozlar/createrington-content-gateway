@@ -155,6 +155,16 @@
               }
             }
           },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "502": {
             "description": "CurseForge could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
             "content": {
@@ -210,7 +220,7 @@
           "curseforge"
         ],
         "summary": "What `POST api.curseforge.com/v1/{path}` answers to this body.",
-        "description": "`POST mods` with only `{\"modIds\": [...]}`, `POST mods/files` with only `{\"fileIds\": [...]}`, and\n`POST fingerprints/432` or `POST fingerprints` with only `{\"fingerprints\": [...]}` are answered per id from the\ncache, and only the ids not kept are asked for, 100 per call. Every other body goes to CurseForge each time.",
+        "description": "`POST mods` with only `{\"modIds\": [...]}`, `POST mods/files` with only `{\"fileIds\": [...]}`, and\n`POST fingerprints/432` or `POST fingerprints` with only `{\"fingerprints\": [...]}` are answered per id from the\ncache, and only the ids not kept are asked for, 100 per call, at most 1000 different ids. Every other body goes to\nCurseForge each time.",
         "operationId": "curseforge_post",
         "parameters": [
           {
@@ -275,7 +285,7 @@
             }
           },
           "400": {
-            "description": "`INVALID_PATH`, `POOL_REQUIRED` or `UNKNOWN_POOL`",
+            "description": "`INVALID_PATH`, `INVALID_BODY` (a batch of more than 1000 different ids), `POOL_REQUIRED` or `UNKNOWN_POOL`",
             "content": {
               "application/json": {
                 "schema": {
@@ -296,6 +306,16 @@
           },
           "413": {
             "description": "The batch needs more calls than a whole minute allows, `REQUEST_TOO_LARGE`; split it",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
             "content": {
               "application/json": {
                 "schema": {
@@ -456,6 +476,16 @@
               }
             }
           },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "502": {
             "description": "Mojang could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
             "content": {
@@ -524,6 +554,16 @@
               }
             }
           },
+          "400": {
+            "description": "`INVALID_QUERY`: `minecraft` given more than once",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "401": {
             "description": "No valid consumer token",
             "content": {
@@ -536,6 +576,16 @@
           },
           "404": {
             "description": "No such loader, `UNKNOWN_LOADER`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
             "content": {
               "application/json": {
                 "schema": {
@@ -631,6 +681,16 @@
               }
             }
           },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "502": {
             "description": "Mojang or the loader's source could not be read: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
             "content": {
@@ -701,6 +761,16 @@
           },
           "404": {
             "description": "Mojang lists no such version, `UNKNOWN_VERSION`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
             "content": {
               "application/json": {
                 "schema": {
@@ -810,6 +880,16 @@
           },
           "401": {
             "description": "No valid consumer token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
             "content": {
               "application/json": {
                 "schema": {
@@ -969,6 +1049,16 @@
               }
             }
           },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
           "502": {
             "description": "Modrinth could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`",
             "content": {
@@ -1116,6 +1206,16 @@
           },
           "413": {
             "description": "The files need more CurseForge calls than a whole minute allows, `REQUEST_TOO_LARGE`; split them",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The gateway failed to finish the request: `INTERNAL`",
             "content": {
               "application/json": {
                 "schema": {
@@ -1342,13 +1442,15 @@
           "UNKNOWN_VERSION",
           "UNKNOWN_LOADER",
           "UNKNOWN_RUNTIME",
+          "UNKNOWN_ROUTE",
           "UPSTREAM_TIMEOUT",
           "UPSTREAM_UNREACHABLE",
           "UPSTREAM_TOO_LARGE",
           "UPSTREAM_UNREADABLE",
           "BUDGET_SPENT",
           "UPSTREAM_HOLD",
-          "REQUEST_TOO_LARGE"
+          "REQUEST_TOO_LARGE",
+          "INTERNAL"
         ]
       },
       "FileSource": {
@@ -1452,7 +1554,7 @@
       },
       "Loader": {
         "type": "string",
-        "description": "The mod loaders whose versions the gateway lists.",
+        "description": "The mod loaders whose versions the gateway lists, named in any case in a path or a query.",
         "enum": [
           "neoforge",
           "forge",
@@ -1753,7 +1855,7 @@
       },
       "Source": {
         "type": "string",
-        "description": "Where a readout's counts come from: `redis` when they are the stored ones, `memory` when no Redis is configured,\n`unavailable` when Redis did not answer, so the minute is this process's own count and the days hold only what\nis not written to Redis yet.",
+        "description": "Where a readout's counts come from: `redis` when they are the stored ones, `memory` when no Redis is configured,\n`unavailable` when Redis did not answer, so the minute is the calls this process let through or refused itself\nand the days hold only what is not written to Redis yet.",
         "enum": [
           "redis",
           "memory",
