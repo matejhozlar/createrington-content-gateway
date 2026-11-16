@@ -155,11 +155,13 @@ pub enum ConfigError {
         "{name} must be a User-Agent of printable ASCII, such as my-app/1.0 (https://example.com), got {value:?}"
     )]
     UserAgent { name: &'static str, value: String },
-    #[error("set {API_KEY_ENV} to the CurseForge API key the gateway calls CurseForge with")]
+    #[error(
+        "{API_KEY_ENV} must be set to the CurseForge API key the gateway calls CurseForge with"
+    )]
     NoApiKey,
-    #[error("set {CONSUMERS_ENV} or {TOKEN_ENV} so that something can call the gateway")]
+    #[error("{CONSUMERS_ENV} or {TOKEN_ENV} must be set so that something can call the gateway")]
     NoConsumers,
-    #[error("set {CONSUMERS_ENV} or {TOKEN_ENV}, not both")]
+    #[error("{CONSUMERS_ENV} and {TOKEN_ENV} are both set, set only one of them")]
     ConsumerSources,
     #[error(
         "{CONSUMERS_ENV} must be a JSON array of {{\"name\", \"token\", \"pools\"}} objects ({category} error at line {line} column {column})"
@@ -855,6 +857,15 @@ mod tests {
             (MODRINTH_BUDGET_ENV, invalid(&[(MODRINTH_BUDGET_ENV, "0")])),
             (HISTORY_DAYS_ENV, invalid(&[(HISTORY_DAYS_ENV, "0")])),
             (REDIS_ENV, invalid(&[(REDIS_ENV, "127.0.0.1")])),
+            (API_KEY_ENV, invalid(&[(API_KEY_ENV, " ")])),
+            (CONSUMERS_ENV, config_from(&[]).unwrap_err().to_string()),
+            (
+                CONSUMERS_ENV,
+                config_with_token(&[(CONSUMERS_ENV, "[]")])
+                    .unwrap_err()
+                    .to_string(),
+            ),
+            (CONSUMERS_ENV, consumers("{")),
             (USER_AGENT_ENV, invalid(&[(USER_AGENT_ENV, "a\tb")])),
             (
                 TOKEN_ENV,
