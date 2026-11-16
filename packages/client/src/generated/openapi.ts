@@ -482,8 +482,8 @@ export interface components {
     };
     /**
      * @description Where a readout's counts come from: `redis` when they are the stored ones, `memory` when no Redis is configured,
-     *     `unavailable` when Redis did not answer, so the minute is this process's own count and the days hold only what
-     *     is not written to Redis yet.
+     *     `unavailable` when Redis did not answer, so the minute is the calls this process let through or refused itself
+     *     and the days hold only what is not written to Redis yet.
      * @enum {string}
      */
     Source: "redis" | "memory" | "unavailable";

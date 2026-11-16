@@ -5,7 +5,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     app::{self, Addresses, AppState, Timeouts},
-    clock::SystemClock,
+    clock::{Clock, SystemClock},
     config::{self, Config, DEFAULT_LOG},
     openapi,
     redis_store::{self, RedisStore},
@@ -60,25 +60,28 @@ pub async fn run() -> ExitCode {
         }
     };
 
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let redis = match &config.redis_url {
         None => None,
-        Some(url) => match RedisStore::open(url.as_str(), redis_store::DEFAULT_PREFIX) {
-            Ok(store) => {
-                store.ping().await;
-                Some(Arc::new(store))
+        Some(url) => {
+            match RedisStore::open(url.as_str(), redis_store::DEFAULT_PREFIX, clock.clone()) {
+                Ok(store) => {
+                    store.ping().await;
+                    Some(Arc::new(store))
+                }
+                Err(error) => {
+                    tracing::error!("cannot use REDIS_URL: {error}");
+                    return ExitCode::FAILURE;
+                }
             }
-            Err(error) => {
-                tracing::error!("cannot use REDIS_URL: {error}");
-                return ExitCode::FAILURE;
-            }
-        },
+        }
     };
 
     let state = match AppState::new(
         &config,
         &Addresses::default(),
         Timeouts::default(),
-        Arc::new(SystemClock),
+        clock,
         redis,
     ) {
         Ok(state) => Arc::new(state),

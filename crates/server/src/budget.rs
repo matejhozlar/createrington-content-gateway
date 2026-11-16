@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
 };
 
 use axum::{
@@ -8,12 +8,14 @@ use axum::{
     extract::{Query, State, rejection::QueryRejection},
 };
 use jiff::{Timestamp, fmt::rfc2822};
-use redis::{Script, Value, aio::ConnectionManager};
+use redis::{ParsingError, Script, Value, aio::ConnectionManager};
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
     app::AppState,
+    auth::Pool,
     clock::{Clock, DAY_MS, MINUTE_MS},
     error::ApiError,
     redis_store::RedisStore,
@@ -32,45 +34,57 @@ pub const MAX_HISTORY_DAYS: u32 = 3660;
 const DEFAULT_SNAPSHOT_DAYS: u32 = 14;
 const HTTP_FORBIDDEN: u16 = 403;
 const HTTP_TOO_MANY_REQUESTS: u16 = 429;
-const ADMITTED: i64 = 0;
-const TOO_LARGE: i64 = 1;
-const HELD: i64 = 2;
-const SPENT: i64 = 3;
 
-const ADMIT_SCRIPT: &str = r"
+const KEEP_LATER_HOLD: &str = r"
+local function keep_later_hold(key, until_arg, now)
+  local stored = tonumber(redis.call('GET', key) or '0') or 0
+  local later = tonumber(until_arg)
+  if later > stored and later > now then
+    redis.call('SET', key, until_arg, 'PX', later - now)
+    return later
+  end
+  return stored
+end
+";
+
+fn admit_script() -> String {
+    format!(
+        r"{KEEP_LATER_HOLD}
 local calls = tonumber(ARGV[1])
 local limit = tonumber(ARGV[2])
 local now = tonumber(ARGV[3])
-local known = tonumber(ARGV[4])
-local stored = tonumber(redis.call('GET', KEYS[2]) or '0') or 0
-if known > stored and known > now then
-  redis.call('SET', KEYS[2], ARGV[4], 'PX', known - now)
-end
-local held = math.max(known, stored)
+local held = keep_later_hold(KEYS[2], ARGV[4], now)
 local used = tonumber(redis.call('HGET', KEYS[1], 'used') or '0') or 0
-local verdict = 0
+local counted = tonumber(ARGV[5])
+if counted > used then
+  redis.call('HSET', KEYS[1], 'used', counted)
+  used = counted
+end
+local verdict = {admitted}
 if calls > limit then
-  verdict = 1
+  verdict = {too_large}
 elseif held > now then
-  verdict = 2
+  verdict = {held}
 elseif used + calls > limit then
-  verdict = 3
+  verdict = {spent}
 end
 local count = 'used'
-if verdict ~= 0 then count = 'withheld' end
+if verdict ~= {admitted} then count = 'withheld' end
 redis.call('HINCRBY', KEYS[1], count, calls)
-redis.call('HINCRBY', KEYS[1], count .. ':' .. ARGV[5], calls)
-redis.call('PEXPIRE', KEYS[1], ARGV[6])
-return {verdict, held}
-";
+redis.call('HINCRBY', KEYS[1], count .. ':' .. ARGV[6], calls)
+redis.call('PEXPIRE', KEYS[1], ARGV[7])
+return {{verdict, held}}
+",
+        admitted = Verdict::Admitted.code(),
+        too_large = Verdict::TooLarge.code(),
+        held = Verdict::Held.code(),
+        spent = Verdict::Spent.code(),
+    )
+}
 
-const HOLD_SCRIPT: &str = r"
-local held = tonumber(redis.call('GET', KEYS[1]) or '0') or 0
-if tonumber(ARGV[1]) > held then
-  redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
-end
-return 0
-";
+fn hold_script() -> String {
+    format!("{KEEP_LATER_HOLD}\nreturn keep_later_hold(KEYS[1], ARGV[1], tonumber(ARGV[2]))\n")
+}
 
 /// Why calls were not let through: the minute's budget is spent, the upstream answered 429 and the hold has not ended,
 /// or the request needs more calls than a whole minute allows, which no retry can fix.
@@ -84,15 +98,48 @@ pub enum Refusal {
     TooLarge { calls: u32, limit_per_minute: u32 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Admitted,
+    TooLarge,
+    Held,
+    Spent,
+}
+
+impl Verdict {
+    const ALL: [Self; 4] = [Self::Admitted, Self::TooLarge, Self::Held, Self::Spent];
+
+    const fn code(self) -> i64 {
+        self as i64
+    }
+
+    fn of_code(code: i64) -> Option<Self> {
+        Self::ALL.into_iter().find(|verdict| verdict.code() == code)
+    }
+
+    fn reached(calls: u32, limit: u32, held_until_ms: u64, used: u32, now: u64) -> Self {
+        if calls > limit {
+            Self::TooLarge
+        } else if held_until_ms > now {
+            Self::Held
+        } else if used.saturating_add(calls) > limit {
+            Self::Spent
+        } else {
+            Self::Admitted
+        }
+    }
+}
+
 /// Counts and caps the calls every consumer makes on one upstream, in memory and in Redis when configured.
 pub struct Budget {
     limit_per_minute: u32,
     history_days: u32,
     upstream: upstream::Source,
-    pools: Vec<PoolKey>,
+    pools: Vec<Pool>,
     clock: Arc<dyn Clock>,
     memory: Arc<Mutex<Counts>>,
     redis: Option<Arc<Shared>>,
+    flush: OnceLock<mpsc::Sender<()>>,
 }
 
 struct Shared {
@@ -104,16 +151,14 @@ struct Shared {
     trimmed_on: Mutex<Option<String>>,
 }
 
-type PoolKey = (Arc<str>, Arc<str>);
-
 #[derive(Default)]
 struct Counts {
     minute: u64,
     used: u32,
     withheld: u32,
-    pools: HashMap<PoolKey, MinuteCounts>,
+    pools: HashMap<Pool, MinuteCounts>,
     held_until_ms: u64,
-    days: BTreeMap<String, HashMap<PoolKey, DayCounts>>,
+    days: BTreeMap<String, HashMap<Pool, DayCounts>>,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -138,8 +183,8 @@ pub struct DayCounts {
 }
 
 /// Where a readout's counts come from: `redis` when they are the stored ones, `memory` when no Redis is configured,
-/// `unavailable` when Redis did not answer, so the minute is this process's own count and the days hold only what
-/// is not written to Redis yet.
+/// `unavailable` when Redis did not answer, so the minute is the calls this process let through or refused itself
+/// and the days hold only what is not written to Redis yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 #[schema(as = Source)]
@@ -147,6 +192,16 @@ pub enum CountSource {
     Redis,
     Memory,
     Unavailable,
+}
+
+impl CountSource {
+    fn and(self, other: Self) -> Self {
+        if other == Self::Unavailable {
+            other
+        } else {
+            self
+        }
+    }
 }
 
 /// What `/v1/budget` answers: one budget per upstream, under one history and one source.
@@ -236,28 +291,22 @@ struct Stored {
 
 impl Budget {
     /// The budget of `upstream`, with its Redis keys under the upstream's namespace.
-    pub fn new<C, P>(
+    pub fn new(
         upstream: upstream::Source,
         limit_per_minute: u32,
-        pools: impl IntoIterator<Item = (C, P)>,
+        pools: impl IntoIterator<Item = Pool>,
         clock: Arc<dyn Clock>,
         redis: Option<Arc<RedisStore>>,
-    ) -> Self
-    where
-        C: Into<Arc<str>>,
-        P: Into<Arc<str>>,
-    {
+    ) -> Self {
         Self {
             limit_per_minute,
             history_days: DEFAULT_HISTORY_DAYS,
             upstream,
-            pools: pools
-                .into_iter()
-                .map(|(consumer, pool)| (consumer.into(), pool.into()))
-                .collect(),
+            pools: pools.into_iter().collect(),
             clock,
             memory: Arc::default(),
             redis: redis.map(|store| Arc::new(Shared::new(store, upstream.namespace()))),
+            flush: OnceLock::new(),
         }
     }
 
@@ -268,40 +317,65 @@ impl Budget {
     }
 
     /// Reserves `calls` upstream calls for one request, all or none.
-    pub async fn admit(&self, consumer: &str, pool: &str, calls: u32) -> Result<(), Refusal> {
+    pub async fn admit(&self, pool: &Pool, calls: u32) -> Result<(), Refusal> {
         if calls == 0 {
             return Ok(());
         }
         let now = self.clock.now_ms();
-        let key = self.key(consumer, pool);
-        let shared = match &self.redis {
-            Some(redis) => self.admit_in_redis(redis, &key, calls, now).await,
+        let decided = match &self.redis {
+            Some(redis) => self.admit_in_redis(redis, pool, calls, now).await,
             None => None,
         };
-        let verdict = match shared {
-            Some(verdict) => verdict,
-            None => self.admit_in_memory(&key, calls, now),
+        let (verdict, held_until_ms) = {
+            let mut state = self.lock(now);
+            let verdict = match decided {
+                Some((verdict, held_until_ms)) => {
+                    state.keep_later_hold(held_until_ms);
+                    verdict
+                }
+                None => Verdict::reached(
+                    calls,
+                    self.limit_per_minute,
+                    state.held_until_ms,
+                    state.used,
+                    now,
+                ),
+            };
+            state.count(pool, calls, verdict == Verdict::Admitted);
+            if verdict != Verdict::Admitted {
+                state.day(now, pool, self.history_days).withheld += u64::from(calls);
+            }
+            (verdict, state.held_until_ms)
         };
-        if verdict.is_err() {
-            self.lock(now).day(now, key, self.history_days).withheld += u64::from(calls);
-            self.write_days_soon();
-        }
-        verdict
+        let refusal = match verdict {
+            Verdict::Admitted => return Ok(()),
+            Verdict::TooLarge => Refusal::TooLarge {
+                calls,
+                limit_per_minute: self.limit_per_minute,
+            },
+            Verdict::Held => Refusal::Hold {
+                retry_after_ms: held_until_ms.saturating_sub(now),
+            },
+            Verdict::Spent => Refusal::Spent {
+                retry_after_ms: (now / MINUTE_MS + 1) * MINUTE_MS - now,
+            },
+        };
+        self.write_days_soon();
+        Err(refusal)
     }
 
-    /// Records one call the upstream answered with `status`, or `None` when it gave no answer. A 429 starts the hold.
+    /// Records one call the upstream answered with `status`, or `None` when it gave no answer. A 429 starts a hold,
+    /// which comes back as the refusal every call meets until it ends.
     pub async fn record(
         &self,
-        consumer: &str,
-        pool: &str,
+        pool: &Pool,
         status: Option<u16>,
         retry_after: Option<&str>,
-    ) {
+    ) -> Option<Refusal> {
         let now = self.clock.now_ms();
-        let key = self.key(consumer, pool);
-        let hold = {
+        let started = {
             let mut state = self.lock(now);
-            let day = state.day(now, key, self.history_days);
+            let day = state.day(now, pool, self.history_days);
             day.calls += 1;
             match status {
                 Some(HTTP_FORBIDDEN) => {
@@ -310,31 +384,35 @@ impl Budget {
                 }
                 Some(HTTP_TOO_MANY_REQUESTS) => {
                     day.throttled += 1;
-                    let wait = hold_ms(retry_after, now);
-                    state.held_until_ms = state.held_until_ms.max(now + wait);
-                    Some((now + wait, wait))
+                    Some(state.keep_later_hold(now + hold_ms(retry_after, now)))
                 }
                 _ => None,
             }
         };
-        if let (Some(redis), Some((until, wait))) = (&self.redis, hold) {
-            let mut invocation = redis.hold.key(redis.store.key(&redis.key("held-until")));
-            invocation.arg(until).arg(wait);
-            redis
+        self.write_days_soon();
+        let mut held_until_ms = started?;
+        if let Some(redis) = &self.redis {
+            let mut invocation = redis.hold.key(redis.hold_key());
+            invocation.arg(held_until_ms).arg(now);
+            let stored = redis
                 .store
                 .run(|mut connection| async move {
-                    invocation.invoke_async::<()>(&mut connection).await
+                    invocation.invoke_async::<u64>(&mut connection).await
                 })
                 .await;
+            if let Some(stored) = stored {
+                held_until_ms = self.lock(now).keep_later_hold(stored);
+            }
         }
-        self.write_days_soon();
+        Some(Refusal::Hold {
+            retry_after_ms: held_until_ms.saturating_sub(now),
+        })
     }
 
     /// Counts one request answered without a call upstream: from the cache, or by joining a call already made.
-    pub fn record_hit(&self, consumer: &str, pool: &str) {
+    pub fn record_hit(&self, pool: &Pool) {
         let now = self.clock.now_ms();
-        let key = self.key(consumer, pool);
-        self.lock(now).day(now, key, self.history_days).hits += 1;
+        self.lock(now).day(now, pool, self.history_days).hits += 1;
         self.write_days_soon();
     }
 
@@ -379,7 +457,7 @@ impl Budget {
 
         let mut state = self.lock(now);
         if let Some(stored) = &stored {
-            state.held_until_ms = state.held_until_ms.max(stored.held_until_ms);
+            state.keep_later_hold(stored.held_until_ms);
         }
         let (used, withheld, pools) = match &stored {
             Some(stored) => {
@@ -390,10 +468,10 @@ impl Budget {
                 let pools = self
                     .pools
                     .iter()
-                    .map(|key| {
-                        let field = pool_field(key);
+                    .map(|pool| {
+                        let field = pool_field(pool);
                         pool_snapshot(
-                            key,
+                            pool,
                             MinuteCounts {
                                 used: count(&format!("used:{field}")),
                                 withheld: count(&format!("withheld:{field}")),
@@ -407,8 +485,8 @@ impl Budget {
                 let pools = self
                     .pools
                     .iter()
-                    .map(|key| {
-                        pool_snapshot(key, state.pools.get(key).copied().unwrap_or_default())
+                    .map(|pool| {
+                        pool_snapshot(pool, state.pools.get(pool).copied().unwrap_or_default())
                     })
                     .collect();
                 (state.used, state.withheld, pools)
@@ -419,29 +497,30 @@ impl Budget {
             .iter()
             .enumerate()
             .filter_map(|(index, date)| {
-                let mut counts: HashMap<PoolKey, DayCounts> = HashMap::new();
+                let mut counts: HashMap<Pool, DayCounts> = HashMap::new();
                 if let Some(fields) = stored.as_ref().and_then(|stored| stored.days.get(index)) {
                     for (field, count) in fields {
-                        let Some((consumer, pool, name)) = parse_day_field(field) else {
-                            continue;
-                        };
-                        counts
-                            .entry(self.key(consumer, pool))
-                            .or_default()
-                            .add(name, *count);
+                        let known = parse_day_field(field).is_some_and(|(pool, name)| {
+                            counts.entry(pool).or_default().add(name, *count)
+                        });
+                        if !known {
+                            tracing::warn!(
+                                "Redis holds the daily count {field} of the {} budget, which is not one the gateway \
+                                 keeps, so the readout leaves it out",
+                                self.upstream.name()
+                            );
+                        }
                     }
                 }
-                for (key, unwritten) in state.days.get(date).into_iter().flatten() {
-                    for (name, count) in unwritten.named() {
-                        counts.entry(key.clone()).or_default().add(name, count);
-                    }
+                for (pool, unwritten) in state.days.get(date).into_iter().flatten() {
+                    counts.entry(pool.clone()).or_default().add_all(*unwritten);
                 }
                 let mut pools: Vec<DayPoolSnapshot> = counts
                     .into_iter()
                     .filter(|(_, counts)| !counts.is_empty())
-                    .map(|(key, counts)| DayPoolSnapshot {
-                        consumer: key.0.to_string(),
-                        pool: key.1.to_string(),
+                    .map(|(pool, counts)| DayPoolSnapshot {
+                        consumer: pool.consumer.to_string(),
+                        pool: pool.name.to_string(),
                         counts,
                     })
                     .collect();
@@ -458,7 +537,7 @@ impl Budget {
             history_days: self.history_days,
             used,
             withheld,
-            resets_at: iso(((now / MINUTE_MS) + 1) * MINUTE_MS),
+            resets_at: iso((now / MINUTE_MS + 1) * MINUTE_MS),
             held_until: (state.held_until_ms > now).then(|| iso(state.held_until_ms)),
             source,
             pools,
@@ -469,91 +548,47 @@ impl Budget {
     async fn admit_in_redis(
         &self,
         redis: &Shared,
-        key: &PoolKey,
+        pool: &Pool,
         calls: u32,
         now: u64,
-    ) -> Option<Result<(), Refusal>> {
-        let minute = now / MINUTE_MS;
-        let held_in_memory = self.lock(now).held_until_ms;
-        let mut invocation = redis
-            .admit
-            .key(redis.store.key(&redis.key(&format!("minute:{minute}"))));
+    ) -> Option<(Verdict, u64)> {
+        let (counted, held_until_ms) = {
+            let state = self.lock(now);
+            (state.used, state.held_until_ms)
+        };
+        let mut invocation = redis.admit.key(redis.minute_key(now));
         invocation
-            .key(redis.store.key(&redis.key("held-until")))
+            .key(redis.hold_key())
             .arg(calls)
             .arg(self.limit_per_minute)
             .arg(now)
-            .arg(held_in_memory)
-            .arg(pool_field(key))
+            .arg(held_until_ms)
+            .arg(counted)
+            .arg(pool_field(pool))
             .arg(MINUTE_KEY_TTL_MS);
-        let (verdict, held_until) = redis
+        let (code, held_until_ms) = redis
             .store
             .run(|mut connection| async move {
-                invocation.invoke_async::<(i64, i64)>(&mut connection).await
+                invocation.invoke_async::<(i64, u64)>(&mut connection).await
             })
             .await?;
-        let held_until = u64::try_from(held_until).unwrap_or(0);
-        match verdict {
-            ADMITTED => Some(Ok(())),
-            TOO_LARGE => Some(Err(Refusal::TooLarge {
-                calls,
-                limit_per_minute: self.limit_per_minute,
-            })),
-            HELD => {
-                let mut state = self.lock(now);
-                state.held_until_ms = state.held_until_ms.max(held_until);
-                Some(Err(Refusal::Hold {
-                    retry_after_ms: held_until.saturating_sub(now),
-                }))
-            }
-            SPENT => Some(Err(Refusal::Spent {
-                retry_after_ms: (minute + 1) * MINUTE_MS - now,
-            })),
-            _ => None,
-        }
-    }
-
-    fn admit_in_memory(&self, key: &PoolKey, calls: u32, now: u64) -> Result<(), Refusal> {
-        let mut state = self.lock(now);
-        let refusal = if calls > self.limit_per_minute {
-            Some(Refusal::TooLarge {
-                calls,
-                limit_per_minute: self.limit_per_minute,
-            })
-        } else if state.held_until_ms > now {
-            Some(Refusal::Hold {
-                retry_after_ms: state.held_until_ms - now,
-            })
-        } else if state.used.saturating_add(calls) > self.limit_per_minute {
-            Some(Refusal::Spent {
-                retry_after_ms: (state.minute + 1) * MINUTE_MS - now,
-            })
-        } else {
-            None
+        let Some(verdict) = Verdict::of_code(code) else {
+            tracing::warn!(
+                "the budget script of {} answered the unknown verdict {code}, memory decides instead",
+                self.upstream.name()
+            );
+            return None;
         };
-
-        let minute = state.pools.entry(key.clone()).or_default();
-        if let Some(refusal) = refusal {
-            minute.withheld = minute.withheld.saturating_add(calls);
-            state.withheld = state.withheld.saturating_add(calls);
-            return Err(refusal);
-        }
-        minute.used = minute.used.saturating_add(calls);
-        state.used += calls;
-        Ok(())
+        Some((verdict, held_until_ms))
     }
 
     async fn read_redis(&self, redis: &Shared, now: u64, dates: &[String]) -> Option<Stored> {
         let mut pipeline = redis::pipe();
         pipeline
-            .hgetall(
-                redis
-                    .store
-                    .key(&redis.key(&format!("minute:{}", now / MINUTE_MS))),
-            )
-            .get(redis.store.key(&redis.key("held-until")));
+            .hgetall(redis.minute_key(now))
+            .get(redis.hold_key());
         for date in dates {
-            pipeline.hgetall(redis.store.key(&redis.day_key(date)));
+            pipeline.hgetall(redis.day_key(date));
         }
         let replies = redis
             .store
@@ -561,42 +596,37 @@ impl Budget {
                 pipeline.query_async::<Vec<Value>>(&mut connection).await
             })
             .await?;
-
-        let mut replies = replies.into_iter();
-        let minute = redis::from_redis_value(replies.next()?).ok()?;
-        let held_until_ms = redis::from_redis_value::<Option<u64>>(replies.next()?)
-            .ok()?
-            .unwrap_or(0);
-        let days = replies
-            .map(|reply| redis::from_redis_value(reply).ok())
-            .collect::<Option<Vec<_>>>()?;
-        Some(Stored {
-            minute,
-            held_until_ms,
-            days,
-        })
-    }
-
-    fn write_days_soon(&self) {
-        if let Some(redis) = &self.redis {
-            let (redis, memory, clock) = (redis.clone(), self.memory.clone(), self.clock.clone());
-            let history_days = self.history_days;
-            tokio::spawn(async move {
-                redis
-                    .write_days(&memory, &*clock, history_days, false)
-                    .await;
-            });
+        match Stored::read(replies) {
+            Ok(stored) => Some(stored),
+            Err(error) => {
+                tracing::warn!(
+                    "Redis answered the readout of the {} budget with replies it cannot read, the readout uses \
+                     memory: {error}",
+                    self.upstream.name()
+                );
+                None
+            }
         }
     }
 
-    fn key(&self, consumer: &str, pool: &str) -> PoolKey {
-        self.pools
-            .iter()
-            .find(|(known_consumer, known_pool)| {
-                known_consumer.as_ref() == consumer && known_pool.as_ref() == pool
-            })
-            .cloned()
-            .unwrap_or_else(|| (consumer.into(), pool.into()))
+    fn write_days_soon(&self) {
+        let Some(redis) = &self.redis else {
+            return;
+        };
+        let flush = self.flush.get_or_init(|| {
+            let (flush, mut asked) = mpsc::channel(1);
+            let (redis, memory, clock) = (redis.clone(), self.memory.clone(), self.clock.clone());
+            let history_days = self.history_days;
+            tokio::spawn(async move {
+                while asked.recv().await.is_some() {
+                    redis
+                        .write_days(&memory, &*clock, history_days, false)
+                        .await;
+                }
+            });
+            flush
+        });
+        let _ = flush.try_send(());
     }
 
     fn lock(&self, now: u64) -> MutexGuard<'_, Counts> {
@@ -612,7 +642,59 @@ impl Budget {
     }
 }
 
+impl Stored {
+    fn read(replies: Vec<Value>) -> Result<Self, ParsingError> {
+        let mut replies = replies.into_iter();
+        let mut next = || {
+            replies
+                .next()
+                .ok_or_else(|| ParsingError::from("a reply is missing"))
+        };
+        let minute = redis::from_redis_value(next()?)?;
+        let held_until_ms = redis::from_redis_value::<Option<u64>>(next()?)?.unwrap_or(0);
+        let days = replies
+            .map(redis::from_redis_value)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            minute,
+            held_until_ms,
+            days,
+        })
+    }
+}
+
 impl Shared {
+    fn new(store: Arc<RedisStore>, namespace: &'static str) -> Self {
+        Self {
+            store,
+            namespace,
+            admit: Script::new(&admit_script()),
+            hold: Script::new(&hold_script()),
+            writing_days: tokio::sync::Mutex::new(()),
+            trimmed_on: Mutex::new(None),
+        }
+    }
+
+    fn key(&self, tail: &str) -> String {
+        if self.namespace.is_empty() {
+            self.store.key(&format!("budget:{tail}"))
+        } else {
+            self.store.key(&format!("budget:{}:{tail}", self.namespace))
+        }
+    }
+
+    fn minute_key(&self, now: u64) -> String {
+        self.key(&format!("minute:{}", now / MINUTE_MS))
+    }
+
+    fn hold_key(&self) -> String {
+        self.key("held-until")
+    }
+
+    fn day_key(&self, date: &str) -> String {
+        self.key(&format!("day:{date}"))
+    }
+
     async fn write_days(
         &self,
         memory: &Mutex<Counts>,
@@ -621,7 +703,7 @@ impl Shared {
         even_if_paused: bool,
     ) -> u64 {
         let _writing = self.writing_days.lock().await;
-        let unwritten: Vec<(String, PoolKey, DayCounts)> = {
+        let unwritten: Vec<(String, Pool, DayCounts)> = {
             let state = memory.lock().unwrap_or_else(PoisonError::into_inner);
             state
                 .days
@@ -629,7 +711,7 @@ impl Shared {
                 .flat_map(|(date, pools)| {
                     pools
                         .iter()
-                        .map(|(key, counts)| (date.clone(), key.clone(), *counts))
+                        .map(|(pool, counts)| (date.clone(), pool.clone(), *counts))
                 })
                 .collect()
         };
@@ -639,12 +721,12 @@ impl Shared {
 
         let mut pipeline = redis::pipe();
         pipeline.atomic();
-        for (date, key, counts) in &unwritten {
-            let day_key = self.store.key(&self.day_key(date));
+        for (date, pool, counts) in &unwritten {
+            let day_key = self.day_key(date);
             for (name, count) in counts.named() {
                 if count > 0 {
                     pipeline
-                        .hincr(&day_key, day_field(key, name), count)
+                        .hincr(&day_key, day_field(pool, name), count)
                         .ignore();
                 }
             }
@@ -665,10 +747,7 @@ impl Shared {
                 DAYS_TRIMMED
             };
             let gone: Vec<String> = (kept..kept + reach)
-                .map(|days_ago| {
-                    self.store
-                        .key(&self.day_key(&utc_date(now.saturating_sub(days_ago * DAY_MS))))
-                })
+                .map(|days_ago| self.day_key(&utc_date(now.saturating_sub(days_ago * DAY_MS))))
                 .collect();
             pipeline.del(gone).ignore();
         }
@@ -695,14 +774,14 @@ impl Shared {
                 .unwrap_or_else(PoisonError::into_inner) = Some(today);
         }
         let mut state = memory.lock().unwrap_or_else(PoisonError::into_inner);
-        for (date, key, counts) in unwritten {
+        for (date, pool, counts) in unwritten {
             let Some(pools) = state.days.get_mut(&date) else {
                 continue;
             };
-            if let Some(left) = pools.get_mut(&key) {
-                left.subtract(&counts);
+            if let Some(left) = pools.get_mut(&pool) {
+                left.subtract(counts);
                 if left.is_empty() {
-                    pools.remove(&key);
+                    pools.remove(&pool);
                 }
             }
             if pools.is_empty() {
@@ -714,45 +793,69 @@ impl Shared {
 }
 
 impl Counts {
-    fn day(&mut self, now: u64, key: PoolKey, history_days: u32) -> &mut DayCounts {
+    fn day(&mut self, now: u64, pool: &Pool, history_days: u32) -> &mut DayCounts {
         let date = utc_date(now);
         if !self.days.contains_key(&date) {
             let oldest = utc_date(now.saturating_sub((u64::from(history_days) - 1) * DAY_MS));
             self.days.retain(|kept, _| *kept >= oldest);
         }
-        self.days.entry(date).or_default().entry(key).or_default()
+        self.days
+            .entry(date)
+            .or_default()
+            .entry(pool.clone())
+            .or_default()
+    }
+
+    fn count(&mut self, pool: &Pool, calls: u32, admitted: bool) {
+        let minute = self.pools.entry(pool.clone()).or_default();
+        let (pool_count, count) = if admitted {
+            (&mut minute.used, &mut self.used)
+        } else {
+            (&mut minute.withheld, &mut self.withheld)
+        };
+        *pool_count = pool_count.saturating_add(calls);
+        *count = count.saturating_add(calls);
+    }
+
+    fn keep_later_hold(&mut self, until_ms: u64) -> u64 {
+        self.held_until_ms = self.held_until_ms.max(until_ms);
+        self.held_until_ms
     }
 }
 
 impl DayCounts {
-    fn named(&self) -> [(&'static str, u64); 5] {
+    fn fields(&mut self) -> [(&'static str, &mut u64); 5] {
         [
-            ("calls", self.calls),
-            ("hits", self.hits),
-            ("withheld", self.withheld),
-            ("forbidden", self.forbidden),
-            ("throttled", self.throttled),
+            ("calls", &mut self.calls),
+            ("hits", &mut self.hits),
+            ("withheld", &mut self.withheld),
+            ("forbidden", &mut self.forbidden),
+            ("throttled", &mut self.throttled),
         ]
     }
 
-    fn add(&mut self, name: &str, count: u64) {
-        let field = match name {
-            "calls" => &mut self.calls,
-            "hits" => &mut self.hits,
-            "withheld" => &mut self.withheld,
-            "forbidden" => &mut self.forbidden,
-            "throttled" => &mut self.throttled,
-            _ => return,
-        };
-        *field = field.saturating_add(count);
+    fn named(mut self) -> [(&'static str, u64); 5] {
+        self.fields().map(|(name, count)| (name, *count))
     }
 
-    fn subtract(&mut self, written: &Self) {
-        self.calls = self.calls.saturating_sub(written.calls);
-        self.hits = self.hits.saturating_sub(written.hits);
-        self.withheld = self.withheld.saturating_sub(written.withheld);
-        self.forbidden = self.forbidden.saturating_sub(written.forbidden);
-        self.throttled = self.throttled.saturating_sub(written.throttled);
+    fn add(&mut self, name: &str, count: u64) -> bool {
+        let Some((_, field)) = self.fields().into_iter().find(|(known, _)| *known == name) else {
+            return false;
+        };
+        *field = field.saturating_add(count);
+        true
+    }
+
+    fn add_all(&mut self, other: Self) {
+        for ((_, count), (_, added)) in self.fields().into_iter().zip(other.named()) {
+            *count = count.saturating_add(added);
+        }
+    }
+
+    fn subtract(&mut self, written: Self) {
+        for ((_, count), (_, taken)) in self.fields().into_iter().zip(written.named()) {
+            *count = count.saturating_sub(taken);
+        }
     }
 
     fn is_empty(&self) -> bool {
@@ -785,62 +888,42 @@ pub async fn readout(
     let modrinth = state.modrinth_budget.history(days).await;
     Ok(Json(BudgetSnapshot {
         history_days: curseforge.history_days,
-        source: curseforge.source,
+        source: curseforge.source.and(modrinth.source),
         curseforge,
         modrinth,
     }))
 }
 
-fn pool_snapshot(key: &PoolKey, counts: MinuteCounts) -> PoolSnapshot {
+fn pool_snapshot(pool: &Pool, counts: MinuteCounts) -> PoolSnapshot {
     PoolSnapshot {
-        consumer: key.0.to_string(),
-        pool: key.1.to_string(),
+        consumer: pool.consumer.to_string(),
+        pool: pool.name.to_string(),
         used: counts.used,
         withheld: counts.withheld,
     }
 }
 
-impl Shared {
-    fn new(store: Arc<RedisStore>, namespace: &'static str) -> Self {
-        Self {
-            store,
-            namespace,
-            admit: Script::new(ADMIT_SCRIPT),
-            hold: Script::new(HOLD_SCRIPT),
-            writing_days: tokio::sync::Mutex::new(()),
-            trimmed_on: Mutex::new(None),
-        }
-    }
-
-    fn key(&self, tail: &str) -> String {
-        if self.namespace.is_empty() {
-            format!("budget:{tail}")
-        } else {
-            format!("budget:{}:{tail}", self.namespace)
-        }
-    }
-
-    fn day_key(&self, date: &str) -> String {
-        self.key(&format!("day:{date}"))
-    }
+fn pool_field(pool: &Pool) -> String {
+    format!("{}/{}", pool.consumer, pool.name)
 }
 
-fn pool_field(key: &PoolKey) -> String {
-    format!("{}/{}", key.0, key.1)
+fn day_field(pool: &Pool, name: &str) -> String {
+    format!("{}/{name}", pool_field(pool))
 }
 
-fn day_field(key: &PoolKey, name: &str) -> String {
-    format!("{}/{}/{name}", key.0, key.1)
+fn parse_day_field(field: &str) -> Option<(Pool, &str)> {
+    let (pool, name) = field.rsplit_once('/')?;
+    let (consumer, pool) = pool.split_once('/')?;
+    Some((
+        Pool {
+            consumer: consumer.into(),
+            name: pool.into(),
+        },
+        name,
+    ))
 }
 
-fn parse_day_field(field: &str) -> Option<(&str, &str, &str)> {
-    let (pool_key, name) = field.rsplit_once('/')?;
-    let (consumer, pool) = pool_key.split_once('/')?;
-    Some((consumer, pool, name))
-}
-
-/// How long a 429 with this `Retry-After` holds every call off: 30 s without one, 1 s to 10 min.
-pub fn hold_ms(retry_after: Option<&str>, now: u64) -> u64 {
+fn hold_ms(retry_after: Option<&str>, now: u64) -> u64 {
     let wait = retry_after
         .map(str::trim)
         .and_then(|header| {
@@ -888,7 +971,19 @@ mod tests {
         test_support::{NOV_3_2026_20H, TestRedis},
     };
 
-    const POOLS: [(&str, &str); 3] = [("app", "launcher"), ("app", "app"), ("sandbox", "jobs")];
+    fn pool(consumer: &str, name: &str) -> Pool {
+        Pool {
+            consumer: consumer.into(),
+            name: name.into(),
+        }
+    }
+
+    fn pools() -> Vec<Pool> {
+        [("app", "launcher"), ("app", "app"), ("sandbox", "jobs")]
+            .into_iter()
+            .map(|(consumer, name)| pool(consumer, name))
+            .collect()
+    }
 
     struct Backends {
         redis: Option<TestRedis>,
@@ -906,7 +1001,7 @@ mod tests {
                 Budget::new(
                     upstream::Source::CurseForge,
                     limit,
-                    POOLS,
+                    pools(),
                     clock.clone(),
                     None,
                 )
@@ -919,7 +1014,7 @@ mod tests {
                     Budget::new(
                         upstream::Source::CurseForge,
                         limit,
-                        POOLS,
+                        pools(),
                         clock.clone(),
                         Some(redis.open()),
                     )
@@ -945,17 +1040,17 @@ mod tests {
         let backends = Backends::new(5, &clock);
         for (source, budget) in &backends.budgets {
             assert_eq!(
-                budget.admit("app", "launcher", 3).await,
+                budget.admit(&pool("app", "launcher"), 3).await,
                 Ok(()),
                 "{source:?}"
             );
             assert_eq!(
-                budget.admit("sandbox", "jobs", 2).await,
+                budget.admit(&pool("sandbox", "jobs"), 2).await,
                 Ok(()),
                 "{source:?}"
             );
             assert_eq!(
-                budget.admit("app", "app", 1).await,
+                budget.admit(&pool("app", "app"), 1).await,
                 Err(Refusal::Spent {
                     retry_after_ms: 60_000
                 }),
@@ -971,9 +1066,20 @@ mod tests {
         let clock = TestClock::at(NOV_3_2026_20H);
         let backends = Backends::new(5, &clock);
         for (source, budget) in &backends.budgets {
-            assert_eq!(budget.admit("app", "app", 4).await, Ok(()), "{source:?}");
-            assert!(budget.admit("app", "app", 2).await.is_err(), "{source:?}");
-            assert_eq!(budget.admit("app", "app", 1).await, Ok(()), "{source:?}");
+            assert_eq!(
+                budget.admit(&pool("app", "app"), 4).await,
+                Ok(()),
+                "{source:?}"
+            );
+            assert!(
+                budget.admit(&pool("app", "app"), 2).await.is_err(),
+                "{source:?}"
+            );
+            assert_eq!(
+                budget.admit(&pool("app", "app"), 1).await,
+                Ok(()),
+                "{source:?}"
+            );
             assert_eq!(budget.snapshot().await.used, 5, "{source:?}");
         }
         backends.forget().await;
@@ -985,7 +1091,7 @@ mod tests {
         let backends = Backends::new(5, &clock);
         for (source, budget) in &backends.budgets {
             assert_eq!(
-                budget.admit("sandbox", "jobs", 6).await,
+                budget.admit(&pool("sandbox", "jobs"), 6).await,
                 Err(Refusal::TooLarge {
                     calls: 6,
                     limit_per_minute: 5
@@ -993,7 +1099,7 @@ mod tests {
                 "{source:?}"
             );
             assert_eq!(
-                budget.admit("sandbox", "jobs", 5).await,
+                budget.admit(&pool("sandbox", "jobs"), 5).await,
                 Ok(()),
                 "{source:?}"
             );
@@ -1006,8 +1112,8 @@ mod tests {
         let clock = TestClock::at(NOV_3_2026_20H);
         let backends = Backends::new(5, &clock);
         for (source, budget) in &backends.budgets {
-            budget.admit("app", "app", 4).await.unwrap();
-            budget.admit("app", "app", 3).await.unwrap_err();
+            budget.admit(&pool("app", "app"), 4).await.unwrap();
+            budget.admit(&pool("app", "app"), 3).await.unwrap_err();
 
             let snapshot = budget.snapshot().await;
             assert_eq!((snapshot.used, snapshot.withheld), (4, 3), "{source:?}");
@@ -1022,8 +1128,12 @@ mod tests {
         let clock = TestClock::at(NOV_3_2026_20H);
         let backends = Backends::new(1, &clock);
         for (source, budget) in &backends.budgets {
-            budget.admit("app", "app", 1).await.unwrap();
-            assert_eq!(budget.admit("app", "app", 0).await, Ok(()), "{source:?}");
+            budget.admit(&pool("app", "app"), 1).await.unwrap();
+            assert_eq!(
+                budget.admit(&pool("app", "app"), 0).await,
+                Ok(()),
+                "{source:?}"
+            );
             assert_eq!(budget.snapshot().await.withheld, 0, "{source:?}");
         }
         backends.forget().await;
@@ -1034,9 +1144,9 @@ mod tests {
         let clock = TestClock::at(NOV_3_2026_20H + 59_000);
         let backends = Backends::new(1, &clock);
         for (source, budget) in &backends.budgets {
-            budget.admit("app", "app", 1).await.unwrap();
+            budget.admit(&pool("app", "app"), 1).await.unwrap();
             assert_eq!(
-                budget.admit("app", "app", 1).await,
+                budget.admit(&pool("app", "app"), 1).await,
                 Err(Refusal::Spent {
                     retry_after_ms: 1_000
                 }),
@@ -1045,7 +1155,11 @@ mod tests {
         }
         clock.advance(1_000);
         for (source, budget) in &backends.budgets {
-            assert_eq!(budget.admit("app", "app", 1).await, Ok(()), "{source:?}");
+            assert_eq!(
+                budget.admit(&pool("app", "app"), 1).await,
+                Ok(()),
+                "{source:?}"
+            );
         }
         backends.forget().await;
     }
@@ -1056,10 +1170,10 @@ mod tests {
         let backends = Backends::new(300, &clock);
         for (source, budget) in &backends.budgets {
             budget
-                .record("sandbox", "jobs", Some(429), Some("120"))
+                .record(&pool("sandbox", "jobs"), Some(429), Some("120"))
                 .await;
             assert_eq!(
-                budget.admit("app", "launcher", 1).await,
+                budget.admit(&pool("app", "launcher"), 1).await,
                 Err(Refusal::Hold {
                     retry_after_ms: 120_000
                 }),
@@ -1069,7 +1183,7 @@ mod tests {
         clock.advance(120_000);
         for (source, budget) in &backends.budgets {
             assert_eq!(
-                budget.admit("app", "launcher", 1).await,
+                budget.admit(&pool("app", "launcher"), 1).await,
                 Ok(()),
                 "{source:?}"
             );
@@ -1082,10 +1196,20 @@ mod tests {
         let clock = TestClock::at(NOV_3_2026_20H);
         let backends = Backends::new(300, &clock);
         for (source, budget) in &backends.budgets {
-            budget.record("app", "app", Some(429), Some("300")).await;
-            budget.record("app", "app", Some(429), Some("5")).await;
+            budget
+                .record(&pool("app", "app"), Some(429), Some("300"))
+                .await;
             assert_eq!(
-                budget.admit("app", "app", 1).await,
+                budget
+                    .record(&pool("app", "app"), Some(429), Some("5"))
+                    .await,
+                Some(Refusal::Hold {
+                    retry_after_ms: 300_000
+                }),
+                "{source:?}"
+            );
+            assert_eq!(
+                budget.admit(&pool("app", "app"), 1).await,
                 Err(Refusal::Hold {
                     retry_after_ms: 300_000
                 }),
@@ -1093,6 +1217,53 @@ mod tests {
             );
         }
         backends.forget().await;
+    }
+
+    #[tokio::test]
+    async fn only_a_429_starts_a_hold() {
+        let clock = TestClock::at(NOV_3_2026_20H);
+        let backends = Backends::new(300, &clock);
+        for (source, budget) in &backends.budgets {
+            for status in [Some(200), Some(403), Some(404), None] {
+                assert_eq!(
+                    budget.record(&pool("app", "app"), status, Some("60")).await,
+                    None,
+                    "{source:?} {status:?}"
+                );
+            }
+            assert_eq!(
+                budget
+                    .record(&pool("app", "app"), Some(429), Some("60"))
+                    .await,
+                Some(Refusal::Hold {
+                    retry_after_ms: 60_000
+                }),
+                "{source:?}"
+            );
+        }
+        backends.forget().await;
+    }
+
+    #[test]
+    fn the_readout_is_unavailable_when_either_budget_could_not_read_redis() {
+        use CountSource::{Memory, Redis, Unavailable};
+        assert_eq!(Redis.and(Redis), Redis);
+        assert_eq!(Memory.and(Memory), Memory);
+        assert_eq!(Redis.and(Unavailable), Unavailable);
+        assert_eq!(Unavailable.and(Redis), Unavailable);
+    }
+
+    #[test]
+    fn the_script_decides_with_the_same_verdict_codes() {
+        let script = admit_script();
+        for verdict in Verdict::ALL {
+            assert_eq!(Verdict::of_code(verdict.code()), Some(verdict));
+            assert!(
+                script.contains(&format!("verdict = {}", verdict.code())),
+                "{verdict:?}"
+            );
+        }
+        assert_eq!(Verdict::of_code(4), None);
     }
 
     #[test]
@@ -1113,15 +1284,21 @@ mod tests {
         let clock = TestClock::at(NOV_3_2026_20H);
         let backends = Backends::new(1, &clock);
         for (_, budget) in &backends.budgets {
-            budget.record("app", "launcher", Some(200), None).await;
-            budget.record("app", "launcher", Some(403), None).await;
-            budget.record("app", "launcher", None, None).await;
-            budget.admit("app", "launcher", 1).await.unwrap();
-            budget.admit("app", "launcher", 1).await.unwrap_err();
+            budget
+                .record(&pool("app", "launcher"), Some(200), None)
+                .await;
+            budget
+                .record(&pool("app", "launcher"), Some(403), None)
+                .await;
+            budget.record(&pool("app", "launcher"), None, None).await;
+            budget.admit(&pool("app", "launcher"), 1).await.unwrap();
+            budget.admit(&pool("app", "launcher"), 1).await.unwrap_err();
         }
         clock.advance(DAY_MS);
         for (source, budget) in &backends.budgets {
-            budget.record("sandbox", "jobs", Some(429), None).await;
+            budget
+                .record(&pool("sandbox", "jobs"), Some(429), None)
+                .await;
 
             let snapshot = budget.snapshot().await;
             let dates: Vec<&str> = snapshot.days.iter().map(|day| day.date.as_str()).collect();
@@ -1151,8 +1328,8 @@ mod tests {
         let clock = TestClock::at(NOV_3_2026_20H);
         let backends = Backends::new(300, &clock);
         for (source, budget) in &backends.budgets {
-            budget.record_hit("app", "launcher");
-            budget.record_hit("app", "launcher");
+            budget.record_hit(&pool("app", "launcher"));
+            budget.record_hit(&pool("app", "launcher"));
             let snapshot = budget.snapshot().await;
             assert_eq!(snapshot.used, 0, "{source:?}");
             assert_eq!(snapshot.days[0].pools[0].counts.hits, 2, "{source:?}");
@@ -1168,7 +1345,7 @@ mod tests {
         for _ in 0..25 {
             clock.advance(DAY_MS);
             for (_, budget) in &backends.budgets {
-                budget.record("app", "app", Some(200), None).await;
+                budget.record(&pool("app", "app"), Some(200), None).await;
             }
         }
         for (source, budget) in &backends.budgets {
@@ -1194,13 +1371,13 @@ mod tests {
         let budget = Budget::new(
             upstream::Source::CurseForge,
             300,
-            POOLS,
+            pools(),
             clock.clone(),
             None,
         )
         .keeping_days(3);
         for _ in 0..5 {
-            budget.record("app", "app", Some(200), None).await;
+            budget.record(&pool("app", "app"), Some(200), None).await;
             clock.advance(DAY_MS);
         }
         let history = budget.history(90).await;
@@ -1214,9 +1391,9 @@ mod tests {
         let clock = TestClock::at(NOV_3_2026_20H + 15_000);
         let backends = Backends::new(300, &clock);
         for (source, budget) in &backends.budgets {
-            budget.admit("app", "launcher", 2).await.unwrap();
+            budget.admit(&pool("app", "launcher"), 2).await.unwrap();
             budget
-                .record("app", "launcher", Some(429), Some("30"))
+                .record(&pool("app", "launcher"), Some(429), Some("30"))
                 .await;
 
             let snapshot = budget.snapshot().await;
@@ -1256,17 +1433,19 @@ mod tests {
             Budget::new(
                 upstream::Source::CurseForge,
                 5,
-                POOLS,
+                pools(),
                 clock.clone(),
                 Some(redis.open()),
             )
         };
 
         let before = open();
-        before.admit("app", "launcher", 3).await.unwrap();
-        before.record("app", "launcher", Some(200), None).await;
+        before.admit(&pool("app", "launcher"), 3).await.unwrap();
         before
-            .record("app", "launcher", Some(429), Some("60"))
+            .record(&pool("app", "launcher"), Some(200), None)
+            .await;
+        before
+            .record(&pool("app", "launcher"), Some(429), Some("60"))
             .await;
         before.write_days_at_exit().await;
         drop(before);
@@ -1280,14 +1459,14 @@ mod tests {
         assert_eq!(snapshot.days[0].pools[0].counts.calls, 2);
         assert_eq!(snapshot.days[0].pools[0].counts.throttled, 1);
         assert_eq!(
-            after.admit("sandbox", "jobs", 1).await,
+            after.admit(&pool("sandbox", "jobs"), 1).await,
             Err(Refusal::Hold {
                 retry_after_ms: 60_000
             })
         );
 
         clock.advance(60_000);
-        assert_eq!(after.admit("sandbox", "jobs", 5).await, Ok(()));
+        assert_eq!(after.admit(&pool("sandbox", "jobs"), 5).await, Ok(()));
         redis.forget().await;
     }
 
@@ -1300,7 +1479,7 @@ mod tests {
             Budget::new(
                 upstream::Source::CurseForge,
                 5,
-                POOLS,
+                pools(),
                 clock.clone(),
                 Some(redis.open()),
             )
@@ -1308,11 +1487,11 @@ mod tests {
 
         let first = open();
         first.lock(NOV_3_2026_20H).held_until_ms = NOV_3_2026_20H + 60_000;
-        assert!(first.admit("app", "app", 1).await.is_err());
+        assert!(first.admit(&pool("app", "app"), 1).await.is_err());
 
         let second = open();
         assert_eq!(
-            second.admit("sandbox", "jobs", 1).await,
+            second.admit(&pool("sandbox", "jobs"), 1).await,
             Err(Refusal::Hold {
                 retry_after_ms: 60_000
             })
@@ -1326,22 +1505,25 @@ mod tests {
         let redis = TestRedis::required();
         let clock = TestClock::at(NOV_3_2026_20H);
         let store = redis.open();
-        store.skip_for_a_while();
+        let failed: Option<()> = store
+            .run(|_| async { Err(std::io::Error::other("refused").into()) })
+            .await;
+        assert_eq!(failed, None);
         let before = Budget::new(
             upstream::Source::CurseForge,
             5,
-            POOLS,
+            pools(),
             clock.clone(),
             Some(store),
         );
-        before.record("app", "app", Some(200), None).await;
+        before.record(&pool("app", "app"), Some(200), None).await;
         before.write_days_at_exit().await;
         drop(before);
 
         let after = Budget::new(
             upstream::Source::CurseForge,
             5,
-            POOLS,
+            pools(),
             clock,
             Some(redis.open()),
         );
@@ -1360,13 +1542,13 @@ mod tests {
         let budget = Budget::new(
             upstream::Source::CurseForge,
             300,
-            POOLS,
+            pools(),
             clock.clone(),
             Some(store.clone()),
         )
         .keeping_days(14);
         for _ in 0..20 {
-            budget.record("app", "app", Some(200), None).await;
+            budget.record(&pool("app", "app"), Some(200), None).await;
             budget.write_days_at_exit().await;
             clock.advance(DAY_MS);
         }
@@ -1406,13 +1588,13 @@ mod tests {
         let long = Budget::new(
             upstream::Source::CurseForge,
             300,
-            POOLS,
+            pools(),
             clock.clone(),
             Some(store.clone()),
         )
         .keeping_days(90);
         for _ in 0..80 {
-            long.record("app", "app", Some(200), None).await;
+            long.record(&pool("app", "app"), Some(200), None).await;
             long.write_days_at_exit().await;
             clock.advance(DAY_MS);
         }
@@ -1421,12 +1603,12 @@ mod tests {
         let short = Budget::new(
             upstream::Source::CurseForge,
             300,
-            POOLS,
+            pools(),
             clock.clone(),
             Some(store.clone()),
         )
         .keeping_days(14);
-        short.record("app", "app", Some(200), None).await;
+        short.record(&pool("app", "app"), Some(200), None).await;
         short.write_days_at_exit().await;
         let days = day_keys(&store).await;
         assert_eq!(days.len(), 14, "{days:?}");
@@ -1463,21 +1645,25 @@ mod tests {
         let curseforge = Budget::new(
             upstream::Source::CurseForge,
             5,
-            POOLS,
+            pools(),
             clock.clone(),
             Some(store.clone()),
         );
         let modrinth = Budget::new(
             upstream::Source::Modrinth,
             5,
-            POOLS,
+            pools(),
             clock.clone(),
             Some(store.clone()),
         );
-        curseforge.admit("app", "app", 5).await.unwrap();
-        curseforge.record("app", "app", Some(200), None).await;
-        assert_eq!(modrinth.admit("app", "app", 5).await, Ok(()));
-        modrinth.record("app", "app", Some(429), Some("30")).await;
+        curseforge.admit(&pool("app", "app"), 5).await.unwrap();
+        curseforge
+            .record(&pool("app", "app"), Some(200), None)
+            .await;
+        assert_eq!(modrinth.admit(&pool("app", "app"), 5).await, Ok(()));
+        modrinth
+            .record(&pool("app", "app"), Some(429), Some("30"))
+            .await;
         curseforge.write_days_at_exit().await;
         modrinth.write_days_at_exit().await;
         assert_eq!(day_keys(&store).await.len(), 1);
@@ -1505,41 +1691,119 @@ mod tests {
             Budget::new(
                 upstream::Source::CurseForge,
                 5,
-                POOLS,
+                pools(),
                 clock.clone(),
                 Some(redis.open()),
             )
         };
         let (first, second) = (open(), open());
-        first.admit("app", "app", 3).await.unwrap();
+        first.admit(&pool("app", "app"), 3).await.unwrap();
         assert_eq!(
-            second.admit("sandbox", "jobs", 3).await,
+            second.admit(&pool("sandbox", "jobs"), 3).await,
             Err(Refusal::Spent {
                 retry_after_ms: 60_000
             })
         );
-        assert_eq!(second.admit("sandbox", "jobs", 2).await, Ok(()));
+        assert_eq!(second.admit(&pool("sandbox", "jobs"), 2).await, Ok(()));
+        redis.forget().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CONTENT_GATEWAY_TEST_REDIS_URL"]
+    async fn a_redis_flap_does_not_let_more_than_the_limit_through() {
+        let redis = TestRedis::required();
+        let clock = TestClock::at(NOV_3_2026_20H);
+        let store = redis.open_on(clock.clone());
+        let budget = Budget::new(
+            upstream::Source::CurseForge,
+            5,
+            pools(),
+            clock.clone(),
+            Some(store.clone()),
+        );
+        budget.admit(&pool("app", "app"), 3).await.unwrap();
+
+        let failed: Option<()> = store
+            .run(|_| async { Err(std::io::Error::other("refused").into()) })
+            .await;
+        assert_eq!(failed, None);
+        assert_eq!(
+            budget.admit(&pool("app", "app"), 3).await,
+            Err(Refusal::Spent {
+                retry_after_ms: 60_000
+            })
+        );
+        budget.admit(&pool("app", "app"), 2).await.unwrap();
+
+        clock.advance(5_000);
+        assert_eq!(
+            budget.admit(&pool("app", "app"), 1).await,
+            Err(Refusal::Spent {
+                retry_after_ms: 55_000
+            })
+        );
+        let snapshot = budget.snapshot().await;
+        assert_eq!(snapshot.source, CountSource::Redis);
+        assert_eq!(snapshot.used, 5);
+        redis.forget().await;
+    }
+
+    #[tokio::test]
+    #[ignore = "needs CONTENT_GATEWAY_TEST_REDIS_URL"]
+    async fn counts_reach_redis_without_waiting_for_the_exit() {
+        let redis = TestRedis::required();
+        let clock = TestClock::at(NOV_3_2026_20H);
+        let open = || {
+            Budget::new(
+                upstream::Source::CurseForge,
+                5,
+                pools(),
+                clock.clone(),
+                Some(redis.open()),
+            )
+        };
+        let (counting, reading) = (open(), open());
+        for _ in 0..50 {
+            counting.record_hit(&pool("app", "app"));
+        }
+        let mut hits = 0;
+        for _ in 0..5_000 {
+            hits = reading
+                .snapshot()
+                .await
+                .days
+                .first()
+                .map_or(0, |day| day.pools[0].counts.hits);
+            if hits == 50 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert_eq!(hits, 50);
         redis.forget().await;
     }
 
     #[tokio::test]
     async fn falls_back_to_memory_when_redis_does_not_answer() {
         let clock = TestClock::at(NOV_3_2026_20H);
-        let store =
-            Arc::new(RedisStore::open("redis://127.0.0.1:1", "content-gateway-test").unwrap());
+        let store = Arc::new(
+            RedisStore::open("redis://127.0.0.1:1", "content-gateway-test", clock.clone()).unwrap(),
+        );
         let budget = Budget::new(
             upstream::Source::CurseForge,
             2,
-            POOLS,
+            pools(),
             clock.clone(),
             Some(store),
         );
 
-        assert_eq!(budget.admit("app", "app", 2).await, Ok(()));
-        assert!(budget.admit("app", "app", 1).await.is_err());
-        budget.record("app", "app", Some(429), Some("10")).await;
+        assert_eq!(budget.admit(&pool("app", "app"), 2).await, Ok(()));
+        assert!(budget.admit(&pool("app", "app"), 1).await.is_err());
+        budget
+            .record(&pool("app", "app"), Some(429), Some("10"))
+            .await;
         clock.advance(60_000);
-        assert_eq!(budget.admit("app", "app", 1).await, Ok(()));
+        assert_eq!(budget.admit(&pool("app", "app"), 1).await, Ok(()));
 
         let snapshot = budget.snapshot().await;
         assert_eq!(snapshot.source, CountSource::Unavailable);
