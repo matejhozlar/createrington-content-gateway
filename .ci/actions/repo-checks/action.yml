@@ -1,5 +1,5 @@
 name: Repository checks
-description: Formatting, the written rules (scripts/check-repo.mjs), commit subjects and the Python client's version on a pull request, and actionlint with shellcheck over the workflows. Runs after the setup action, on a checkout with the full history.
+description: Formatting, the written rules (scripts/check-repo.mjs), commit subjects on a pull request, the Python client's version against the release on main, and actionlint with shellcheck over the workflows. Runs after the setup action, on a checkout with the full history.
 
 inputs:
   actionlint-version:
@@ -33,11 +33,11 @@ runs:
         BASE_REF: ${{ github.base_ref }}
       run: node scripts/check-commits.mjs "origin/$BASE_REF"
 
-    - name: Check the Python client's version and changelog
+    - name: Check the Python client's version against the release on main
       shell: bash
-      env:
-        BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
-      run: node scripts/check-python-version.mjs ${BASE:+"$BASE"}
+      run: |
+        git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
+        node scripts/check-python-version.mjs origin/main
 
     - name: Install actionlint and shellcheck
       shell: bash

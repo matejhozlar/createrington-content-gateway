@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { subjectProblem } from "./check-commits.mjs";
-import { topHeading } from "./check-python-version.mjs";
+import { topHeading, versionProblems } from "./check-python-version.mjs";
 import {
   envNames,
   inReadmeTable,
@@ -90,4 +90,53 @@ test("topHeading reads the first second-level heading", () => {
     "0.2.2",
   );
   assert.equal(topHeading("# client\n"), null);
+});
+
+const released = {
+  released: "origin/main",
+  releasedVersion: "0.2.2",
+};
+
+test("a source change since the release needs a version other than the released one", () => {
+  assert.deepEqual(
+    versionProblems({
+      ...released,
+      version: "0.3.0",
+      heading: "0.3.0",
+      sourceChanged: true,
+    }),
+    [],
+  );
+  const [problem, ...rest] = versionProblems({
+    ...released,
+    version: "0.2.2",
+    heading: "0.2.2",
+    sourceChanged: true,
+  });
+  assert.match(problem, /still the released 0\.2\.2/);
+  assert.deepEqual(rest, []);
+});
+
+test("an unreleased version needs no further bump for more source changes", () => {
+  assert.deepEqual(
+    versionProblems({
+      ...released,
+      releasedVersion: "0.2.1",
+      version: "0.2.2",
+      heading: "0.2.2",
+      sourceChanged: true,
+    }),
+    [],
+  );
+});
+
+test("the version needs the top changelog heading whatever changed", () => {
+  const [problem, ...rest] = versionProblems({
+    ...released,
+    version: "0.3.0",
+    heading: "0.2.2",
+    sourceChanged: false,
+  });
+  assert.match(problem, /top heading .* is ## 0\.2\.2, but .* says 0\.3\.0/);
+  assert.deepEqual(rest, []);
 });
