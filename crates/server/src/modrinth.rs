@@ -7,7 +7,7 @@ use std::{
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::{HeaderMap, Method, StatusCode, Uri},
+    http::{HeaderMap, Method, Uri},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
@@ -17,19 +17,17 @@ use utoipa::ToSchema;
 use crate::{
     app::AppState,
     auth::Pool,
-    cache::{
-        Answer, AnswerCache, CacheStatus, Entry, Finisher, LoadFailure, Outcome, Waiting, load_key,
-    },
+    cache::{Answer, Entry},
     clock::{DAY_MS, HOUR_MS, MINUTE_MS},
     error::ApiError,
+    load::{self, PerId},
     passthrough::{self, Freshness, SHA1_LENGTH, fresh, sha1_of},
-    upstream::{Source, UpstreamFailure},
+    upstream::Source,
 };
 
 pub const MODRINTH_API: &str = "https://api.modrinth.com/v2";
 pub const TIMEOUT: Duration = Duration::from_secs(10);
 const MOST_HASHES: usize = 1000;
-const HASHES_PER_CALL: usize = 100;
 const FOUND_MS: u64 = HOUR_MS;
 const NOT_FOUND_MS: u64 = 10 * MINUTE_MS;
 
@@ -94,205 +92,48 @@ fn sha1() -> String {
     "sha1".to_owned()
 }
 
-/// What Modrinth knows about the file with one SHA-1: its version as Modrinth sent it, or nothing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Known {
-    pub hash: String,
-    pub version: Option<Bytes>,
-}
+/// Modrinth's version of the file with each lowercase SHA-1, kept per hash and asked for with `POST version_files`.
+#[derive(Debug, Clone, Copy)]
+pub struct VersionFiles;
 
-/// The versions of the kept hashes, and whether Modrinth was asked, found as `hit`, `miss` or `stale`.
-pub struct Looked {
-    pub known: Vec<Known>,
-    pub cache: CacheStatus,
-}
+impl PerId for VersionFiles {
+    type Id = String;
+    const SOURCE: Source = Source::Modrinth;
+    const PER_CALL: usize = 100;
+    const KNOWS_NONE_AS_404: bool = false;
 
-enum Slot {
-    Kept(Arc<Entry>),
-    Waiting { waiting: Waiting, started: bool },
-}
-
-struct Mine {
-    hash: String,
-    load_key: String,
-    finisher: Finisher,
-}
-
-fn key(hash: &str) -> String {
-    format!("modrinth:sha1:{hash}")
-}
-
-/// Modrinth's version for each lowercase SHA-1 from the cache while fresh, the rest asked for 100 per call.
-pub async fn lookup(
-    state: &Arc<AppState>,
-    pool: &Pool,
-    hashes: Vec<String>,
-    forced: bool,
-) -> Result<Looked, LoadFailure> {
-    let keys: Vec<String> = hashes.iter().map(|hash| key(hash)).collect();
-    let found = state.cache.lookup_many(&keys, state.clock.now_ms()).await;
-    let now = state.clock.now_ms();
-    let mut slots = Vec::with_capacity(hashes.len());
-    let mut mine = Vec::new();
-    for ((hash, key), kept) in hashes.into_iter().zip(keys).zip(found) {
-        let kept = kept.filter(|entry| entry.fits_a_batch());
-        if !forced && let Some(entry) = kept.clone().filter(|entry| entry.is_fresh(now)) {
-            slots.push((hash, kept, Slot::Kept(entry)));
-            continue;
-        }
-        let load_key = load_key(key, forced);
-        let (waiting, finisher) = state.cache.join(&load_key);
-        let started = finisher.is_some();
-        if let Some(finisher) = finisher {
-            mine.push(Mine {
-                hash: hash.clone(),
-                load_key,
-                finisher,
-            });
-        }
-        slots.push((hash, kept, Slot::Waiting { waiting, started }));
+    fn key(self, hash: &String) -> String {
+        format!("modrinth:sha1:{hash}")
     }
 
-    if !mine.is_empty() {
-        tokio::spawn(fetch(state.clone(), pool.clone(), mine, forced));
+    fn path(self) -> &'static str {
+        "version_files"
     }
 
-    let mut known = Vec::with_capacity(slots.len());
-    let mut stale = false;
-    let mut called = false;
-    for (hash, kept, slot) in slots {
-        let loaded = match slot {
-            Slot::Kept(entry) => Ok(entry),
-            Slot::Waiting { waiting, started } => match AnswerCache::wait(waiting).await {
-                Some(outcome) => {
-                    called |= started && outcome.called;
-                    outcome.loaded
-                }
-                None => Err(LoadFailure::Upstream(UpstreamFailure::Unreachable)),
-            },
-        };
-        let entry = match loaded {
-            Ok(entry) if entry.fits_a_batch() => entry,
-            Ok(_) => return Err(LoadFailure::Upstream(UpstreamFailure::Unreadable)),
-            Err(failure) => {
-                let now = state.clock.now_ms();
-                match kept.filter(|entry| entry.can_stand_in(now)) {
-                    Some(entry) if failure.allows_stale() => {
-                        stale = true;
-                        entry
-                    }
-                    _ => return Err(failure),
-                }
-            }
-        };
-        known.push(Known {
-            hash,
-            version: entry.row.clone(),
-        });
+    fn body(self, hashes: &[String]) -> Bytes {
+        serde_json::json!({ "hashes": hashes, "algorithm": "sha1" })
+            .to_string()
+            .into()
     }
-    if !called {
-        state.modrinth_budget.record_hit(&pool.consumer, &pool.name);
-    }
-    Ok(Looked {
-        known,
-        cache: CacheStatus::of(stale, called),
-    })
-}
 
-async fn fetch(state: Arc<AppState>, pool: Pool, mine: Vec<Mine>, forced: bool) {
-    let mut missing = Vec::with_capacity(mine.len());
-    for load in mine {
-        let kept = state.cache.get(&key(&load.hash)).filter(|entry| {
-            !forced && entry.fits_a_batch() && entry.is_fresh(state.clock.now_ms())
-        });
-        match kept {
-            Some(entry) => {
-                let outcome = Outcome::not_called(Ok(entry));
-                state.cache.finish(&load.load_key, load.finisher, outcome);
-            }
-            None => missing.push(load),
-        }
+    fn split(self, answer: &Answer, now_ms: u64) -> Option<Vec<(String, Entry)>> {
+        let versions: HashMap<String, &RawValue> = serde_json::from_slice(&answer.body).ok()?;
+        Some(
+            versions
+                .into_iter()
+                .map(|(hash, version)| {
+                    let version = answer.body.slice_ref(version.get().as_bytes());
+                    let mut entry = Entry::new(Answer::json(version.clone()), now_ms, FOUND_MS);
+                    entry.row = Some(version);
+                    (hash.to_ascii_lowercase(), entry)
+                })
+                .collect(),
+        )
     }
-    if missing.is_empty() {
-        return;
-    }
-    let calls = u32::try_from(missing.len().div_ceil(HASHES_PER_CALL)).unwrap_or(u32::MAX);
-    if let Err(refusal) = state
-        .modrinth_budget
-        .admit(&pool.consumer, &pool.name, calls)
-        .await
-    {
-        for load in missing {
-            let outcome = Outcome::not_called(Err(LoadFailure::Refused(refusal)));
-            state.cache.finish(&load.load_key, load.finisher, outcome);
-        }
-        return;
-    }
-    let mut missing = missing.into_iter().peekable();
-    while missing.peek().is_some() {
-        let chunk: Vec<Mine> = missing.by_ref().take(HASHES_PER_CALL).collect();
-        tokio::spawn(fetch_chunk(state.clone(), pool.clone(), chunk));
-    }
-}
 
-async fn fetch_chunk(state: Arc<AppState>, pool: Pool, chunk: Vec<Mine>) {
-    let hashes: Vec<&str> = chunk.iter().map(|load| load.hash.as_str()).collect();
-    let body = serde_json::json!({ "hashes": hashes, "algorithm": "sha1" }).to_string();
-    let sent = passthrough::send_recorded(
-        &state,
-        Source::Modrinth,
-        &pool,
-        Method::POST,
-        "version_files",
-        None,
-        body.into(),
-    )
-    .await;
-    let found = match sent {
-        Ok(answer) if answer.status == StatusCode::OK => match split(&answer) {
-            Some(found) => Ok(found),
-            None => Err(LoadFailure::Upstream(UpstreamFailure::Unreadable)),
-        },
-        Ok(answer) => Err(LoadFailure::Answered(answer)),
-        Err(failure) => Err(failure),
-    };
-
-    let now = state.clock.now_ms();
-    for load in chunk {
-        let loaded = match &found {
-            Ok(versions) => {
-                let entry = match versions.get(&load.hash) {
-                    Some(version) => {
-                        let mut entry = Entry::new(Answer::json(version.clone()), now, FOUND_MS);
-                        entry.row = Some(version.clone());
-                        entry
-                    }
-                    None => Entry::new(Answer::not_found(), now, NOT_FOUND_MS),
-                };
-                let entry = Arc::new(entry);
-                state.cache.insert(&key(&load.hash), entry.clone());
-                Ok(entry)
-            }
-            Err(failure) => Err(failure.clone()),
-        };
-        let outcome = Outcome::called(loaded);
-        state.cache.finish(&load.load_key, load.finisher, outcome);
+    fn not_found_ms(self) -> u64 {
+        NOT_FOUND_MS
     }
-}
-
-fn split(answer: &Answer) -> Option<HashMap<String, Bytes>> {
-    let versions: HashMap<String, &RawValue> = serde_json::from_slice(&answer.body).ok()?;
-    Some(
-        versions
-            .into_iter()
-            .map(|(hash, version)| {
-                (
-                    hash.to_ascii_lowercase(),
-                    answer.body.slice_ref(version.get().as_bytes()),
-                )
-            })
-            .collect(),
-    )
 }
 
 /// What `GET api.modrinth.com/v2/{path}` answers, from the cache while it is fresh.
@@ -401,18 +242,13 @@ pub async fn version_file(state: Arc<AppState>, pool: Pool, hash: &str, forced: 
     let Some(hash) = sha1_of(hash) else {
         return ApiError::invalid_hash().into_response();
     };
-    let looked = match lookup(&state, &pool, vec![hash], forced).await {
-        Ok(looked) => looked,
+    let given = match load::rows(&state, &pool, VersionFiles, vec![hash], forced).await {
+        Ok(given) => given,
         Err(failure) => return passthrough::failed(failure, &pool, Source::Modrinth),
     };
-    match looked
-        .known
-        .into_iter()
-        .next()
-        .and_then(|known| known.version)
-    {
-        Some(version) => passthrough::respond(&Answer::json(version), looked.cache),
-        None => passthrough::respond(&Answer::not_found(), looked.cache),
+    match given.value.into_iter().next() {
+        Some((_, version)) => passthrough::respond(&Answer::json(version), given.cache),
+        None => passthrough::respond(&Answer::not_found(), given.cache),
     }
 }
 
@@ -443,41 +279,35 @@ pub async fn version_files(
             return ApiError::invalid_body("`hashes` may list at most 1000 SHA-1s").into_response();
         }
     }
-    let looked = match lookup(&state, &pool, hashes, forced).await {
-        Ok(looked) => looked,
+    let given = match load::rows(&state, &pool, VersionFiles, hashes, forced).await {
+        Ok(given) => given,
         Err(failure) => return passthrough::failed(failure, &pool, Source::Modrinth),
     };
-    let found: Vec<&Known> = looked
-        .known
-        .iter()
-        .filter(|known| known.version.is_some())
-        .collect();
+    let found = given.value;
     let mut body = Vec::with_capacity(
         found
             .iter()
-            .map(|known| known.version.as_ref().map_or(0, Bytes::len) + SHA1_LENGTH + 4)
+            .map(|(_, version)| version.len() + SHA1_LENGTH + 4)
             .sum::<usize>()
             + 2,
     );
     body.push(b'{');
-    for (index, known) in found.iter().enumerate() {
+    for (index, (hash, version)) in found.iter().enumerate() {
         if index > 0 {
             body.push(b',');
         }
         body.push(b'"');
-        body.extend_from_slice(known.hash.as_bytes());
+        body.extend_from_slice(hash.as_bytes());
         body.extend_from_slice(b"\":");
-        if let Some(version) = &known.version {
-            body.extend_from_slice(version);
-        }
+        body.extend_from_slice(version);
     }
     body.push(b'}');
-    passthrough::respond(&Answer::json(body), looked.cache)
+    passthrough::respond(&Answer::json(body), given.cache)
 }
 
 #[cfg(test)]
 mod tests {
-    use axum::http::Request;
+    use axum::http::{Request, StatusCode};
 
     use super::*;
     use crate::{app::Timeouts, test_support::*};
@@ -640,6 +470,9 @@ mod tests {
         let stale = get(&gateway.router, &format!("/v1/modrinth/version_file/{JEI}")).await;
         assert_eq!(stale.status, StatusCode::OK);
         assert_eq!(stale.header("x-cache"), Some("stale"));
+        let snapshot = gateway.state.modrinth_budget.snapshot().await;
+        let counts = &snapshot.days[0].pools[0].counts;
+        assert_eq!((counts.calls, counts.hits), (2, 0));
 
         let fresh = get(
             &gateway.router,

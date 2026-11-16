@@ -16,9 +16,10 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::{
     app::AppState,
-    cache::{Answer, AnswerCache, Entry, LoadFailure, Outcome},
+    cache::{Answer, Entry, LoadFailure, Outcome},
     clock::{DAY_MS, HOUR_MS},
     error::ApiError,
+    load,
     upstream::{self, UpstreamFailure},
 };
 
@@ -387,6 +388,10 @@ fn parsed<T: DeserializeOwned>(body: &[u8], origin: Origin, url: &str) -> Result
     })
 }
 
+fn read<T: DeserializeOwned>(entry: &Arc<Entry>) -> Option<T> {
+    serde_json::from_slice(&entry.answer.body).ok()
+}
+
 /// The list at `url` read as `T`, from the cache while fresh. A body is kept only once it reads as `T`, and the old
 /// copy answers while the source fails. A kept copy that does not read, such as one an older gateway kept in Redis,
 /// counts as no copy. A fetched body is read twice, once to decide it is kept and once for each waiting request.
@@ -397,48 +402,34 @@ async fn document<T: DeserializeOwned + 'static>(
     origin: Origin,
     fresh_ms: u64,
 ) -> Result<T, ListFailure> {
-    let now = state.clock.now_ms();
-    let cached = state.cache.lookup(key, now).await;
-    if let Some(entry) = cached.as_ref().filter(|entry| entry.is_fresh(now))
-        && let Ok(kept) = serde_json::from_slice(&entry.answer.body)
-    {
-        return Ok(kept);
-    }
-    let (waiting, finisher) = state.cache.join(key);
-    if let Some(finisher) = finisher {
+    let fetch = {
         let (state, key, url) = (state.clone(), key.to_owned(), url.to_owned());
-        tokio::spawn(async move {
-            let loaded = match state.meta.get(&url, origin).await {
-                Ok(body) => match parsed::<T>(&body, origin, &url) {
-                    Ok(_) => {
-                        let answer = Answer {
-                            status: StatusCode::OK,
-                            content_type: None,
-                            body,
-                        };
-                        let entry = Arc::new(Entry::new(answer, state.clock.now_ms(), fresh_ms));
-                        state.cache.insert(&key, entry.clone());
-                        Ok(entry)
-                    }
-                    Err(failed) => Err(LoadFailure::Upstream(failed.failure)),
-                },
-                Err(failure) => Err(LoadFailure::Upstream(failure)),
+        async move {
+            let body = match state.meta.get(&url, origin).await {
+                Ok(body) => body,
+                Err(failure) => return Outcome::called(Err(LoadFailure::Upstream(failure))),
             };
-            state.cache.finish(&key, finisher, Outcome::called(loaded));
-        });
-    }
-    let failure = match AnswerCache::wait(waiting)
-        .await
-        .map(|outcome| outcome.loaded)
-    {
-        Some(Ok(entry)) => return parsed(&entry.answer.body, origin, url),
-        Some(Err(LoadFailure::Upstream(failure))) => failure,
-        _ => UpstreamFailure::Unreachable,
+            if let Err(failed) = parsed::<T>(&body, origin, &url) {
+                return Outcome::called(Err(LoadFailure::Upstream(failed.failure)));
+            }
+            let answer = Answer {
+                status: StatusCode::OK,
+                content_type: None,
+                body,
+            };
+            let entry = Arc::new(Entry::new(answer, state.clock.now_ms(), fresh_ms));
+            state.cache.insert(&key, entry.clone());
+            Outcome::called(Ok(entry))
+        }
     };
-    cached
-        .filter(|entry| entry.can_stand_in(state.clock.now_ms()))
-        .and_then(|entry| serde_json::from_slice(&entry.answer.body).ok())
-        .ok_or(ListFailure { origin, failure })
+    match load::one(state, key.to_owned(), false, read::<T>, fetch).await {
+        Ok(given) => Ok(given.value),
+        Err(LoadFailure::Upstream(failure)) => Err(ListFailure { origin, failure }),
+        Err(_) => Err(ListFailure {
+            origin,
+            failure: UpstreamFailure::Unreachable,
+        }),
+    }
 }
 
 async fn manifest(state: &Arc<AppState>) -> Result<Manifest, ListFailure> {

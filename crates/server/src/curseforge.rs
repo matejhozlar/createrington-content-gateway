@@ -13,6 +13,7 @@ use crate::{
     batch::Batch,
     clock::{DAY_MS, HOUR_MS, MINUTE_MS},
     error::ApiError,
+    load::PerId,
     passthrough::{self, Freshness, fresh, is_id},
     upstream::Source,
 };
@@ -119,7 +120,8 @@ pub async fn passthrough_get(
 ///
 /// `POST mods` with only `{"modIds": [...]}`, `POST mods/files` with only `{"fileIds": [...]}`, and
 /// `POST fingerprints/432` or `POST fingerprints` with only `{"fingerprints": [...]}` are answered per id from the
-/// cache, and only the ids not kept are asked for, 100 per call. Every other body goes to CurseForge each time.
+/// cache, and only the ids not kept are asked for, 100 per call, at most 1000 different ids. Every other body goes to
+/// CurseForge each time.
 #[utoipa::path(
     post,
     operation_id = "curseforge_post",
@@ -134,7 +136,7 @@ pub async fn passthrough_get(
     request_body(content = Value, description = "The JSON body CurseForge expects at this path", content_type = "application/json"),
     responses(
         (status = 200, description = "CurseForge's answer, as it came, or one built from the kept rows of a batch", body = Value, headers(("X-Cache" = String, description = "`hit` when every id was kept, `miss` when CurseForge was asked, `stale` an old answer given because CurseForge could not be asked"))),
-        (status = 400, description = "`INVALID_PATH`, `POOL_REQUIRED` or `UNKNOWN_POOL`", body = ApiError),
+        (status = 400, description = "`INVALID_PATH`, `INVALID_BODY` (a batch of more than 1000 different ids), `POOL_REQUIRED` or `UNKNOWN_POOL`", body = ApiError),
         (status = 401, description = "No valid consumer token", body = ApiError),
         (status = 413, description = "The batch needs more calls than a whole minute allows, `REQUEST_TOO_LARGE`; split it", body = ApiError),
         (status = 502, description = "CurseForge could not be reached or answered something the gateway cannot keep: `UPSTREAM_UNREACHABLE`, `UPSTREAM_TOO_LARGE` or `UPSTREAM_UNREADABLE`", body = ApiError),
@@ -472,7 +474,7 @@ mod tests {
         assert_eq!(stale.body, r#"{"data":"old"}"#);
         let snapshot = gateway.state.curseforge_budget.snapshot().await;
         let counts = &snapshot.days[0].pools[0].counts;
-        assert_eq!((counts.calls, counts.hits), (2, 1));
+        assert_eq!((counts.calls, counts.hits), (2, 0));
 
         gateway.clock.advance(DAY_MS);
         let gone = get(&gateway.router, "/v1/curseforge/mods/1").await;
@@ -502,6 +504,9 @@ mod tests {
         assert_eq!(refused.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(refused.json()["code"], "BUDGET_SPENT");
         assert_eq!(mock.calls(), 2);
+        let snapshot = gateway.state.curseforge_budget.snapshot().await;
+        let counts = &snapshot.days[0].pools[0].counts;
+        assert_eq!((counts.calls, counts.hits), (2, 1));
     }
 
     #[tokio::test]

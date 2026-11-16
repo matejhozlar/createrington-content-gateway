@@ -5,8 +5,8 @@ use std::{
 
 use axum::{
     body::Bytes,
-    http::{HeaderValue, Method, StatusCode},
-    response::Response,
+    http::{HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
 };
 use serde::{Deserialize, de::IgnoredAny};
 use serde_json::value::RawValue;
@@ -14,16 +14,15 @@ use serde_json::value::RawValue;
 use crate::{
     app::AppState,
     auth::Pool,
-    cache::{
-        Answer, AnswerCache, CacheStatus, Entry, Finisher, LoadFailure, Outcome, Waiting, load_key,
-    },
+    cache::{Answer, Entry},
+    clock::{HOUR_MS, MINUTE_MS},
+    error::ApiError,
+    load::{self, PerId},
     passthrough,
-    upstream::{Source, UpstreamFailure},
+    upstream::Source,
 };
 
-use crate::clock::{HOUR_MS, MINUTE_MS};
-
-const IDS_PER_CALL: usize = 100;
+const MOST_IDS: usize = 1000;
 
 /// A CurseForge batch route answered per id: `POST /mods`, `POST /mods/files` and `POST /fingerprints`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,16 +129,6 @@ impl Batch {
         (!ids.is_empty()).then_some(ids)
     }
 
-    /// The cache key of one id, shared with `GET /mods/{id}` and `GET /mods/{modId}/files/{id}`.
-    pub fn key(self, id: u64) -> String {
-        match self {
-            Self::Mods => format!("mod:{id}"),
-            Self::Files => format!("file:{id}"),
-            Self::Fingerprints => format!("fingerprint:{id}"),
-            Self::MinecraftFingerprints => format!("fingerprint:{MINECRAFT}:{id}"),
-        }
-    }
-
     pub fn found_ms(self) -> u64 {
         match self {
             Self::Mods | Self::Fingerprints | Self::MinecraftFingerprints => HOUR_MS,
@@ -147,15 +136,33 @@ impl Batch {
         }
     }
 
-    pub fn not_found_ms(self) -> u64 {
-        match self {
-            Self::Mods => 5 * MINUTE_MS,
-            Self::Files | Self::Fingerprints | Self::MinecraftFingerprints => 10 * MINUTE_MS,
-        }
-    }
-
     fn is_fingerprints(self) -> bool {
         matches!(self, Self::Fingerprints | Self::MinecraftFingerprints)
+    }
+
+    fn field(self) -> &'static str {
+        match self {
+            Self::Mods => "modIds",
+            Self::Files => "fileIds",
+            Self::Fingerprints | Self::MinecraftFingerprints => "fingerprints",
+        }
+    }
+}
+
+impl PerId for Batch {
+    type Id = u64;
+    const SOURCE: Source = Source::CurseForge;
+    const PER_CALL: usize = 100;
+    const KNOWS_NONE_AS_404: bool = true;
+
+    /// The cache key of one id, shared with `GET /mods/{id}` and `GET /mods/{modId}/files/{id}`.
+    fn key(self, id: &u64) -> String {
+        match self {
+            Self::Mods => format!("mod:{id}"),
+            Self::Files => format!("file:{id}"),
+            Self::Fingerprints => format!("fingerprint:{id}"),
+            Self::MinecraftFingerprints => format!("fingerprint:{MINECRAFT}:{id}"),
+        }
     }
 
     fn path(self) -> &'static str {
@@ -168,13 +175,31 @@ impl Batch {
     }
 
     fn body(self, ids: &[u64]) -> Bytes {
-        let field = match self {
-            Self::Mods => "modIds",
-            Self::Files => "fileIds",
-            Self::Fingerprints | Self::MinecraftFingerprints => "fingerprints",
-        };
         let ids: Vec<String> = ids.iter().map(u64::to_string).collect();
-        format!("{{\"{field}\":[{}]}}", ids.join(",")).into()
+        format!("{{\"{}\":[{}]}}", self.field(), ids.join(",")).into()
+    }
+
+    fn split(self, answer: &Answer, now_ms: u64) -> Option<Vec<(u64, Entry)>> {
+        let rows = if self.is_fingerprints() {
+            split_matches(answer)?
+        } else {
+            split_rows(answer)?
+        };
+        Some(
+            rows.into_iter()
+                .map(|(id, row, owner)| {
+                    let entry = kept_row(self, &row, owner, &answer.content_type, now_ms);
+                    (id, entry)
+                })
+                .collect(),
+        )
+    }
+
+    fn not_found_ms(self) -> u64 {
+        match self {
+            Self::Mods => 5 * MINUTE_MS,
+            Self::Files | Self::Fingerprints | Self::MinecraftFingerprints => 10 * MINUTE_MS,
+        }
     }
 }
 
@@ -187,23 +212,7 @@ pub fn row_of(body: &Bytes) -> Option<(Bytes, Option<u64>)> {
     Some((body.slice_ref(single.data.get().as_bytes()), owner))
 }
 
-enum Slot {
-    Kept(Arc<Entry>),
-    Waiting { waiting: Waiting, started: bool },
-}
-
-struct Mine {
-    id: u64,
-    load_key: String,
-    finisher: Finisher,
-}
-
-/// The kept rows of a batch and whether they were a `hit`, a `miss` or `stale`.
-pub struct Rows {
-    pub rows: Vec<(u64, Bytes)>,
-    pub cache: CacheStatus,
-}
-
+/// The answer to a batch of ids from the per-id cache: the rows CurseForge knows, joined in its shape.
 pub async fn answer(
     state: Arc<AppState>,
     pool: Pool,
@@ -217,16 +226,23 @@ pub async fn answer(
         .copied()
         .filter(|id| seen.insert(*id))
         .collect();
-    let Rows { rows, cache } = match rows(state, pool.clone(), batch, ids, forced).await {
-        Ok(rows) => rows,
+    if ids.len() > MOST_IDS {
+        return ApiError::invalid_body(&format!(
+            "a list of at most {MOST_IDS} ids under `{}`",
+            batch.field()
+        ))
+        .into_response();
+    }
+    let given = match load::rows(&state, &pool, batch, ids, forced).await {
+        Ok(given) => given,
         Err(failure) => return passthrough::failed(failure, &pool, Source::CurseForge),
     };
+    let (rows, cache) = (given.value, given.cache);
     if batch.is_fingerprints() {
         return passthrough::respond(&Answer::json(fingerprint_answer(&rows, &asked)), cache);
     }
     if rows.is_empty() {
-        let answer = Answer::not_found();
-        return passthrough::respond(&answer, cache);
+        return passthrough::respond(&Answer::not_found(), cache);
     }
     let mut body =
         Vec::with_capacity(rows.iter().map(|(_, row)| row.len() + 1).sum::<usize>() + 11);
@@ -234,92 +250,6 @@ pub async fn answer(
     join(&mut body, rows.iter().map(|(_, row)| row.as_ref()));
     body.extend_from_slice(b"]}");
     passthrough::respond(&Answer::json(body), cache)
-}
-
-/// The rows of these ids from the cache while fresh, the rest asked for 100 per call.
-pub async fn rows(
-    state: Arc<AppState>,
-    pool: Pool,
-    batch: Batch,
-    ids: Vec<u64>,
-    forced: bool,
-) -> Result<Rows, LoadFailure> {
-    let keys: Vec<String> = ids.iter().map(|id| batch.key(*id)).collect();
-    let found = state.cache.lookup_many(&keys, state.clock.now_ms()).await;
-    let now = state.clock.now_ms();
-    let mut slots = Vec::with_capacity(ids.len());
-    let mut mine = Vec::new();
-    for ((&id, key), kept) in ids.iter().zip(keys).zip(found) {
-        let kept = kept.filter(|entry| entry.fits_a_batch());
-        if !forced && let Some(entry) = kept.clone().filter(|entry| entry.is_fresh(now)) {
-            slots.push((id, kept, Slot::Kept(entry)));
-            continue;
-        }
-        let load_key = load_key(key, forced);
-        let (waiting, finisher) = state.cache.join(&load_key);
-        let started = finisher.is_some();
-        if let Some(finisher) = finisher {
-            mine.push(Mine {
-                id,
-                load_key,
-                finisher,
-            });
-        }
-        slots.push((id, kept, Slot::Waiting { waiting, started }));
-    }
-
-    if !mine.is_empty() {
-        tokio::spawn(fetch(state.clone(), pool.clone(), batch, mine, forced));
-    }
-
-    let mut rows = Vec::with_capacity(slots.len());
-    let mut stale = false;
-    let mut called = false;
-    for (id, kept, slot) in slots {
-        let loaded = match slot {
-            Slot::Kept(entry) => Ok(entry),
-            Slot::Waiting { waiting, started } => match AnswerCache::wait(waiting).await {
-                Some(outcome) => {
-                    called |= started && outcome.called;
-                    outcome.loaded
-                }
-                None => Err(LoadFailure::Upstream(UpstreamFailure::Unreachable)),
-            },
-        };
-        let loaded = loaded.and_then(|entry| {
-            if entry.fits_a_batch() {
-                Ok(entry)
-            } else {
-                Err(LoadFailure::Upstream(UpstreamFailure::Unreadable))
-            }
-        });
-        let entry = match loaded {
-            Ok(entry) => entry,
-            Err(failure) => {
-                let now = state.clock.now_ms();
-                match kept.filter(|entry| entry.can_stand_in(now)) {
-                    Some(entry) if failure.allows_stale() => {
-                        stale = true;
-                        entry
-                    }
-                    _ => return Err(failure),
-                }
-            }
-        };
-        if let Some(row) = &entry.row {
-            rows.push((id, row.clone()));
-        }
-    }
-
-    if !called {
-        state
-            .curseforge_budget
-            .record_hit(&pool.consumer, &pool.name);
-    }
-    Ok(Rows {
-        rows,
-        cache: CacheStatus::of(stale, called),
-    })
 }
 
 fn join<'a>(body: &mut Vec<u8>, parts: impl Iterator<Item = &'a [u8]>) {
@@ -349,90 +279,7 @@ fn fingerprint_answer(rows: &[(u64, Bytes)], asked: &[u64]) -> Vec<u8> {
     body
 }
 
-async fn fetch(state: Arc<AppState>, pool: Pool, batch: Batch, mine: Vec<Mine>, forced: bool) {
-    let mut missing = Vec::with_capacity(mine.len());
-    for load in mine {
-        let kept = state.cache.get(&batch.key(load.id)).filter(|entry| {
-            !forced && entry.fits_a_batch() && entry.is_fresh(state.clock.now_ms())
-        });
-        match kept {
-            Some(entry) => {
-                let outcome = Outcome::not_called(Ok(entry));
-                state.cache.finish(&load.load_key, load.finisher, outcome);
-            }
-            None => missing.push(load),
-        }
-    }
-    if missing.is_empty() {
-        return;
-    }
-    let mine = missing;
-    let calls = u32::try_from(mine.len().div_ceil(IDS_PER_CALL)).unwrap_or(u32::MAX);
-    if let Err(refusal) = state
-        .curseforge_budget
-        .admit(&pool.consumer, &pool.name, calls)
-        .await
-    {
-        for load in mine {
-            let outcome = Outcome::not_called(Err(LoadFailure::Refused(refusal)));
-            state.cache.finish(&load.load_key, load.finisher, outcome);
-        }
-        return;
-    }
-    let mut mine = mine.into_iter().peekable();
-    while mine.peek().is_some() {
-        let chunk: Vec<Mine> = mine.by_ref().take(IDS_PER_CALL).collect();
-        tokio::spawn(fetch_chunk(state.clone(), pool.clone(), batch, chunk));
-    }
-}
-
-async fn fetch_chunk(state: Arc<AppState>, pool: Pool, batch: Batch, chunk: Vec<Mine>) {
-    let ids: Vec<u64> = chunk.iter().map(|load| load.id).collect();
-    let sent = passthrough::send_recorded(
-        &state,
-        Source::CurseForge,
-        &pool,
-        Method::POST,
-        batch.path(),
-        None,
-        batch.body(&ids),
-    )
-    .await;
-    let found = match sent {
-        Ok(answer) if answer.status == StatusCode::OK => match split(batch, &answer) {
-            Some(found) => Ok((found, answer.content_type)),
-            None => Err(LoadFailure::Upstream(UpstreamFailure::Unreadable)),
-        },
-        Ok(answer) if answer.status == StatusCode::NOT_FOUND => {
-            Ok((Vec::new(), answer.content_type))
-        }
-        Ok(answer) => Err(LoadFailure::Answered(answer)),
-        Err(failure) => Err(failure),
-    };
-
-    let now = state.clock.now_ms();
-    for load in chunk {
-        let loaded = match &found {
-            Ok((rows, content_type)) => {
-                let entry = match rows.iter().find(|(id, _, _)| *id == load.id) {
-                    Some((_, row, owner)) => kept_row(batch, row, *owner, content_type, now),
-                    None => Entry::new(Answer::not_found(), now, batch.not_found_ms()),
-                };
-                let entry = Arc::new(entry);
-                state.cache.insert(&batch.key(load.id), entry.clone());
-                Ok(entry)
-            }
-            Err(failure) => Err(failure.clone()),
-        };
-        let outcome = Outcome::called(loaded);
-        state.cache.finish(&load.load_key, load.finisher, outcome);
-    }
-}
-
-fn split(batch: Batch, answer: &Answer) -> Option<Vec<(u64, Bytes, Option<u64>)>> {
-    if batch.is_fingerprints() {
-        return split_matches(answer);
-    }
+fn split_rows(answer: &Answer) -> Option<Vec<(u64, Bytes, Option<u64>)>> {
     let rows: DataRows<'_> = serde_json::from_slice(&answer.body).ok()?;
     rows.data
         .iter()
@@ -698,6 +545,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn more_than_a_thousand_different_ids_are_refused_before_any_call() {
+        let mock = Mock::start(Duration::ZERO, curseforge).await;
+        let gateway = gateway(&mock);
+        let got = post_json(&gateway.router, "/v1/curseforge/mods", &many(1001)).await;
+        assert_eq!(got.status, StatusCode::BAD_REQUEST);
+        assert_eq!(got.json()["code"], "INVALID_BODY");
+        assert_eq!(
+            got.json()["message"],
+            "the body must be a list of at most 1000 ids under `modIds`"
+        );
+        assert_eq!(mock.calls(), 0);
+
+        let repeated = format!(r#"{{"modIds":[{}1]}}"#, "1,".repeat(1000));
+        let got = post_json(&gateway.router, "/v1/curseforge/mods", &repeated).await;
+        assert_eq!(got.status, StatusCode::OK);
+        assert_eq!(mock.calls(), 1);
+
+        let fingerprints = many(1001).replace("modIds", "fingerprints");
+        for route in [
+            "/v1/curseforge/fingerprints",
+            "/v1/curseforge/fingerprints/432",
+        ] {
+            let got = post_json(&gateway.router, route, &fingerprints).await;
+            assert_eq!(got.status, StatusCode::BAD_REQUEST, "{route}");
+            assert_eq!(
+                got.json()["message"],
+                "the body must be a list of at most 1000 ids under `fingerprints`",
+                "{route}"
+            );
+        }
+        assert_eq!(mock.calls(), 1);
+    }
+
+    #[tokio::test]
     async fn a_batch_larger_than_a_minute_allows_is_refused_whole() {
         let mock = Mock::start(Duration::ZERO, curseforge).await;
         let gateway = gateway_with(
@@ -828,6 +709,9 @@ mod tests {
             stale.body,
             format!(r#"{{"data":[{},{}]}}"#, mod_row(1), mod_row(2))
         );
+        let snapshot = gateway.state.curseforge_budget.snapshot().await;
+        let counts = &snapshot.days[0].pools[0].counts;
+        assert_eq!((counts.calls, counts.hits), (2, 0));
 
         let failed = post_json(
             &gateway.router,
@@ -857,34 +741,6 @@ mod tests {
         .await;
         assert_eq!(forced.header("x-cache"), Some("miss"));
         assert_eq!(mock.seen()[1].body, r#"{"modIds":[1,2]}"#);
-    }
-
-    #[tokio::test]
-    async fn an_id_kept_meanwhile_is_neither_asked_for_nor_counted() {
-        let mock = Mock::start(Duration::ZERO, curseforge).await;
-        let gateway = gateway(&mock);
-        get(&gateway.router, "/v1/curseforge/mods/1").await;
-
-        let (waiting, finisher) = gateway.state.cache.join("mod:1");
-        let pool = Pool {
-            consumer: "app".into(),
-            name: "launcher".into(),
-        };
-        let mine = vec![Mine {
-            id: 1,
-            load_key: "mod:1".to_owned(),
-            finisher: finisher.unwrap(),
-        }];
-        fetch(gateway.state.clone(), pool, Batch::Mods, mine, false).await;
-
-        let outcome = AnswerCache::wait(waiting).await.unwrap();
-        assert!(!outcome.called);
-        assert_eq!(
-            outcome.loaded.unwrap().row.clone().unwrap(),
-            Bytes::from(mod_row(1))
-        );
-        assert_eq!(mock.calls(), 1);
-        assert_eq!(gateway.state.curseforge_budget.snapshot().await.used, 1);
     }
 
     #[tokio::test]

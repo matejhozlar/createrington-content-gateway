@@ -36,7 +36,8 @@ export interface paths {
      * What `POST api.curseforge.com/v1/{path}` answers to this body.
      * @description `POST mods` with only `{"modIds": [...]}`, `POST mods/files` with only `{"fileIds": [...]}`, and
      *     `POST fingerprints/432` or `POST fingerprints` with only `{"fingerprints": [...]}` are answered per id from the
-     *     cache, and only the ids not kept are asked for, 100 per call. Every other body goes to CurseForge each time.
+     *     cache, and only the ids not kept are asked for, 100 per call, at most 1000 different ids. Every other body goes to
+     *     CurseForge each time.
      */
     post: operations["curseforge_post"];
     delete?: never;
@@ -716,7 +717,7 @@ export interface operations {
           "application/json": unknown;
         };
       };
-      /** @description `INVALID_PATH`, `POOL_REQUIRED` or `UNKNOWN_POOL` */
+      /** @description `INVALID_PATH`, `INVALID_BODY` (a batch of more than 1000 different ids), `POOL_REQUIRED` or `UNKNOWN_POOL` */
       400: {
         headers: {
           [name: string]: unknown;
