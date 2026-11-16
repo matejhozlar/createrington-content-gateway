@@ -8,7 +8,7 @@ The package is on npm:
 pnpm add @createrington/content-gateway-client zod
 ```
 
-`zod` is a peer dependency: 3.25 or newer, or 4, and the tests run against both. The schemas are built with `zod/v4`, which both ship, so a consumer on zod 3.25 that extends them imports `z` from `zod/v4`.
+`zod` is a peer dependency: 4.6.6 or newer within zod 4, since earlier versions can exhaust memory while validating oversized constrained collections ([GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5)). The schemas are built with `zod/v4`.
 
 ## Usage
 

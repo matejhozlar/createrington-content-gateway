@@ -28,11 +28,11 @@
     "generate:check": "node scripts/generate.mjs --check",
     "build": "pnpm run clean && tsc -p tsconfig.build.json",
     "clean": "node -e \"fs.rmSync('dist', { recursive: true, force: true })\"",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.zod3.json",
+    "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
   "peerDependencies": {
-    "zod": "^3.25.0 || ^4.0.0"
+    "zod": "^4.6.6"
   },
   "devDependencies": {
     "@types/node": "^26.6.6",
@@ -40,8 +40,7 @@
     "prettier": "^3.9.10",
     "typescript": "^5.9.3",
     "vitest": "^5.1.0",
-    "zod": "^4.6.7",
-    "zod3": "npm:zod@^3.25.76"
+    "zod": "^4.6.7"
   },
   "publishConfig": {
     "access": "public"

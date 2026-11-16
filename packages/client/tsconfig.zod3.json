@@ -1,6 +1,0 @@
-{
-  "extends": "./tsconfig.json",
-  "compilerOptions": {
-    "paths": { "zod/v4": ["./node_modules/zod3/v4/index.d.cts"] }
-  }
-}
