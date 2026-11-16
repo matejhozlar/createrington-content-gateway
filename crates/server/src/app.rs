@@ -6,7 +6,7 @@ use axum::{
 };
 
 use crate::{
-    auth,
+    auth::{self, Pool},
     budget::{self, Budget},
     cache::AnswerCache,
     clock::Clock,
@@ -58,18 +58,22 @@ impl AppState {
         clock: Arc<dyn Clock>,
         redis: Option<Arc<RedisStore>>,
     ) -> reqwest::Result<Self> {
-        let pools = config.consumers.iter().flat_map(|consumer| {
-            consumer
-                .pools
-                .iter()
-                .map(|pool| (consumer.name.as_str(), pool.as_str()))
-        });
-        let pools: Vec<(&str, &str)> = pools.collect();
+        let pools: Vec<Pool> = config
+            .consumers
+            .iter()
+            .flat_map(|consumer| {
+                let name: Arc<str> = consumer.name.as_str().into();
+                consumer.pools.iter().map(move |pool| Pool {
+                    consumer: name.clone(),
+                    name: pool.as_str().into(),
+                })
+            })
+            .collect();
         Ok(Self {
             curseforge_budget: Budget::new(
                 Source::CurseForge,
                 config.budget_per_minute,
-                pools.iter().copied(),
+                pools.clone(),
                 clock.clone(),
                 redis.clone(),
             )
@@ -77,7 +81,7 @@ impl AppState {
             modrinth_budget: Budget::new(
                 Source::Modrinth,
                 config.modrinth_per_minute,
-                pools.iter().copied(),
+                pools,
                 clock.clone(),
                 redis.clone(),
             )

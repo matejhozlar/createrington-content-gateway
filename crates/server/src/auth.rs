@@ -32,7 +32,7 @@ impl From<&Consumer> for Caller {
 }
 
 /// The budget pool a request draws from: the `X-Budget-Pool` header, or the token's only pool when it has one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Pool {
     pub consumer: Arc<str>,
     pub name: Arc<str>,
@@ -69,13 +69,13 @@ impl<S: Send + Sync> FromRequestParts<S> for Pool {
                 pools => return Err(ApiError::pool_required(pools)),
             },
             Some(value) => {
-                let requested = value.to_str().unwrap_or_default();
+                let requested = String::from_utf8_lossy(value.as_bytes());
                 caller
                     .pools
                     .iter()
                     .find(|pool| pool.as_ref() == requested)
                     .cloned()
-                    .ok_or_else(|| ApiError::unknown_pool(requested, &caller.pools))?
+                    .ok_or_else(|| ApiError::unknown_pool(&requested, &caller.pools))?
             }
         };
         Ok(Self {
@@ -106,7 +106,7 @@ mod tests {
     use axum::{
         Router,
         body::Body,
-        http::{Request, StatusCode},
+        http::{HeaderValue, Request, StatusCode},
         middleware,
         routing::get,
     };
@@ -186,6 +186,24 @@ mod tests {
             call(&[("authorization", &bearer), ("x-budget-pool", "launcher")]).await,
             (StatusCode::OK, "app/launcher".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn a_pool_name_that_is_not_ascii_is_named_in_the_refusal() {
+        let bearer = format!("Bearer {APP_TOKEN}");
+        let request = Request::get("/pool")
+            .header("authorization", &bearer)
+            .header(
+                "x-budget-pool",
+                HeaderValue::from_bytes("launcher\u{e9}".as_bytes()).unwrap(),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let got = call_router(&router(), request).await;
+        assert_eq!(got.status, StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_str(&got.text()).unwrap();
+        assert_eq!(body["code"], "UNKNOWN_POOL");
+        assert_eq!(body["pool"], "launcher\u{e9}");
     }
 
     #[tokio::test]

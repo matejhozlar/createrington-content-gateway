@@ -13,7 +13,6 @@ use crate::{
     app::AppState,
     auth::Pool,
     batch::{self, Batch},
-    budget::{self, Refusal},
     cache::{Answer, CacheStatus, Entry, LoadFailure, Outcome},
     curseforge::{self, Share},
     error::ApiError,
@@ -174,7 +173,7 @@ async fn uncached(
         tokio::spawn(async move {
             state
                 .budget_of(source)
-                .admit(&pool.consumer, &pool.name, 1)
+                .admit(&pool, 1)
                 .await
                 .map_err(LoadFailure::Refused)?;
             send_recorded(&state, source, &pool, method, &path, query.as_deref(), body).await
@@ -218,7 +217,7 @@ impl Get {
                     && entry.answer.status == StatusCode::OK
                     && entry.owner == Some(project)
             }) {
-                budget.record_hit(&pool.consumer, &pool.name);
+                budget.record_hit(&pool);
                 return respond(&entry.answer, CacheStatus::Hit);
             }
         }
@@ -233,11 +232,7 @@ impl Get {
 
     async fn fetch(self) -> Outcome {
         let state = &self.state;
-        if let Err(refusal) = state
-            .budget_of(self.source)
-            .admit(&self.pool.consumer, &self.pool.name, 1)
-            .await
-        {
+        if let Err(refusal) = state.budget_of(self.source).admit(&self.pool, 1).await {
             return Outcome::not_called(Err(LoadFailure::Refused(refusal)));
         }
         let sent = send_recorded(
@@ -300,26 +295,20 @@ pub async fn send_recorded(
         .await
     {
         Ok(sent) => {
-            budget
+            let hold = budget
                 .record(
-                    &pool.consumer,
-                    &pool.name,
+                    pool,
                     Some(sent.answer.status.as_u16()),
                     sent.retry_after.as_deref(),
                 )
                 .await;
-            if sent.answer.status == StatusCode::TOO_MANY_REQUESTS {
-                return Err(LoadFailure::Refused(Refusal::Hold {
-                    retry_after_ms: budget::hold_ms(
-                        sent.retry_after.as_deref(),
-                        state.clock.now_ms(),
-                    ),
-                }));
+            match hold {
+                Some(hold) => Err(LoadFailure::Refused(hold)),
+                None => Ok(sent.answer),
             }
-            Ok(sent.answer)
         }
         Err(failure) => {
-            budget.record(&pool.consumer, &pool.name, None, None).await;
+            budget.record(pool, None, None).await;
             Err(LoadFailure::Upstream(failure))
         }
     }

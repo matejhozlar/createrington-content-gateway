@@ -1764,7 +1764,7 @@
       },
       "Source": {
         "type": "string",
-        "description": "Where a readout's counts come from: `redis` when they are the stored ones, `memory` when no Redis is configured,\n`unavailable` when Redis did not answer, so the minute is this process's own count and the days hold only what\nis not written to Redis yet.",
+        "description": "Where a readout's counts come from: `redis` when they are the stored ones, `memory` when no Redis is configured,\n`unavailable` when Redis did not answer, so the minute is the calls this process let through or refused itself\nand the days hold only what is not written to Redis yet.",
         "enum": [
           "redis",
           "memory",

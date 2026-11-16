@@ -21,7 +21,7 @@ use tower::ServiceExt;
 use crate::{
     app::{self, Addresses, AppState, Timeouts},
     budget::DEFAULT_HISTORY_DAYS,
-    clock::TestClock,
+    clock::{Clock, SystemClock, TestClock},
     config::{ApiKey, Config, Consumer, Token},
     redis_store::RedisStore,
 };
@@ -352,7 +352,11 @@ impl TestRedis {
     }
 
     pub(crate) fn open(&self) -> Arc<RedisStore> {
-        Arc::new(RedisStore::open(&self.url, self.prefix.clone()).unwrap())
+        self.open_on(Arc::new(SystemClock))
+    }
+
+    pub(crate) fn open_on(&self, clock: Arc<dyn Clock>) -> Arc<RedisStore> {
+        Arc::new(RedisStore::open(&self.url, self.prefix.clone(), clock).unwrap())
     }
 
     pub(crate) async fn forget(&self) {

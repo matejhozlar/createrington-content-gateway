@@ -28,7 +28,7 @@ impl<T> Given<T> {
     /// Counts the request as a hit of `pool` when it was answered without a call of its own.
     pub fn counted(self, budget: &Budget, pool: &Pool) -> Self {
         if !self.called {
-            budget.record_hit(&pool.consumer, &pool.name);
+            budget.record_hit(pool);
         }
         self
     }
@@ -266,11 +266,7 @@ pub async fn rows<R: PerId>(
 
 async fn fetch<R: PerId>(state: Arc<AppState>, pool: Pool, route: R, won: Vec<Won<R::Id>>) {
     let calls = u32::try_from(won.len().div_ceil(R::PER_CALL)).unwrap_or(u32::MAX);
-    if let Err(refusal) = state
-        .budget_of(R::SOURCE)
-        .admit(&pool.consumer, &pool.name, calls)
-        .await
-    {
+    if let Err(refusal) = state.budget_of(R::SOURCE).admit(&pool, calls).await {
         for load in won {
             let outcome = Outcome::not_called(Err(LoadFailure::Refused(refusal)));
             load.finish(&state.cache, outcome);
