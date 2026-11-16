@@ -1,4 +1,9 @@
-use std::{collections::HashMap, future::Future, hash::Hash, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    hash::Hash,
+    sync::Arc,
+};
 
 use axum::{
     body::Bytes,
@@ -298,6 +303,24 @@ async fn fetch<R: PerId>(state: Arc<AppState>, pool: Pool, route: R, won: Vec<Wo
     }
 }
 
+/// The items in their first order, each once, or `None` when more than `most` different ones are listed.
+pub fn distinct<T: Eq + Hash + Clone>(
+    items: impl IntoIterator<Item = T>,
+    most: usize,
+) -> Option<Vec<T>> {
+    let mut seen = HashSet::new();
+    let mut kept = Vec::new();
+    for item in items {
+        if seen.insert(item.clone()) {
+            if kept.len() == most {
+                return None;
+            }
+            kept.push(item);
+        }
+    }
+    Some(kept)
+}
+
 fn spawn_load(load: impl Future<Output = ()> + Send + 'static, key: String, keys: usize) {
     let running = tokio::spawn(load);
     tokio::spawn(async move {
@@ -362,6 +385,14 @@ mod tests {
 
     use super::*;
     use crate::{batch::Batch, test_support::*};
+
+    #[test]
+    fn distinct_keeps_the_first_order_and_refuses_more_than_the_most() {
+        assert_eq!(distinct([3, 1, 3, 2, 1], 3), Some(vec![3, 1, 2]));
+        assert_eq!(distinct([3, 1, 3, 2, 1, 2, 3], 3), Some(vec![3, 1, 2]));
+        assert_eq!(distinct([3, 1, 3, 2, 4], 3), None);
+        assert_eq!(distinct(Vec::<u64>::new(), 3), Some(vec![]));
+    }
 
     #[tokio::test]
     async fn an_id_kept_meanwhile_is_neither_asked_for_nor_counted() {

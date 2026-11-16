@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     body::Bytes,
@@ -220,19 +217,13 @@ pub async fn answer(
     asked: Vec<u64>,
     forced: bool,
 ) -> Response {
-    let mut seen = HashSet::new();
-    let ids: Vec<u64> = asked
-        .iter()
-        .copied()
-        .filter(|id| seen.insert(*id))
-        .collect();
-    if ids.len() > MOST_IDS {
+    let Some(ids) = load::distinct(asked.iter().copied(), MOST_IDS) else {
         return ApiError::invalid_body(&format!(
             "a list of at most {MOST_IDS} ids under `{}`",
             batch.field()
         ))
         .into_response();
-    }
+    };
     let given = match load::rows(&state, &pool, batch, ids, forced).await {
         Ok(given) => given,
         Err(failure) => return passthrough::failed(failure, &pool, Source::CurseForge),
@@ -371,7 +362,7 @@ fn kept_row(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{collections::HashSet, time::Duration};
 
     use axum::http::Request;
 
