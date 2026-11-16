@@ -5,7 +5,7 @@ use std::{
 };
 
 use redis::{
-    Client, RedisResult,
+    Client, IntoConnectionInfo, RedisResult,
     aio::{ConnectionManager, ConnectionManagerConfig},
 };
 
@@ -37,7 +37,11 @@ enum Link {
 
 impl RedisStore {
     /// Sets up the connection without making it. Needs a Tokio runtime.
-    pub fn open(url: &str, prefix: impl Into<String>, clock: Arc<dyn Clock>) -> RedisResult<Self> {
+    pub fn open(
+        url: impl IntoConnectionInfo,
+        prefix: impl Into<String>,
+        clock: Arc<dyn Clock>,
+    ) -> RedisResult<Self> {
         let config = ConnectionManagerConfig::new()
             .set_connection_timeout(Some(COMMAND_TIMEOUT))
             .set_response_timeout(Some(COMMAND_TIMEOUT))

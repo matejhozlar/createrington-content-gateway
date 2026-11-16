@@ -356,7 +356,7 @@ impl TestRedis {
     }
 
     pub(crate) fn open_on(&self, clock: Arc<dyn Clock>) -> Arc<RedisStore> {
-        Arc::new(RedisStore::open(&self.url, self.prefix.clone(), clock).unwrap())
+        Arc::new(RedisStore::open(self.url.as_str(), self.prefix.clone(), clock).unwrap())
     }
 
     pub(crate) async fn forget(&self) {
