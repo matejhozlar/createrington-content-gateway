@@ -1,6 +1,6 @@
 # content-gateway-client
 
-The Python client of [content-gateway](../../README.md): the gateway's own routes typed from its OpenAPI document, and the CurseForge and Modrinth passthroughs with the gateway's refusals handled. Sync and async, on [httpx](https://www.python-httpx.org/).
+The Python client of [content-gateway](https://github.com/matejhozlar/createrington-content-gateway): the gateway's own routes typed from its OpenAPI document, and the CurseForge and Modrinth passthroughs with the gateway's refusals handled. Sync and async, on [httpx](https://www.python-httpx.org/).
 
 ```bash
 pip install content-gateway-client
@@ -25,21 +25,21 @@ with ContentGateway("http://127.0.0.1:5005", token=TOKEN, pool="app") as gateway
 
 `curseforge(path, ...)` sends `api.curseforge.com/v1/<path>` through the gateway and answers whatever CurseForge answered as a `PassthroughAnswer`: `status`, `ok`, `body` (parsed JSON, the text when it is not JSON, `None` when empty), `headers`, and `cache`, which is `hit`, `miss` or `stale` from the gateway's `X-Cache`. A `body` makes the request a `POST`; `fresh=True` asks CurseForge again instead of the cache; `pool` draws from another of the token's pools. `query` values of `None` are left out.
 
-Only the gateway's own answers raise, as `ContentGatewayError` with the gateway's `code` (`BUDGET_SPENT`, `UPSTREAM_HOLD`, `UNAUTHORIZED`, ...), `status`, `pool` and `retry_after_ms`. `code` is `None` when the answer was not the gateway's JSON error at all, such as a proxy's HTML page, and `retry_after_ms` comes from `Retry-After` when the body does not carry it. The gateway's own routes (`health`, `budget`, `resolve` and the version lists) also raise on any answer that is not the gateway's JSON object: a page from something else at the base URL, or CurseForge's own failure that `resolve` passes on with its status.
+Only the gateway's own answers raise, as `ContentGatewayError` with the gateway's `code` (`BUDGET_SPENT`, `UPSTREAM_HOLD`, `UNAUTHORIZED`, ...), `status`, `pool` and `retry_after_ms` (`retry_after` gives it in seconds, the unit of `timeout` and `wait_up_to`). `code` is `None` when the answer was not the gateway's JSON error at all, such as a proxy's HTML page, and `retry_after_ms` comes from `Retry-After` when the body does not carry it. The gateway's own routes (`health`, `budget`, `resolve` and the version lists) also raise on any answer that is not the gateway's JSON object: a page from something else at the base URL, or CurseForge's own failure that `resolve` passes on with its status.
 
 `modrinth(path, ...)` sends `api.modrinth.com/v2/<path>` through the gateway the same way; the calls draw from the pool's Modrinth budget. `modrinth_version_file(sha1)` and `modrinth_version_files(hashes)` are the two SHA-1 lookups, and `modrinth_file_url(version, sha1)` picks the address of the file itself on Modrinth's CDN out of a version.
 
 `resolve(file_ids, cdn=True, pool=None, fresh=False, wait_up_to=None, timeout=60)` reads `/v1/resolve`: a download address per CurseForge file, from CurseForge's own link, else Modrinth's copy of the file found by SHA-1, else the file's built address on CurseForge's CDN when it answers a HEAD with the file's size (`cdn=False` skips that step). A file with a `source` of `None` and `retry` true could not be fully checked this time. The consumer downloads from the address itself; no bytes pass through the gateway. The gateway tries the three sources in a row, so a call can take 40 s at worst; `resolve()` therefore waits 60 s rather than the client's timeout.
 
-`minecraft_versions(type=None, loader=None)`, `minecraft_version(id)` and `loader_versions(loader, minecraft=None)` read `/v1/minecraft/*`: Mojang's version list (releases by default, narrowed to what a loader builds for), one version with the Java major it needs, and a loader's builds (NeoForge, Forge, Fabric) with `stable` and `recommended` flags. `java_runtime(platform, major=None, component=None)` finds a Java runtime Mojang ships for a platform (`linux`, `windows-x64`, `mac-os-arm64` and the rest of Mojang's names), by Java major or by the `javaComponent` a version names, with the address, SHA-1 and size of Mojang's manifest of its files.
+`minecraft_versions(type=None, loader=None)`, `minecraft_version(id)` and `loader_versions(loader, minecraft=None)` read `/v1/minecraft/*`: Mojang's version list (releases by default, narrowed to what a loader builds for), one version with the Java major it needs, and a loader's builds (NeoForge, Forge, Fabric) with `stable` and `recommended` flags. `java_runtime(platform, major=None, component=None)` finds a Java runtime Mojang ships for a platform (`linux`, `windows-x64`, `mac-os-arm64` and the rest of Mojang's names), by Java major or by the `javaComponent` a version names (exactly one of `major` and `component`, which the type checker sees too), with the address, SHA-1 and size of Mojang's manifest of its files.
 
 `health()` reads `/v1/healthz` and `budget(days=None)` reads `/v1/budget`, one `UpstreamBudget` for CurseForge and one for Modrinth with the last `days` UTC days of counts (14 when left out, more than the gateway's `historyDays` answers the days kept).
 
-The gateway's own answers are plain dicts typed as `TypedDict`s generated from `openapi.json` (`Health`, `BudgetSnapshot`, `Resolved`, `MinecraftVersions`, ...), so a type checker knows their keys. The passthrough bodies are CurseForge's and Modrinth's JSON as it came, typed `Any`.
+The gateway's own answers are plain dicts typed as `TypedDict`s generated from `openapi.json` (`Health`, `BudgetSnapshot`, `Resolved`, `MinecraftVersions`, ...), so a type checker knows their keys; the bodies `resolve` and `modrinth_version_files` send are `ResolveRequest` and `VersionFilesRequest`, and the budget's `source` is `BudgetSource` (also exported as `Source`). The passthrough bodies are CurseForge's and Modrinth's JSON as it came, typed `Any`.
 
 ### Async
 
-`AsyncContentGateway` has the same methods as coroutines, on `httpx.AsyncClient`:
+`AsyncContentGateway` has the same methods as coroutines, on `httpx.AsyncClient`, with `aclose()` in place of `close()`:
 
 ```python
 from content_gateway import AsyncContentGateway
@@ -60,7 +60,7 @@ The call is sent again after each refusal that fits in what is left of `wait_up_
 
 ### Timeouts and connections
 
-`timeout`, 15 s by default, is httpx's limit on each phase of a request (connecting, waiting for a read, a write), not on the whole call; the gateway answers in one body, so a call ends within it in practice. The gateway gives CurseForge 10 s before it answers `504` or a stale answer, so keep the client's timeout above that: a stalled call then comes back as the gateway's answer instead of an `httpx.TimeoutException` here. The client keeps connections to the gateway open between calls; pass your own `httpx.Client` or `httpx.AsyncClient` as `client` to change that or to test (an `httpx.MockTransport` makes a fake gateway).
+`timeout`, 15 s by default, is httpx's limit on each phase of a request (connecting, waiting for a read, a write), not on the whole call; the gateway answers in one body, so a call ends within it in practice. The gateway gives CurseForge 10 s before it answers `504` or a stale answer, so keep the client's timeout above that: a stalled call then comes back as the gateway's answer instead of an `httpx.TimeoutException` here. A call that never reached the gateway raises httpx's own exception, an `httpx.TransportError` such as `httpx.ConnectError` or `httpx.TimeoutException`, never `ContentGatewayError`. The client keeps connections to the gateway open between calls; pass your own `httpx.Client` or `httpx.AsyncClient` as `client` to change that or to test (an `httpx.MockTransport` makes a fake gateway).
 
 ## Development
 
