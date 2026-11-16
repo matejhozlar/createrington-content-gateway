@@ -1,6 +1,6 @@
 # content-gateway-client
 
-The Python client of [content-gateway](../../README.md): the gateway's own routes typed from its OpenAPI document, and the CurseForge and Modrinth passthroughs with the gateway's refusals handled. Sync and async, on [httpx](https://www.python-httpx.org/).
+The Python client of [content-gateway](https://github.com/matejhozlar/createrington-content-gateway): the gateway's own routes typed from its OpenAPI document, and the CurseForge and Modrinth passthroughs with the gateway's refusals handled. Sync and async, on [httpx](https://www.python-httpx.org/).
 
 ```bash
 pip install content-gateway-client
