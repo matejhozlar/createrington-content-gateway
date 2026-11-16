@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
     body::Bytes,
@@ -268,19 +264,18 @@ pub async fn version_files(
     if request.hashes.is_empty() {
         return ApiError::invalid_body("`hashes` must list at least one SHA-1").into_response();
     }
-    let mut seen = HashSet::new();
-    let mut hashes = Vec::new();
-    for hash in &request.hashes {
-        let Some(hash) = sha1_of(hash) else {
-            return ApiError::invalid_hash().into_response();
-        };
-        if seen.insert(hash.clone()) {
-            hashes.push(hash);
-        }
-        if hashes.len() > MOST_HASHES {
-            return ApiError::invalid_body("`hashes` may list at most 1000 SHA-1s").into_response();
-        }
-    }
+    let Some(hashes) = request
+        .hashes
+        .iter()
+        .map(|hash| sha1_of(hash))
+        .collect::<Option<Vec<String>>>()
+    else {
+        return ApiError::invalid_hash().into_response();
+    };
+    let Some(hashes) = load::distinct(hashes, MOST_HASHES) else {
+        return ApiError::invalid_body(&format!("`hashes` may list at most {MOST_HASHES} SHA-1s"))
+            .into_response();
+    };
     let given = match load::rows(&state, &pool, VersionFiles, hashes, forced).await {
         Ok(given) => given,
         Err(failure) => return passthrough::failed(failure, &pool, Source::Modrinth),
