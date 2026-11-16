@@ -127,9 +127,9 @@ impl RedisStore {
         }
     }
 
-    fn mark_down(&self, reason: &str) {
+    fn mark_down(&self, error: &str) {
         if let Some(news) = self.went_down() {
-            tracing::warn!(%reason, "{news}");
+            tracing::warn!(%error, "{news}");
         }
     }
 
