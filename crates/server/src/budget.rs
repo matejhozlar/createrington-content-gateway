@@ -341,7 +341,7 @@ impl Budget {
                     now,
                 ),
             };
-            state.count(pool, calls, verdict == Verdict::Admitted);
+            state.count(pool, now, calls, verdict == Verdict::Admitted);
             if verdict != Verdict::Admitted {
                 state.day(now, pool, self.history_days).withheld += u64::from(calls);
             }
@@ -632,7 +632,7 @@ impl Budget {
     fn lock(&self, now: u64) -> MutexGuard<'_, Counts> {
         let mut state = self.memory.lock().unwrap_or_else(PoisonError::into_inner);
         let minute = now / MINUTE_MS;
-        if state.minute != minute {
+        if minute > state.minute {
             state.minute = minute;
             state.used = 0;
             state.withheld = 0;
@@ -806,7 +806,10 @@ impl Counts {
             .or_default()
     }
 
-    fn count(&mut self, pool: &Pool, calls: u32, admitted: bool) {
+    fn count(&mut self, pool: &Pool, now: u64, calls: u32, admitted: bool) {
+        if now / MINUTE_MS < self.minute {
+            return;
+        }
         let minute = self.pools.entry(pool.clone()).or_default();
         let (pool_count, count) = if admitted {
             (&mut minute.used, &mut self.used)
@@ -1162,6 +1165,31 @@ mod tests {
             );
         }
         backends.forget().await;
+    }
+
+    #[tokio::test]
+    async fn a_late_count_from_the_last_minute_leaves_this_minute_alone() {
+        let clock = TestClock::at(NOV_3_2026_20H + MINUTE_MS);
+        let budget = Budget::new(
+            upstream::Source::CurseForge,
+            5,
+            pools(),
+            clock.clone(),
+            None,
+        );
+        budget.admit(&pool("app", "app"), 3).await.unwrap();
+        budget
+            .lock(NOV_3_2026_20H)
+            .count(&pool("app", "app"), NOV_3_2026_20H, 2, true);
+
+        let snapshot = budget.snapshot().await;
+        assert_eq!((snapshot.used, snapshot.pools[1].used), (3, 3));
+        assert_eq!(
+            budget.admit(&pool("app", "app"), 3).await,
+            Err(Refusal::Spent {
+                retry_after_ms: 60_000
+            })
+        );
     }
 
     #[tokio::test]
