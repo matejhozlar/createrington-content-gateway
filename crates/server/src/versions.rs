@@ -439,7 +439,10 @@ async fn document<T: DeserializeOwned + 'static>(
     match load::one(state, key.to_owned(), false, read::<T>, fetch).await {
         Ok(given) => Ok(given.value),
         Err(LoadFailure::Upstream(failure)) => Err(ListFailure::Upstream { origin, failure }),
-        Err(_) => Err(ListFailure::Lost),
+        Err(LoadFailure::Lost) => Err(ListFailure::Lost),
+        Err(LoadFailure::Answered(_) | LoadFailure::Refused(_)) => {
+            Err(ListFailure::unreadable(origin))
+        }
     }
 }
 
