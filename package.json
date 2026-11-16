@@ -23,6 +23,8 @@
     "version-packages": "changeset version",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
+    "check:repo": "node scripts/check-repo.mjs",
+    "test:scripts": "node --test \"scripts/*.test.mjs\"",
     "prepare": "husky",
     "branch:done": "node scripts/finish-branch.mjs",
     "post-release": "node scripts/post-release.mjs"
