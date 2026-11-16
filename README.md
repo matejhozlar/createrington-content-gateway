@@ -123,7 +123,7 @@ User=content-gateway
 
 `source` in the budget says where its counts come from: `redis` for the stored ones, `memory` when no Redis is configured, and `unavailable` when Redis did not answer, in which case the minute is the gateway's own count and the days show only what is not written to Redis yet.
 
-The gateway's own answers are described by [`openapi.json`](openapi.json), which the server derives from its types (`content-gateway --openapi` prints it). Its `info.version` is the version of the API, the `1` of `/v1`; the gateway's own version is in `/v1/healthz`. The CurseForge answers are CurseForge's and are not described there. TypeScript consumers install [`@createrington/content-gateway-client`](packages/client/README.md) and Python consumers [`content-gateway-client`](packages/python-client/README.md), whose types come from the document; anyone else can generate a client from it.
+The gateway's own answers are described by [`openapi.json`](openapi.json), which the server derives from its types (`content-gateway --openapi` prints it). Its `info.version` is the version of the API, the `1` of `/v1`; the gateway's own version is in `/v1/healthz`. The CurseForge answers are CurseForge's and are not described there. TypeScript consumers install [`@createrington/content-gateway-client`](packages/client/README.md) from npm (`pnpm add @createrington/content-gateway-client zod`) and Python consumers [`content-gateway-client`](packages/python-client/README.md), whose types come from the document; anyone else can generate a client from it.
 
 ### CurseForge
 

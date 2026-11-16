@@ -8,8 +8,10 @@ import type {
   LoaderVersions,
   MinecraftVersionDetails,
   MinecraftVersions,
+  ResolveRequest,
   Resolved,
-  VersionFilter,
+  VersionFilesRequest,
+  paths,
 } from "./gateway.js";
 
 /** How long one request to the gateway may take, above the 10 s the gateway gives an upstream. */
@@ -21,6 +23,7 @@ export const RESOLVE_TIMEOUT_MS = 60_000;
 const CACHE_HEADER = "x-cache";
 const POOL_HEADER = "x-budget-pool";
 const CACHE_STATUSES = ["hit", "miss", "stale"] as const;
+const UNAUTHENTICATED: keyof paths = "/v1/healthz";
 
 export interface ContentGatewayOptions {
   /** Where the gateway listens, such as `http://127.0.0.1:5005`. */
@@ -40,68 +43,122 @@ export type Query =
   | URLSearchParams
   | Record<string, string | number | boolean | null | undefined>;
 
+/** What every call takes. */
+export interface RequestOptions {
+  /** Aborts the call, the wait for a refusal to end included. */
+  signal?: AbortSignal;
+}
+
+/** What a call that draws from the budget takes. */
+export interface BudgetedOptions extends RequestOptions {
+  /** The pool this call draws from instead of the client's. */
+  pool?: string;
+  /** Ask the upstream again instead of answering from the cache (`Cache-Control: no-cache`). */
+  fresh?: boolean;
+  /** How long to wait out the gateway's refusals, in milliseconds, for background callers. */
+  waitUpToMs?: number;
+}
+
+/** What a passthrough call takes besides its method and body. */
+export interface PassthroughOptions extends BudgetedOptions {
+  query?: Query;
+}
+
 /** A request's method and body: a `GET` carries none, a body makes the request a `POST`. */
 export type CurseForgeMethod =
   { method?: "GET"; body?: undefined } | { method?: "POST"; body?: unknown };
 
-export type CurseForgeRequest = CurseForgeMethod & {
-  query?: Query;
-  /** The pool this call draws from instead of the client's. */
-  pool?: string;
-  /** Ask CurseForge again instead of answering from the cache (`Cache-Control: no-cache`). */
-  fresh?: boolean;
-  /** How long to wait out the gateway's refusals, in milliseconds, for background callers. */
-  waitUpToMs?: number;
-  signal?: AbortSignal;
-};
+export type CurseForgeRequest = CurseForgeMethod & PassthroughOptions;
 
 /** A Modrinth call's options, as `CurseForgeRequest`: the calls draw from the pool's Modrinth budget. */
 export type ModrinthRequest = CurseForgeRequest;
 
+type Method = "get" | "post";
+
+type Operation<P extends keyof paths, M extends Method> = Extract<
+  paths[P][M],
+  { responses: unknown }
+>;
+
+type RouteMethod<P extends keyof paths> = {
+  [M in Method]: [Operation<P, M>] extends [never] ? never : M;
+}[Method];
+
+type RouteQuery<P extends keyof paths, M extends RouteMethod<P>> =
+  Operation<P, M> extends { parameters: { query?: infer Q } }
+    ? NonNullable<Q>
+    : never;
+
+type RouteAnswer<O> = O extends {
+  responses: { 200: { content: { "application/json": infer A } } };
+}
+  ? A
+  : never;
+
+type RouteCall<O> = (O extends {
+  parameters: { path: infer T extends Record<string, string> };
+}
+  ? { params: T }
+  : { params?: never }) &
+  (O extends { parameters: { query: infer Q extends Query } }
+    ? { query: Q }
+    : {
+        query?: O extends { parameters: { query?: infer Q extends Query } }
+          ? Q
+          : never;
+      }) &
+  (O extends { requestBody: { content: { "application/json": infer B } } }
+    ? { body: B }
+    : { body?: never }) &
+  BudgetedOptions & { timeoutMs?: number };
+
+interface Call extends BudgetedOptions {
+  params?: Record<string, string>;
+  query?: Query;
+  body?: unknown;
+  timeoutMs?: number;
+}
+
 /** What `resolve()` asks for. */
-export interface ResolveOptions {
-  /** Whether the file's built CDN address may be checked when neither CurseForge nor Modrinth has a link. On unless false. */
-  cdn?: boolean;
-  /** The pool the CurseForge calls draw from instead of the client's. */
-  pool?: string;
-  /** Ask every source again instead of answering from the cache. */
-  fresh?: boolean;
-  /** As on `CurseForgeRequest`. */
-  waitUpToMs?: number;
+export interface ResolveOptions
+  extends BudgetedOptions, Pick<ResolveRequest, "cdn"> {
   /** How long the call may take, in milliseconds. `RESOLVE_TIMEOUT_MS` when unset, longer than the client's own timeout. */
   timeoutMs?: number;
-  signal?: AbortSignal;
 }
 
 /** What `minecraftVersions()` asks for. */
-export interface MinecraftVersionsOptions {
-  /** `release` (the default), `snapshot` or `all`. */
-  type?: VersionFilter;
-  /** Only the versions this loader has at least one build for. */
-  loader?: Loader;
-  signal?: AbortSignal;
-}
+export type MinecraftVersionsOptions = RouteQuery<
+  "/v1/minecraft/versions",
+  "get"
+> &
+  RequestOptions;
 
 /** What `loaderVersions()` asks for. */
-export interface LoaderVersionsOptions {
-  /** Only the builds for this Minecraft version, such as `1.21.1`. */
-  minecraft?: string;
-  signal?: AbortSignal;
-}
+export type LoaderVersionsOptions = RouteQuery<
+  "/v1/minecraft/loaders/{loader}/versions",
+  "get"
+> &
+  RequestOptions;
+
+/** What `budget()` asks for. */
+export type BudgetOptions = RouteQuery<"/v1/budget", "get"> & RequestOptions;
+
+type JavaQuery = RouteQuery<"/v1/minecraft/java", "get">;
 
 /** What `javaRuntime()` asks for: a Java major or a runtime component, not both. */
 export type JavaRuntimeOptions = (
   | {
       /** The newest runtime Mojang ships of this Java major, such as 21. */
-      major: number;
+      major: NonNullable<JavaQuery["major"]>;
       component?: never;
     }
   | {
       /** The runtime of this name, such as `java-runtime-delta`, as `javaComponent` of `minecraftVersion()` names it. */
-      component: string;
+      component: NonNullable<JavaQuery["component"]>;
       major?: never;
     }
-) & { signal?: AbortSignal };
+) &
+  RequestOptions;
 
 /** How the gateway answered a passthrough call, from `X-Cache`. */
 export type CacheStatus = (typeof CACHE_STATUSES)[number];
@@ -152,24 +209,10 @@ interface Sent {
   body: unknown;
 }
 
-interface SendOptions {
+interface SendOptions extends Omit<Call, "params"> {
   method: "GET" | "POST";
   path: string;
-  query?: Query | undefined;
-  body?: unknown;
   authenticated: boolean;
-  pool?: string | undefined;
-  fresh?: boolean | undefined;
-  waitUpToMs?: number | undefined;
-  timeoutMs?: number | undefined;
-  signal?: AbortSignal | undefined;
-}
-
-/** What `budget()` asks for. */
-export interface BudgetOptions {
-  /** UTC days of daily counts to answer, today included, 1 up; 14 when left out, more than the gateway's `historyDays` answers the days kept. */
-  days?: number | undefined;
-  signal?: AbortSignal | undefined;
 }
 
 /** A consumer's connection to one gateway. */
@@ -189,24 +232,17 @@ export class ContentGateway {
   }
 
   /** `GET /v1/healthz`, which needs no token. */
-  async health(signal?: AbortSignal): Promise<Health> {
-    return this.own({
-      method: "GET",
-      path: "/v1/healthz",
-      authenticated: false,
-      signal,
-    });
+  async health(options?: RequestOptions): Promise<Health>;
+  /** @deprecated Pass `{ signal }`. */
+  async health(signal: AbortSignal): Promise<Health>;
+  async health(options: RequestOptions | AbortSignal = {}): Promise<Health> {
+    return this.call("get", "/v1/healthz", { signal: signalOf(options) });
   }
 
   /** `GET /v1/budget`: this minute's calls, the 429 hold and the daily counts of the last `days` UTC days. */
   async budget(options: BudgetOptions = {}): Promise<BudgetSnapshot> {
-    return this.own({
-      method: "GET",
-      path: "/v1/budget",
-      query: options.days === undefined ? undefined : { days: options.days },
-      authenticated: true,
-      signal: options.signal,
-    });
+    const { signal, ...query } = options;
+    return this.call("get", "/v1/budget", { query, signal });
   }
 
   /** Sends `api.curseforge.com/v1/<path>` (such as `mods/search`) through the gateway; CurseForge's answer comes back whatever its status, and only the gateway's own answers throw `ContentGatewayError`. */
@@ -214,24 +250,7 @@ export class ContentGateway {
     path: string,
     request: CurseForgeRequest = {},
   ): Promise<CurseForgeAnswer> {
-    const method =
-      request.method ?? (request.body === undefined ? "GET" : "POST");
-    if (method === "GET" && request.body !== undefined) {
-      throw new TypeError(
-        `a GET to ${path} cannot carry a body; leave method unset or make it POST`,
-      );
-    }
-    return this.passthrough({
-      method,
-      path: `/v1/curseforge/${path.replace(/^\/+/, "")}`,
-      query: request.query,
-      body: request.body,
-      authenticated: true,
-      pool: request.pool,
-      fresh: request.fresh,
-      waitUpToMs: request.waitUpToMs,
-      signal: request.signal,
-    });
+    return this.passthrough("curseforge", path, request);
   }
 
   /** Sends `api.modrinth.com/v2/<path>` (such as `project/sodium`) through the gateway; Modrinth's answer comes back whatever its status, and only the gateway's own answers throw `ContentGatewayError`. */
@@ -239,47 +258,34 @@ export class ContentGateway {
     path: string,
     request: ModrinthRequest = {},
   ): Promise<PassthroughAnswer> {
-    const method =
-      request.method ?? (request.body === undefined ? "GET" : "POST");
-    if (method === "GET" && request.body !== undefined) {
-      throw new TypeError(
-        `a GET to ${path} cannot carry a body; leave method unset or make it POST`,
-      );
-    }
-    return this.passthrough({
-      method,
-      path: `/v1/modrinth/${path.replace(/^\/+/, "")}`,
-      query: request.query,
-      body: request.body,
-      authenticated: true,
-      pool: request.pool,
-      fresh: request.fresh,
-      waitUpToMs: request.waitUpToMs,
-      signal: request.signal,
-    });
+    return this.passthrough("modrinth", path, request);
   }
 
   /** `GET /v1/modrinth/version_file/<sha1>`: the version Modrinth lists the file under, or a 404. */
   async modrinthVersionFile(
     sha1: string,
-    request: ModrinthRequest = {},
+    options: PassthroughOptions = {},
   ): Promise<PassthroughAnswer> {
-    return this.modrinth(`version_file/${encodeURIComponent(sha1)}`, {
-      ...request,
-      method: "GET",
-      body: undefined,
-    });
+    return this.passthrough(
+      "modrinth",
+      `version_file/${encodeURIComponent(sha1)}`,
+      { ...options, method: "GET" },
+    );
   }
 
   /** `POST /v1/modrinth/version_files`: the versions Modrinth lists these SHA-1s under, keyed by lowercase hash. */
   async modrinthVersionFiles(
     hashes: readonly string[],
-    request: ModrinthRequest = {},
+    options: PassthroughOptions = {},
   ): Promise<PassthroughAnswer> {
-    return this.modrinth("version_files", {
-      ...request,
+    const body: VersionFilesRequest = {
+      hashes: [...hashes],
+      algorithm: "sha1",
+    };
+    return this.passthrough("modrinth", "version_files", {
+      ...options,
       method: "POST",
-      body: { hashes, algorithm: "sha1" },
+      body,
     });
   }
 
@@ -288,19 +294,11 @@ export class ContentGateway {
     fileIds: readonly number[],
     options: ResolveOptions = {},
   ): Promise<Resolved> {
-    return this.own({
-      method: "POST",
-      path: "/v1/resolve",
-      body: {
-        fileIds,
-        ...(options.cdn === undefined ? {} : { cdn: options.cdn }),
-      },
-      authenticated: true,
-      pool: options.pool,
-      fresh: options.fresh,
-      waitUpToMs: options.waitUpToMs,
-      timeoutMs: options.timeoutMs ?? RESOLVE_TIMEOUT_MS,
-      signal: options.signal,
+    const { cdn, timeoutMs, ...rest } = options;
+    return this.call("post", "/v1/resolve", {
+      ...rest,
+      body: { fileIds: [...fileIds], cdn },
+      timeoutMs: timeoutMs ?? RESOLVE_TIMEOUT_MS,
     });
   }
 
@@ -308,25 +306,27 @@ export class ContentGateway {
   async minecraftVersions(
     options: MinecraftVersionsOptions = {},
   ): Promise<MinecraftVersions> {
-    return this.own({
-      method: "GET",
-      path: "/v1/minecraft/versions",
-      query: { type: options.type, loader: options.loader },
-      authenticated: true,
-      signal: options.signal,
-    });
+    const { signal, ...query } = options;
+    return this.call("get", "/v1/minecraft/versions", { query, signal });
   }
 
   /** `GET /v1/minecraft/versions/<id>`: one version with the Java major it needs. Throws `UNKNOWN_VERSION` as a `ContentGatewayError`. */
   async minecraftVersion(
     id: string,
-    signal?: AbortSignal,
+    options?: RequestOptions,
+  ): Promise<MinecraftVersionDetails>;
+  /** @deprecated Pass `{ signal }`. */
+  async minecraftVersion(
+    id: string,
+    signal: AbortSignal,
+  ): Promise<MinecraftVersionDetails>;
+  async minecraftVersion(
+    id: string,
+    options: RequestOptions | AbortSignal = {},
   ): Promise<MinecraftVersionDetails> {
-    return this.own({
-      method: "GET",
-      path: `/v1/minecraft/versions/${encodeURIComponent(id)}`,
-      authenticated: true,
-      signal,
+    return this.call("get", "/v1/minecraft/versions/{id}", {
+      params: { id },
+      signal: signalOf(options),
     });
   }
 
@@ -335,12 +335,11 @@ export class ContentGateway {
     loader: Loader,
     options: LoaderVersionsOptions = {},
   ): Promise<LoaderVersions> {
-    return this.own({
-      method: "GET",
-      path: `/v1/minecraft/loaders/${loader}/versions`,
-      query: { minecraft: options.minecraft },
-      authenticated: true,
-      signal: options.signal,
+    const { signal, ...query } = options;
+    return this.call("get", "/v1/minecraft/loaders/{loader}/versions", {
+      params: { loader },
+      query,
+      signal,
     });
   }
 
@@ -349,23 +348,33 @@ export class ContentGateway {
     platform: string,
     options: JavaRuntimeOptions,
   ): Promise<JavaRuntime> {
-    return this.own({
-      method: "GET",
-      path: "/v1/minecraft/java",
-      query: {
-        platform,
-        major: options.major,
-        component: options.component,
-      },
-      authenticated: true,
-      signal: options.signal,
+    const { signal, ...runtime } = options;
+    return this.call("get", "/v1/minecraft/java", {
+      query: { platform, ...runtime },
+      signal,
     });
   }
 
-  private async own<T>(options: SendOptions): Promise<T> {
+  private async call<P extends keyof paths, M extends RouteMethod<P>>(
+    method: M,
+    path: P,
+    request: RouteCall<Operation<P, M>>,
+  ): Promise<RouteAnswer<Operation<P, M>>>;
+  private async call(
+    method: Method,
+    route: keyof paths,
+    request: Call,
+  ): Promise<unknown> {
+    const { params, ...rest } = request;
+    const options: SendOptions = {
+      ...rest,
+      method: method === "get" ? "GET" : "POST",
+      path: fillPath(route, params),
+      authenticated: route !== UNAUTHENTICATED,
+    };
     const { response, body } = await this.send(options);
     const cache = response.headers.get(CACHE_HEADER);
-    if (response.ok && cache === null && isObject(body)) return body as T;
+    if (response.ok && cache === null && isObject(body)) return body;
     const answered = `${response.status} answer to ${options.method} ${options.path}`;
     throw new ContentGatewayError(
       response.status,
@@ -376,7 +385,24 @@ export class ContentGateway {
     );
   }
 
-  private async passthrough(options: SendOptions): Promise<PassthroughAnswer> {
+  private async passthrough(
+    upstream: "curseforge" | "modrinth",
+    path: string,
+    request: CurseForgeRequest,
+  ): Promise<PassthroughAnswer> {
+    const { method: asked, ...rest } = request;
+    const method = asked ?? (request.body === undefined ? "GET" : "POST");
+    if (method === "GET" && request.body !== undefined) {
+      throw new TypeError(
+        `a GET to ${path} cannot carry a body; leave method unset or make it POST`,
+      );
+    }
+    const options: SendOptions = {
+      ...rest,
+      method,
+      path: `/v1/${upstream}/${path.replace(/^\/+/, "")}`,
+      authenticated: true,
+    };
     const { response, body } = await this.send(options);
     const cache = response.headers.get(CACHE_HEADER);
     if (!isCacheStatus(cache)) {
@@ -413,41 +439,83 @@ export class ContentGateway {
       body = JSON.stringify(options.body);
     }
     const deadline = Date.now() + (options.waitUpToMs ?? 0);
+    const caller = followSignal(options.signal);
 
-    for (;;) {
-      const response = await this.fetch(url, {
-        method: options.method,
-        headers,
-        body,
-        signal: attemptSignal(
-          options.timeoutMs ?? this.timeoutMs,
-          options.signal,
-        ),
-      });
-      const answer = await readBody(response);
-      if (response.headers.has(CACHE_HEADER) || response.ok) {
-        return { response, body: answer };
-      }
+    try {
+      for (;;) {
+        const response = await this.fetch(url, {
+          method: options.method,
+          headers,
+          body,
+          signal: attemptSignal(
+            options.timeoutMs ?? this.timeoutMs,
+            caller.signal,
+          ),
+        });
+        const answer = await readBody(response);
+        if (response.headers.has(CACHE_HEADER) || response.ok) {
+          return { response, body: answer };
+        }
 
-      const error = asApiError(answer);
-      const wait = retryAfterMs(response, error);
-      if (
-        response.status === 503 &&
-        wait !== null &&
-        Date.now() + wait <= deadline
-      ) {
-        await sleep(wait, options.signal);
-        continue;
+        const error = asApiError(answer);
+        const wait = retryAfterMs(response, error);
+        if (
+          response.status === 503 &&
+          wait !== null &&
+          Date.now() + wait <= deadline
+        ) {
+          await sleep(wait, caller.signal);
+          continue;
+        }
+        throw new ContentGatewayError(
+          response.status,
+          error,
+          `the gateway answered ${response.status} to ${options.method} ${options.path}` +
+            (typeof answer === "string" && answer !== "" ? `: ${answer}` : ""),
+          wait,
+        );
       }
-      throw new ContentGatewayError(
-        response.status,
-        error,
-        `the gateway answered ${response.status} to ${options.method} ${options.path}` +
-          (typeof answer === "string" && answer !== "" ? `: ${answer}` : ""),
-        wait,
-      );
+    } finally {
+      caller.stop();
     }
   }
+}
+
+function signalOf(
+  options: RequestOptions | AbortSignal,
+): AbortSignal | undefined {
+  return "aborted" in options ? options : options.signal;
+}
+
+function followSignal(signal: AbortSignal | undefined): {
+  signal: AbortSignal | undefined;
+  stop: () => void;
+} {
+  if (signal === undefined || signal instanceof AbortSignal) {
+    return { signal, stop: () => {} };
+  }
+  const foreign: EventTarget & Pick<AbortSignal, "aborted" | "reason"> = signal;
+  const controller = new AbortController();
+  const abort = (): void => controller.abort(foreign.reason);
+  if (foreign.aborted) abort();
+  else foreign.addEventListener("abort", abort, { once: true });
+  return {
+    signal: controller.signal,
+    stop: () => foreign.removeEventListener("abort", abort),
+  };
+}
+
+function fillPath(
+  route: string,
+  params: Record<string, string> | undefined,
+): string {
+  return route.replace(/\{(\w+)\}/g, (_, name: string) => {
+    const value = params?.[name];
+    if (value === undefined) {
+      throw new TypeError(`no value for {${name}} in ${route}`);
+    }
+    return encodeURIComponent(value);
+  });
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -496,11 +564,16 @@ async function readBody(response: Response): Promise<unknown> {
 }
 
 function asApiError(body: unknown): ApiError | null {
-  if (typeof body !== "object" || body === null) return null;
-  const candidate = body as Partial<ApiError>;
-  if (typeof candidate.code !== "string") return null;
-  if (typeof candidate.message !== "string") return null;
-  return candidate as ApiError;
+  if (!isObject(body)) return null;
+  const { code, message } = body;
+  if (typeof code !== "string" || typeof message !== "string") return null;
+  return {
+    code,
+    message,
+    pool: typeof body.pool === "string" ? body.pool : null,
+    retryAfterMs:
+      typeof body.retryAfterMs === "number" ? body.retryAfterMs : null,
+  };
 }
 
 function retryAfterMs(

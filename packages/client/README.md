@@ -1,26 +1,30 @@
 # @createrington/content-gateway-client
 
-The TypeScript client of [content-gateway](../../README.md): the gateway's own routes typed from its OpenAPI document, the CurseForge passthrough with the gateway's refusals handled, and loose zod schemas for the CurseForge answers consumers read.
+The TypeScript client of [content-gateway](https://github.com/matejhozlar/createrington-content-gateway): the gateway's own routes typed from its OpenAPI document, the CurseForge and Modrinth passthroughs with the gateway's refusals handled, and loose zod schemas for the CurseForge and Modrinth answers consumers read.
+
+The package is on npm:
 
 ```bash
 pnpm add @createrington/content-gateway-client zod
 ```
 
-`zod` is a peer dependency: 3.25 or newer, or 4. The schemas are built with `zod/v4`, which both ship.
+`zod` is a peer dependency: 4.6.6 or newer within zod 4, since earlier versions can exhaust memory while validating oversized constrained collections ([GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5)). The schemas are built with `zod/v4`.
 
 ## Usage
 
 ```ts
 import {
   ContentGateway,
-  ContentGatewayError,
   curseforgeModSchema,
   curseforgePage,
 } from "@createrington/content-gateway-client";
 
+const token = process.env.CONTENT_GATEWAY_TOKEN;
+if (!token) throw new Error("CONTENT_GATEWAY_TOKEN is not set");
+
 const gateway = new ContentGateway({
   baseUrl: "http://127.0.0.1:5005",
-  token: process.env.CONTENT_GATEWAY_TOKEN,
+  token,
   pool: "app",
 });
 
@@ -31,11 +35,11 @@ if (!answer.ok) throw new Error(`CurseForge answered ${answer.status}`);
 const page = curseforgePage(curseforgeModSchema).parse(answer.body);
 ```
 
-`curseforge(path, request)` sends `api.curseforge.com/v1/<path>` through the gateway and answers whatever CurseForge answered: `status`, `ok`, `body` (parsed JSON, the text when it is not JSON, `null` when empty), `headers`, and `cache`, which is `hit`, `miss` or `stale` from the gateway's `X-Cache`. A `body` makes the request a `POST`; `fresh: true` asks CurseForge again instead of the cache; `pool` draws from another of the token's pools; `signal` aborts.
+`curseforge(path, request)` sends `api.curseforge.com/v1/<path>` through the gateway and answers whatever CurseForge answered: `status`, `ok`, `body` (parsed JSON, the text when it is not JSON, `null` when empty), `headers`, and `cache`, which is `hit`, `miss` or `stale` from the gateway's `X-Cache`. A `body` makes the request a `POST`; `fresh: true` asks CurseForge again instead of the cache; `pool` draws from another of the token's pools; `signal` aborts. Every method takes `signal` in its options, the wait for a refusal to end included.
 
-Only the gateway's own answers throw, as `ContentGatewayError` with the gateway's `code` (`BUDGET_SPENT`, `UPSTREAM_HOLD`, `UNAUTHORIZED`, ...), `status`, `pool` and `retryAfterMs`. `code` is `null` when the answer was not the gateway's JSON error at all, such as a proxy's HTML page, and `retryAfterMs` comes from `Retry-After` when the body does not carry it. The gateway's own routes (`health`, `budget`, `resolve` and the version lists) also throw on any answer that is not the gateway's JSON object: a page from something else at the base URL, or CurseForge's own failure that `resolve` passes on with its status.
+Only the gateway's own answers throw, as `ContentGatewayError` with the gateway's `code` (`BUDGET_SPENT`, `UPSTREAM_HOLD`, `UNAUTHORIZED`, ...), `status`, `pool` and `retryAfterMs`. `code` is `null` when the answer was not the gateway's JSON error at all, such as a proxy's HTML page, and `retryAfterMs` comes from `Retry-After` when the body does not carry it. `code` is typed as `ErrorCode`, the codes this version of the client knows (`KnownErrorCode`) or any other string: a newer gateway adds codes inside `/v1`, so a `switch` over it keeps a `default` branch. The gateway's own routes (`health`, `budget`, `resolve` and the version lists) also throw on any answer that is not the gateway's JSON object: a page from something else at the base URL, or CurseForge's own failure that `resolve` passes on with its status.
 
-`modrinth(path, request)` sends `api.modrinth.com/v2/<path>` through the gateway the same way and answers a `PassthroughAnswer`; the calls draw from the pool's Modrinth budget. `modrinthVersionFile(sha1)` and `modrinthVersionFiles(hashes)` are the two SHA-1 lookups. Loose schemas exist for what consumers read: `modrinthProjectSchema`, `modrinthSearchSchema`, `modrinthVersionSchema`, `modrinthVersionFilesSchema`, `modrinthTagSchema` and `modrinthGameVersionSchema`; `modrinthFileUrl(version, sha1)` picks the address of the file itself on Modrinth's CDN.
+`modrinth(path, request)` sends `api.modrinth.com/v2/<path>` through the gateway the same way and answers a `PassthroughAnswer`; the calls draw from the pool's Modrinth budget. `modrinthVersionFile(sha1, options)` and `modrinthVersionFiles(hashes, options)` are the two SHA-1 lookups; their options are those of `modrinth()` without a method or body. Loose schemas exist for what consumers read: `modrinthProjectSchema`, `modrinthSearchSchema`, `modrinthVersionSchema`, `modrinthVersionFilesSchema`, `modrinthTagSchema` and `modrinthGameVersionSchema`; `modrinthFileUrl(version, sha1)` picks the address of the file itself on Modrinth's CDN.
 
 `resolve(fileIds, { cdn, pool, fresh, waitUpToMs })` reads `/v1/resolve`: a download address per CurseForge file, from CurseForge's own link, else Modrinth's copy of the file found by SHA-1, else the file's built address on CurseForge's CDN when it answers a HEAD with the file's size (`cdn: false` skips that step). A file with a null `source` and `retry: true` could not be fully checked this time. The consumer downloads from the address itself; no bytes pass through the gateway. The gateway tries the three sources in a row, so a call can take 40 s at worst; `resolve()` therefore waits `RESOLVE_TIMEOUT_MS` (60 s) rather than the client's timeout, or `timeoutMs` in its options.
 
@@ -72,7 +76,7 @@ A consumer that needs more of a file than its ids extends the file schema for th
 
 A change consumers can notice comes with a changeset (`pnpm changeset` at the repository root); the release PR turns the changesets into the version and `CHANGELOG.md`, and the merge into `main` publishes. Never edit the version by hand.
 
-The package is published under the `@createrington` scope to the registry the publish workflow reads from the `NPM_PUBLISH_REGISTRY` repository variable, with the `NPM_PUBLISH_TOKEN` secret. A fork that publishes its own copy changes the scope in `package.json` and sets its own variable and secret.
+The package is published to npm under the `@createrington` scope, and to a private registry for internal use. A fork that publishes its own copy changes the scope in `package.json`, sets its own `NPM_PUBLISH_REGISTRY` variable and `NPM_PUBLISH_TOKEN` secret for the registry publish, and registers its own repository as the package's trusted publisher on npm for the npm publish.
 
 ```bash
 pnpm --filter @createrington/content-gateway-client test

@@ -9,7 +9,10 @@ const generated = fileURLToPath(
 );
 const check = process.argv.includes("--check");
 
-const ast = await openapiTS(document, { alphabetize: true });
+const ast = await openapiTS(document, {
+  alphabetize: true,
+  defaultNonNullable: false,
+});
 const config = await prettier.resolveConfig(generated);
 const fresh = await prettier.format(astToString(ast), {
   ...config,
