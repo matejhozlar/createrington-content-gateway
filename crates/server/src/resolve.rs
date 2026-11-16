@@ -1,8 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
     Json,
@@ -19,13 +15,13 @@ use crate::{
     app::AppState,
     auth::Pool,
     batch::Batch,
-    cache::{Answer, Entry},
+    cache::{Answer, AnswerCache, Entry, LoadFailure, Outcome, load_key},
     clock::{HOUR_MS, MINUTE_MS},
     error::ApiError,
     load,
     modrinth::VersionFiles,
     passthrough,
-    upstream::Source,
+    upstream::{Source, UpstreamFailure},
 };
 
 pub const CURSEFORGE_CDN: &str = "https://mediafilez.forgecdn.net";
@@ -151,7 +147,6 @@ pub struct Resolved {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FileRow {
-    id: u64,
     file_name: Option<String>,
     file_length: Option<u64>,
     download_url: Option<String>,
@@ -183,7 +178,6 @@ struct VersionHashes {
 }
 
 struct ListedFile {
-    file_id: u64,
     file_name: Option<String>,
     size: Option<u64>,
     sha1: Option<String>,
@@ -194,6 +188,58 @@ struct Candidate {
     file_id: u64,
     file_name: String,
     size: u64,
+}
+
+/// Modrinth's links by SHA-1, or that Modrinth could not be asked.
+enum ModrinthLinks {
+    Asked(HashMap<String, String>),
+    Unasked,
+}
+
+impl ModrinthLinks {
+    fn of(&self, file: &ListedFile) -> Option<&String> {
+        match self {
+            Self::Asked(links) => links.get(file.sha1.as_ref()?),
+            Self::Unasked => None,
+        }
+    }
+
+    fn could_have(&self, file: &ListedFile) -> bool {
+        matches!(self, Self::Unasked) && file.sha1.is_some()
+    }
+}
+
+/// What CurseForge's CDN said about a file's built address: there, not there, or not asked in time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CdnVerdict {
+    Found(String),
+    Missing,
+    Unknown,
+}
+
+impl CdnVerdict {
+    fn kept(entry: &Entry) -> Self {
+        if entry.answer.status != StatusCode::OK {
+            return Self::Missing;
+        }
+        String::from_utf8(entry.answer.body.to_vec()).map_or(Self::Missing, Self::Found)
+    }
+
+    fn entry(&self, now_ms: u64) -> Option<Entry> {
+        let (answer, fresh_ms) = match self {
+            Self::Found(url) => (
+                Answer {
+                    status: StatusCode::OK,
+                    content_type: Some(HeaderValue::from_static("text/plain")),
+                    body: Bytes::from(url.clone()),
+                },
+                CDN_FOUND_MS,
+            ),
+            Self::Missing => (Answer::not_found(), CDN_NOT_FOUND_MS),
+            Self::Unknown => return None,
+        };
+        Some(Entry::new(answer, now_ms, fresh_ms))
+    }
 }
 
 /// A download address for each CurseForge file.
@@ -234,33 +280,69 @@ pub async fn resolve(
     headers: HeaderMap,
     body: Result<Json<ResolveRequest>, JsonRejection>,
 ) -> Response {
-    let Ok(Json(request)) = body else {
-        return ApiError::invalid_body(
-            "a JSON object with `fileIds`, a list of CurseForge file ids",
-        )
-        .into_response();
+    let asked = match requested_ids(body) {
+        Ok(asked) => asked,
+        Err(error) => return error.into_response(),
     };
-    if request.file_ids.is_empty() {
-        return ApiError::invalid_body("`fileIds` must list at least one file id").into_response();
-    }
-    let mut seen = HashSet::new();
-    let mut ids: Vec<u64> = Vec::new();
-    for id in &request.file_ids {
-        if seen.insert(*id) {
-            ids.push(*id);
-        }
-        if ids.len() > MOST_FILES {
-            return ApiError::invalid_body("`fileIds` may list at most 1000 file ids")
-                .into_response();
-        }
-    }
     let forced = passthrough::wants_fresh(&headers);
-
-    let rows = match load::rows(&state, &pool, Batch::Files, ids.clone(), forced).await {
-        Ok(given) => given.value,
+    let ids = asked.file_ids;
+    let known = match known_files(&state, &pool, &ids, forced).await {
+        Ok(known) => known,
         Err(failure) => return passthrough::failed(failure, &pool, Source::CurseForge),
     };
-    let known: HashMap<u64, ListedFile> = rows
+    let unlinked: Vec<(u64, &ListedFile)> = ids
+        .iter()
+        .filter_map(|id| Some((*id, known.get(id)?)))
+        .filter(|(_, file)| file.download_url.is_none())
+        .collect();
+    let modrinth = modrinth_links(&state, &pool, &unlinked, forced).await;
+    let on_cdn = if asked.cdn {
+        let candidates: Vec<Candidate> = unlinked
+            .iter()
+            .filter_map(|(id, file)| cdn_candidate(*id, file, &modrinth))
+            .collect();
+        Some(cdn_links(&state, candidates, forced).await)
+    } else {
+        None
+    };
+    Json(assemble(&ids, &known, &modrinth, on_cdn.as_ref())).into_response()
+}
+
+struct Asked {
+    file_ids: Vec<u64>,
+    cdn: bool,
+}
+
+fn requested_ids(body: Result<Json<ResolveRequest>, JsonRejection>) -> Result<Asked, ApiError> {
+    let Ok(Json(request)) = body else {
+        return Err(ApiError::invalid_body(
+            "a JSON object with `fileIds`, a list of CurseForge file ids",
+        ));
+    };
+    if request.file_ids.is_empty() {
+        return Err(ApiError::invalid_body(
+            "`fileIds` must list at least one file id",
+        ));
+    }
+    let file_ids = load::distinct(request.file_ids, MOST_FILES).ok_or_else(|| {
+        ApiError::invalid_body(&format!("`fileIds` may list at most {MOST_FILES} file ids"))
+    })?;
+    Ok(Asked {
+        file_ids,
+        cdn: request.cdn,
+    })
+}
+
+async fn known_files(
+    state: &Arc<AppState>,
+    pool: &Pool,
+    ids: &[u64],
+    forced: bool,
+) -> Result<HashMap<u64, ListedFile>, LoadFailure> {
+    let rows = load::rows(state, pool, Batch::Files, ids.to_vec(), forced)
+        .await?
+        .value;
+    Ok(rows
         .iter()
         .filter_map(|(id, row)| {
             let row: FileRow = serde_json::from_slice(row)
@@ -271,7 +353,6 @@ pub async fn resolve(
             Some((
                 *id,
                 ListedFile {
-                    file_id: row.id,
                     file_name: row.file_name,
                     size: row.file_length,
                     sha1: row
@@ -283,61 +364,61 @@ pub async fn resolve(
                 },
             ))
         })
-        .collect();
+        .collect())
+}
 
-    let wanted: Vec<&ListedFile> = ids
+async fn modrinth_links(
+    state: &Arc<AppState>,
+    pool: &Pool,
+    unlinked: &[(u64, &ListedFile)],
+    forced: bool,
+) -> ModrinthLinks {
+    let hashes: Vec<String> = unlinked
         .iter()
-        .filter_map(|id| known.get(id))
-        .filter(|file| file.download_url.is_none())
+        .filter_map(|(_, file)| file.sha1.clone())
         .collect();
-    let hashes: Vec<String> = wanted.iter().filter_map(|file| file.sha1.clone()).collect();
-    let (on_modrinth, modrinth_failed) = if hashes.is_empty() {
-        (HashMap::new(), false)
-    } else {
-        match load::rows(&state, &pool, VersionFiles, hashes, forced).await {
-            Ok(given) => (
-                given
-                    .value
-                    .into_iter()
-                    .filter_map(|(hash, version)| {
-                        let url = modrinth_url(&hash, &version)?;
-                        Some((hash, url))
-                    })
-                    .collect::<HashMap<String, String>>(),
-                false,
-            ),
-            Err(failure) => {
-                tracing::warn!(
-                    files = wanted.len(),
-                    %failure,
-                    "Modrinth could not be asked for the files"
-                );
-                (HashMap::new(), true)
-            }
-        }
-    };
-
-    let on_cdn = if request.cdn {
-        let candidates: Vec<Candidate> = wanted
-            .iter()
-            .filter(|file| {
-                file.sha1
-                    .as_ref()
-                    .is_none_or(|sha1| !on_modrinth.contains_key(sha1))
-            })
-            .filter_map(|file| {
-                Some(Candidate {
-                    file_id: file.file_id,
-                    file_name: file.file_name.clone()?,
-                    size: file.size?,
+    if hashes.is_empty() {
+        return ModrinthLinks::Asked(HashMap::new());
+    }
+    match load::rows(state, pool, VersionFiles, hashes, forced).await {
+        Ok(given) => ModrinthLinks::Asked(
+            given
+                .value
+                .into_iter()
+                .filter_map(|(hash, version)| {
+                    let url = modrinth_url(&hash, &version)?;
+                    Some((hash, url))
                 })
-            })
-            .collect();
-        check_cdn(&state, &candidates, forced).await
-    } else {
-        HashMap::new()
-    };
+                .collect(),
+        ),
+        Err(failure) => {
+            tracing::warn!(
+                files = unlinked.len(),
+                %failure,
+                "Modrinth could not be asked for the files"
+            );
+            ModrinthLinks::Unasked
+        }
+    }
+}
 
+fn cdn_candidate(file_id: u64, file: &ListedFile, modrinth: &ModrinthLinks) -> Option<Candidate> {
+    if file.download_url.is_some() || modrinth.of(file).is_some() {
+        return None;
+    }
+    Some(Candidate {
+        file_id,
+        file_name: file.file_name.clone()?,
+        size: file.size?,
+    })
+}
+
+fn assemble(
+    ids: &[u64],
+    known: &HashMap<u64, ListedFile>,
+    modrinth: &ModrinthLinks,
+    on_cdn: Option<&HashMap<u64, CdnVerdict>>,
+) -> Resolved {
     let files = ids
         .iter()
         .map(|id| {
@@ -354,18 +435,19 @@ pub async fn resolve(
             };
             let (found, retry) = if let Some(url) = &file.download_url {
                 (Some((FileSource::Curseforge, url.clone())), false)
-            } else if let Some(url) = file.sha1.as_ref().and_then(|sha1| on_modrinth.get(sha1)) {
+            } else if let Some(url) = modrinth.of(file) {
                 (Some((FileSource::Modrinth, url.clone())), false)
             } else {
-                let cdn = if request.cdn && file.file_name.is_some() && file.size.is_some() {
-                    on_cdn.get(id)
-                } else {
-                    Some(&None)
+                let verdict = match on_cdn {
+                    Some(on_cdn) if cdn_candidate(*id, file, modrinth).is_some() => {
+                        on_cdn.get(id).cloned().unwrap_or(CdnVerdict::Unknown)
+                    }
+                    _ => CdnVerdict::Missing,
                 };
-                match cdn {
-                    Some(Some(url)) => (Some((FileSource::CurseforgeCdn, url.clone())), false),
-                    Some(None) => (None, modrinth_failed && file.sha1.is_some()),
-                    None => (None, true),
+                match verdict {
+                    CdnVerdict::Found(url) => (Some((FileSource::CurseforgeCdn, url)), false),
+                    CdnVerdict::Missing => (None, modrinth.could_have(file)),
+                    CdnVerdict::Unknown => (None, true),
                 }
             };
             let (source, url) =
@@ -381,7 +463,7 @@ pub async fn resolve(
             }
         })
         .collect();
-    Json(Resolved { files }).into_response()
+    Resolved { files }
 }
 
 fn modrinth_url(hash: &str, version: &[u8]) -> Option<String> {
@@ -408,11 +490,11 @@ fn cdn_key(file_id: u64, size: u64) -> String {
     format!("cdn:{file_id}:{size}")
 }
 
-async fn check_cdn(
+async fn cdn_links(
     state: &Arc<AppState>,
-    candidates: &[Candidate],
+    candidates: Vec<Candidate>,
     forced: bool,
-) -> HashMap<u64, Option<String>> {
+) -> HashMap<u64, CdnVerdict> {
     let mut verdicts = HashMap::with_capacity(candidates.len());
     if candidates.is_empty() {
         return verdicts;
@@ -423,39 +505,46 @@ async fn check_cdn(
         .collect();
     let now = state.clock.now_ms();
     let kept = state.cache.lookup_many(&keys, now).await;
-    let mut to_check = Vec::new();
-    for (file, kept) in candidates.iter().zip(kept) {
-        match kept.filter(|entry| !forced && entry.is_fresh(now)) {
-            Some(entry) if entry.answer.status == StatusCode::OK => {
-                verdicts.insert(
-                    file.file_id,
-                    String::from_utf8(entry.answer.body.to_vec()).ok(),
-                );
-            }
-            Some(_) => {
-                verdicts.insert(file.file_id, None);
-            }
-            None => to_check.push((file.file_id, file.file_name.clone(), file.size)),
-        }
-    }
-    if to_check.is_empty() {
-        return verdicts;
-    }
-
     let at_once = Arc::new(Semaphore::new(CDN_AT_ONCE));
     let mut checks = JoinSet::new();
-    for (file_id, file_name, size) in to_check {
-        let (state, at_once) = (state.clone(), at_once.clone());
-        checks.spawn(async move {
-            let _slot = at_once.acquire().await;
-            (file_id, head(&state, file_id, &file_name, size).await)
-        });
+    let mut waits = Vec::new();
+    for ((file, key), kept) in candidates.into_iter().zip(keys).zip(kept) {
+        if let Some(entry) = kept.filter(|entry| !forced && entry.is_fresh(now)) {
+            verdicts.insert(file.file_id, CdnVerdict::kept(&entry));
+            continue;
+        }
+        let file_id = file.file_id;
+        let load_key = load_key(key.clone(), forced);
+        let (waiting, finisher) = state.cache.join(&load_key);
+        if let Some(finisher) = finisher {
+            let (state, at_once) = (state.clone(), at_once.clone());
+            checks.spawn(async move {
+                let _slot = at_once.acquire().await;
+                let verdict = head(&state, &file).await;
+                let loaded = match verdict.entry(state.clock.now_ms()) {
+                    Some(entry) => {
+                        let entry = Arc::new(entry);
+                        state.cache.insert(&key, entry.clone());
+                        Ok(entry)
+                    }
+                    None => Err(LoadFailure::Upstream(UpstreamFailure::Unreachable)),
+                };
+                state
+                    .cache
+                    .finish(&load_key, finisher, Outcome::called(loaded));
+            });
+        }
+        waits.push((file_id, waiting));
     }
     let collect = async {
-        while let Some(joined) = checks.join_next().await {
-            if let Ok((file_id, Some(verdict))) = joined {
-                verdicts.insert(file_id, verdict);
-            }
+        for (file_id, waiting) in waits {
+            let verdict = match AnswerCache::wait(waiting).await {
+                Some(Outcome {
+                    loaded: Ok(entry), ..
+                }) => CdnVerdict::kept(&entry),
+                _ => CdnVerdict::Unknown,
+            };
+            verdicts.insert(file_id, verdict);
         }
     };
     let wait = state.cdn.wait;
@@ -468,50 +557,30 @@ async fn check_cdn(
     verdicts
 }
 
-async fn head(
-    state: &AppState,
-    file_id: u64,
-    file_name: &str,
-    size: u64,
-) -> Option<Option<String>> {
-    let url = state.cdn.url(file_id, file_name);
-    let verdict = match state.cdn.head(&url).await {
-        Ok((StatusCode::OK, Some(length))) if length == size => Some(url),
+async fn head(state: &AppState, file: &Candidate) -> CdnVerdict {
+    let file_id = file.file_id;
+    let url = state.cdn.url(file_id, &file.file_name);
+    match state.cdn.head(&url).await {
+        Ok((StatusCode::OK, Some(length))) if length == file.size => CdnVerdict::Found(url),
         Ok((StatusCode::OK, length)) => {
             tracing::warn!(
                 file_id,
                 cdn_bytes = ?length,
-                api_bytes = size,
+                api_bytes = file.size,
                 "CurseForge's CDN and API list different sizes for a file"
             );
-            None
+            CdnVerdict::Missing
         }
-        Ok((StatusCode::FORBIDDEN | StatusCode::NOT_FOUND, _)) => None,
+        Ok((StatusCode::FORBIDDEN | StatusCode::NOT_FOUND, _)) => CdnVerdict::Missing,
         Ok((status, _)) => {
             tracing::warn!(file_id, %status, "CurseForge's CDN answered a file with an unexpected status");
-            return None;
+            CdnVerdict::Unknown
         }
         Err(error) => {
             tracing::warn!(file_id, %error, "CurseForge's CDN could not be asked about a file");
-            return None;
+            CdnVerdict::Unknown
         }
-    };
-    let (answer, fresh_ms) = match &verdict {
-        Some(url) => (
-            Answer {
-                status: StatusCode::OK,
-                content_type: Some(HeaderValue::from_static("text/plain")),
-                body: Bytes::from(url.clone()),
-            },
-            CDN_FOUND_MS,
-        ),
-        None => (Answer::not_found(), CDN_NOT_FOUND_MS),
-    };
-    state.cache.insert(
-        &cdn_key(file_id, size),
-        Arc::new(Entry::new(answer, state.clock.now_ms(), fresh_ms)),
-    );
-    Some(verdict)
+    }
 }
 
 #[cfg(test)]
@@ -878,6 +947,49 @@ mod tests {
         let file = &got.json()["files"][0];
         assert_eq!(file["source"], Value::Null);
         assert_eq!(file["retry"], true);
+    }
+
+    #[tokio::test]
+    async fn a_check_of_the_same_file_joins_the_one_running() {
+        let (mock, gate) = Mock::held_when(
+            |seen| seen.method == "HEAD",
+            only_on_the_cdn(cdn_reply(200, "30")),
+        )
+        .await;
+        let gateway = gateway(&mock);
+        let first = tokio::spawn({
+            let router = gateway.router.clone();
+            async move { post_json(&router, "/v1/resolve", r#"{"fileIds":[1003]}"#).await }
+        });
+        until("the first check to reach the CDN", || heads(&mock) == 1).await;
+        let second = tokio::spawn({
+            let router = gateway.router.clone();
+            async move { post_json(&router, "/v1/resolve", r#"{"fileIds":[1003]}"#).await }
+        });
+        until("the second check to join it", || {
+            gateway.state.cache.joined() == 1
+        })
+        .await;
+        gate.open();
+
+        for got in [first.await.unwrap(), second.await.unwrap()] {
+            let file = &got.json()["files"][0];
+            assert_eq!(file["source"], "curseforge-cdn");
+            assert_eq!(file["retry"], false);
+        }
+        assert_eq!(heads(&mock), 1);
+    }
+
+    #[test]
+    fn a_kept_cdn_verdict_reads_back_as_it_was_given() {
+        for verdict in [
+            CdnVerdict::Found("https://mediafilez.forgecdn.net/files/1/3/a.jar".to_owned()),
+            CdnVerdict::Missing,
+        ] {
+            let entry = verdict.entry(NOV_3_2026_20H).unwrap();
+            assert_eq!(CdnVerdict::kept(&entry), verdict);
+        }
+        assert!(CdnVerdict::Unknown.entry(NOV_3_2026_20H).is_none());
     }
 
     #[tokio::test]
