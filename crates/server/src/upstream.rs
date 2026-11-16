@@ -151,7 +151,13 @@ pub async fn read(
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok()?.parse::<usize>().ok());
     if let Some(bytes) = announced.filter(|length| *length > MAX_ANSWER_BYTES) {
-        return Err(too_large(name, bytes));
+        tracing::warn!(
+            upstream = name,
+            bytes,
+            limit = MAX_ANSWER_BYTES,
+            "the upstream announced an answer larger than the gateway reads"
+        );
+        return Err(UpstreamFailure::TooLarge);
     }
     let mut body = Vec::with_capacity(announced.unwrap_or(0));
     while let Some(chunk) = response
@@ -160,7 +166,12 @@ pub async fn read(
         .map_err(|error| failure(error, name))?
     {
         if body.len() + chunk.len() > MAX_ANSWER_BYTES {
-            return Err(too_large(name, body.len() + chunk.len()));
+            tracing::warn!(
+                upstream = name,
+                limit = MAX_ANSWER_BYTES,
+                "the upstream's answer grew past the size the gateway reads while being read"
+            );
+            return Err(UpstreamFailure::TooLarge);
         }
         body.extend_from_slice(&chunk);
     }
@@ -172,16 +183,6 @@ pub async fn read(
         },
         retry_after,
     })
-}
-
-fn too_large(name: &'static str, bytes: usize) -> UpstreamFailure {
-    tracing::warn!(
-        upstream = name,
-        bytes,
-        limit = MAX_ANSWER_BYTES,
-        "the upstream's answer is larger than the gateway reads"
-    );
-    UpstreamFailure::TooLarge
 }
 
 /// Why `name` gave no answer, from the error reqwest reported.
