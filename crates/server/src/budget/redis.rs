@@ -5,7 +5,7 @@ use std::{
 
 use redis::{ParsingError, Script, Value, aio::ConnectionManager};
 
-use super::{Budget, Counts, DayCounts, MAX_HISTORY_DAYS, Verdict, readout::utc_date};
+use super::{Budget, Counts, DayCounts, MAX_HISTORY_DAYS, Verdict, utc_date};
 use crate::{
     auth::Pool,
     clock::{Clock, DAY_MS, MINUTE_MS},

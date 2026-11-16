@@ -6,12 +6,12 @@ use std::{
     sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
 };
 
-use jiff::fmt::rfc2822;
+use jiff::{Timestamp, fmt::rfc2822};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use utoipa::ToSchema;
 
-use self::{readout::utc_date, redis::Shared};
+use self::redis::Shared;
 use crate::{
     auth::Pool,
     clock::{Clock, DAY_MS, MINUTE_MS},
@@ -413,6 +413,17 @@ fn hold_ms(retry_after: Option<&str>, now: u64) -> u64 {
         })
         .unwrap_or(HOLD_WHEN_NOT_TOLD_MS);
     wait.clamp(SHORTEST_HOLD_MS, LONGEST_HOLD_MS)
+}
+
+fn timestamp(ms: u64) -> Timestamp {
+    i64::try_from(ms)
+        .ok()
+        .and_then(|ms| Timestamp::from_millisecond(ms).ok())
+        .unwrap_or(Timestamp::UNIX_EPOCH)
+}
+
+fn utc_date(ms: u64) -> String {
+    timestamp(ms).strftime("%Y-%m-%d").to_string()
 }
 
 #[cfg(test)]

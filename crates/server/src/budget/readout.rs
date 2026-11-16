@@ -4,11 +4,10 @@ use axum::{
     Json,
     extract::{Query, State, rejection::QueryRejection},
 };
-use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
-use super::{Budget, DayCounts, MinuteCounts, redis::parse_day_field};
+use super::{Budget, DayCounts, MinuteCounts, redis::parse_day_field, timestamp, utc_date};
 use crate::{
     app::AppState,
     auth::Pool,
@@ -274,17 +273,6 @@ fn pool_snapshot(pool: &Pool, counts: MinuteCounts) -> PoolSnapshot {
     }
 }
 
-fn timestamp(ms: u64) -> Timestamp {
-    i64::try_from(ms)
-        .ok()
-        .and_then(|ms| Timestamp::from_millisecond(ms).ok())
-        .unwrap_or(Timestamp::UNIX_EPOCH)
-}
-
 fn iso(ms: u64) -> String {
     timestamp(ms).to_string()
-}
-
-pub(super) fn utc_date(ms: u64) -> String {
-    timestamp(ms).strftime("%Y-%m-%d").to_string()
 }
