@@ -402,8 +402,15 @@ async fn modrinth_links(
     }
 }
 
+fn is_cdn_candidate(file: &ListedFile, modrinth: &ModrinthLinks) -> bool {
+    file.download_url.is_none()
+        && modrinth.of(file).is_none()
+        && file.file_name.is_some()
+        && file.size.is_some()
+}
+
 fn cdn_candidate(file_id: u64, file: &ListedFile, modrinth: &ModrinthLinks) -> Option<Candidate> {
-    if file.download_url.is_some() || modrinth.of(file).is_some() {
+    if !is_cdn_candidate(file, modrinth) {
         return None;
     }
     Some(Candidate {
@@ -439,7 +446,7 @@ fn assemble(
                 (Some((FileSource::Modrinth, url.clone())), false)
             } else {
                 let verdict = match on_cdn {
-                    Some(on_cdn) if cdn_candidate(*id, file, modrinth).is_some() => {
+                    Some(on_cdn) if is_cdn_candidate(file, modrinth) => {
                         on_cdn.get(id).cloned().unwrap_or(CdnVerdict::Unknown)
                     }
                     _ => CdnVerdict::Missing,
