@@ -160,6 +160,31 @@ def test_the_async_class_mirrors_the_sync_one() -> None:
             assert twin.__doc__ == sync.__doc__, name
 
 
+def shape(function: Callable[..., Any]) -> list[tuple[Any, ...]]:
+    """A function's parameters by name, kind and default, which hold across a sync and an async twin whose annotations name different classes."""
+    parameters = inspect.signature(function).parameters.values()
+    return [(p.name, p.kind, p.default) for p in parameters]
+
+
+def test_the_async_class_is_made_and_entered_like_the_sync_one() -> None:
+    sync_init = inspect.signature(ContentGateway.__init__)
+    async_init = inspect.signature(AsyncContentGateway.__init__)
+    assert async_init.replace(
+        parameters=[p for p in async_init.parameters.values() if p.name != "client"]
+    ) == sync_init.replace(
+        parameters=[p for p in sync_init.parameters.values() if p.name != "client"]
+    )
+    sync_client = sync_init.parameters["client"]
+    async_client = async_init.parameters["client"]
+    assert (async_client.kind, async_client.default) == (sync_client.kind, sync_client.default)
+    for sync, twin in (
+        (ContentGateway.__enter__, AsyncContentGateway.__aenter__),
+        (ContentGateway.__exit__, AsyncContentGateway.__aexit__),
+    ):
+        assert inspect.iscoroutinefunction(twin), twin.__name__
+        assert shape(twin) == shape(sync), twin.__name__
+
+
 def test_health_needs_no_token(fake: FakeGateway, gateway: ContentGateway) -> None:
     fake.reply(200, {"status": "ok", "version": "0.1.1", "commit": None, "builtAt": None})
     health = gateway.health()
