@@ -340,3 +340,6 @@ pub fn failed(failure: LoadFailure, pool: &Pool, source: Source) -> Response {
         LoadFailure::Lost => ApiError::internal().into_response(),
     }
 }
+
+#[cfg(test)]
+mod tests;
