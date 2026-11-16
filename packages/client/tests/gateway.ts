@@ -58,6 +58,7 @@ export class FakeGateway {
   async stop(): Promise<void> {
     const server = this.server;
     if (server === undefined) return;
+    this.server = undefined;
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
